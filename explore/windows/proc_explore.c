@@ -6,7 +6,7 @@
  * timing with and without a debugger, the debugger as a "die with my parent" mechanism, and silo creation.
  *
  * Build (from a VS developer prompt):  cl /nologo /O1 /Fe:proc_explore.exe proc_explore.c user32.lib advapi32.lib
- * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|period|iorate|all]
+ * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|period|iorate|pipes|pidreuse|all]
  *       (each group runs well inside the 300 s watchdog; "all" may not, so CI runs groups one by one)
  */
 #ifndef _WIN32_WINNT
@@ -1293,6 +1293,191 @@ static void probe_period(void) {
        t_all, q_all, i_all, t_all / q_all, i_all >= 0 ? i_all / q_all : -1.0);
 }
 
+/* ------------------------------------------------------------------ pipes and stdio */
+static int child_write_stdout(int total) {
+  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (h == NULL) return 0x20000;
+  if (h == INVALID_HANDLE_VALUE) return 0x20001;
+  char b[4096];
+  memset(b, 'o', sizeof b);
+  for (int done = 0; done < total; done += (int)sizeof b) {
+    DWORD w;
+    if (!WriteFile(h, b, sizeof b, &w, NULL)) return (int)(0x10000u | GetLastError());
+  }
+  return 0;
+}
+
+static int child_read_stdin(void) {
+  HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+  char b[16];
+  DWORD n = 0;
+  BOOL ok = ReadFile(h, b, sizeof b, &n, NULL);
+  return ok ? (int)(0x30000u | n) : (int)(0x38000u | GetLastError());
+}
+
+/* start this executable with the given std handles (only those inherited); flags passed through */
+static BOOL spawn_with_std(const wchar_t *args, HANDLE in, HANDLE out, HANDLE err, PROCESS_INFORMATION *pi) {
+  wchar_t cmd[4096];
+  swprintf(cmd, sizeof cmd / sizeof cmd[0], L"\"%ls\" %ls", g_self, args);
+  STARTUPINFOW si;
+  memset(&si, 0, sizeof si);
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = in;
+  si.hStdOutput = out;
+  si.hStdError = err;
+  return CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, pi);
+}
+
+typedef struct { HANDLE h; volatile LONG written; } fill_t;
+static DWORD WINAPI filler(LPVOID p) {
+  fill_t *f = (fill_t *)p;
+  char c = 'x';
+  DWORD w;
+  while (WriteFile(f->h, &c, 1, &w, NULL)) InterlockedIncrement(&f->written);
+  return 0;
+}
+
+static void pipe_capacity(DWORD requested) {
+  HANDLE r, w;
+  CreatePipe(&r, &w, NULL, requested);
+  fill_t f = {w, 0};
+  HANDLE t = CreateThread(NULL, 0, filler, &f, 0, NULL);
+  LONG last = -1;
+  for (int i = 0; i < 100; i++) { Sleep(30); LONG now = f.written; if (now == last) break; last = now; }
+  char name[64];
+  snprintf(name, sizeof name, "pipe_capacity_nsize_%lu", (unsigned long)requested);
+  emit(name, "\"bytes_before_writer_blocked\":%ld", (long)f.written);
+  CancelSynchronousIo(t);
+  CloseHandle(r);
+  WaitForSingleObject(t, 2000);
+  CloseHandle(t);
+  CloseHandle(w);
+}
+
+static void probe_pipes(void) {
+  pipe_capacity(0);
+  pipe_capacity(4096);
+  pipe_capacity(65536);
+  pipe_capacity(1 << 20);
+
+  SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
+  /* wait-before-read: a child writing 1 MiB cannot exit while nobody drains its stdout */
+  {
+    HANDLE r, w;
+    CreatePipe(&r, &w, &sa, 0);
+    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+    PROCESS_INFORMATION pi;
+    BOOL ok = spawn_with_std(L"--child-write-stdout 1048576", NULL, w, NULL, &pi);
+    CloseHandle(w);
+    int exited;
+    wait_exit(pi.hProcess, 1500, &exited);
+    char b[65536];
+    DWORD n;
+    long got = 0;
+    double t0 = abs_ms();
+    while (ReadFile(r, b, sizeof b, &n, NULL) && n) got += n;
+    DWORD last = GetLastError();
+    int ex2;
+    DWORD code = wait_exit(pi.hProcess, 3000, &ex2);
+    emit("child_writes_1MiB_while_supervisor_waits_first", "\"spawn_ok\":%s,\"exited_within_1500ms_without_reading\":%s,\"bytes_read_after\":%ld,\"ms_to_drain\":%.0f,"
+         "\"read_end_error\":%lu,\"exit_code\":\"0x%08lX\"", bstr(ok), bstr(exited), got, abs_ms() - t0, (unsigned long)last, (unsigned long)code);
+    kill_close(&pi);
+    CloseHandle(r);
+  }
+  /* the supervisor closes its read end while the child writes; and the same with the read end leaked into the child */
+  for (int leak = 0; leak < 2; leak++) {
+    HANDLE r, w;
+    CreatePipe(&r, &w, &sa, 0);
+    if (!leak) SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+    PROCESS_INFORMATION pi;
+    spawn_with_std(L"--child-write-stdout 1048576", NULL, w, NULL, &pi);
+    CloseHandle(w);
+    char b[4096];
+    DWORD n;
+    ReadFile(r, b, sizeof b, &n, NULL);
+    CloseHandle(r);
+    int exited;
+    DWORD code = wait_exit(pi.hProcess, 2000, &exited);
+    emit(leak ? "supervisor_closes_read_end_but_child_inherited_it" : "supervisor_closes_read_end",
+         "\"child_exited_within_2s\":%s,\"exit_code\":\"0x%08lX\",\"note\":\"0x1xxxx = WriteFile failed with error xxxx (0xE8 = 232 ERROR_NO_DATA, 0x6D = 109 ERROR_BROKEN_PIPE)\"",
+         bstr(exited), (unsigned long)(exited ? code : 0));
+    kill_close(&pi);
+  }
+  /* no stdout at all */
+  {
+    PROCESS_INFORMATION pi;
+    spawn_with_std(L"--child-write-stdout 4096", NULL, NULL, NULL, &pi);
+    int exited;
+    DWORD code = wait_exit(pi.hProcess, 3000, &exited);
+    emit("child_started_without_std_handles", "\"exit_code\":\"0x%08lX\",\"note\":\"0x20000 = GetStdHandle returned NULL; 0x1xxxx = WriteFile error xxxx\"", (unsigned long)code);
+    kill_close(&pi);
+  }
+  /* stdin: the supervisor closes the write end */
+  {
+    HANDLE r, w;
+    CreatePipe(&r, &w, &sa, 0);
+    SetHandleInformation(w, HANDLE_FLAG_INHERIT, 0);
+    PROCESS_INFORMATION pi;
+    spawn_with_std(L"--child-read-stdin", r, NULL, NULL, &pi);
+    CloseHandle(r);
+    Sleep(100);
+    CloseHandle(w);
+    int exited;
+    DWORD code = wait_exit(pi.hProcess, 3000, &exited);
+    emit("supervisor_closes_child_stdin", "\"exit_code\":\"0x%08lX\",\"note\":\"0x3000n = ReadFile succeeded with n bytes; 0x38xxx = ReadFile failed with error xxx (0x6D = 109 ERROR_BROKEN_PIPE)\"",
+         (unsigned long)code);
+    kill_close(&pi);
+  }
+}
+
+/* ------------------------------------------------------------------ pid reuse */
+static void probe_pidreuse(void) {
+  enum { N = 600 };
+  static DWORD pids[N];
+  int first_repeat = -1, repeat_of = -1;
+  double t0 = abs_ms();
+  for (int i = 0; i < N; i++) {
+    PROCESS_INFORMATION pi;
+    DWORD e;
+    if (!spawn_self(L"--child-sleep 0", 0, NULL, &pi, &e)) { pids[i] = 0; continue; }
+    WaitForSingleObject(pi.hProcess, 5000);
+    pids[i] = pi.dwProcessId;
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    if (first_repeat < 0) for (int k = 0; k < i; k++) if (pids[k] == pids[i]) { first_repeat = i; repeat_of = k; break; }
+  }
+  double dt = abs_ms() - t0;
+  int distinct = 0;
+  for (int i = 0; i < N; i++) { int seen = 0; for (int k = 0; k < i; k++) if (pids[k] == pids[i]) { seen = 1; break; } if (!seen) distinct++; }
+  emit("pid_reuse_spawn_wait_close", "\"children\":%d,\"distinct_pids\":%d,\"first_repeat_at_child\":%d,\"it_reused_the_pid_of_child\":%d,\"seconds\":%.1f",
+       N, distinct, first_repeat, repeat_of, dt / 1000.0);
+
+  /* an open handle to an exited process keeps its pid out of circulation */
+  PROCESS_INFORMATION held;
+  DWORD e;
+  spawn_self(L"--child-sleep 0", 0, NULL, &held, &e);
+  WaitForSingleObject(held.hProcess, 5000);
+  DWORD held_pid = held.dwProcessId;
+  int reissued_while_held = 0, reissued_after_close = 0, after_index = -1;
+  for (int i = 0; i < N; i++) {
+    PROCESS_INFORMATION pi;
+    if (!spawn_self(L"--child-sleep 0", 0, NULL, &pi, &e)) continue;
+    WaitForSingleObject(pi.hProcess, 5000);
+    if (pi.dwProcessId == held_pid) reissued_while_held++;
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+  }
+  CloseHandle(held.hProcess); CloseHandle(held.hThread);
+  for (int i = 0; i < N; i++) {
+    PROCESS_INFORMATION pi;
+    if (!spawn_self(L"--child-sleep 0", 0, NULL, &pi, &e)) continue;
+    WaitForSingleObject(pi.hProcess, 5000);
+    if (pi.dwProcessId == held_pid) { reissued_after_close++; if (after_index < 0) after_index = i; }
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+  }
+  emit("pid_held_by_an_open_handle", "\"held_pid\":%lu,\"reissued_while_handle_open\":%d,\"reissued_after_handle_closed\":%d,\"first_reissue_after_close_at_child\":%d,\"children_each_phase\":%d",
+       (unsigned long)held_pid, reissued_while_held, reissued_after_close, after_index, N);
+}
+
 /* ------------------------------------------------------------------ header and main */
 static DWORD WINAPI watchdog_thread(LPVOID p) {
   (void)p;
@@ -1333,6 +1518,8 @@ int main(void) {
   if (argc >= 2 && wcscmp(argv[1], L"--child-spin") == 0) { double end = abs_ms() + 60000; volatile unsigned long x = 0; while (abs_ms() < end) { for (int i = 0; i < 100000; i++) x++; } return 0; }
   if (argc >= 3 && wcscmp(argv[1], L"--child-crash") == 0) return child_crash(_wtoi(argv[2]));
   if (argc >= 4 && wcscmp(argv[1], L"--child-write") == 0) return child_write(argv[2], _wtoi(argv[3]));
+  if (argc >= 3 && wcscmp(argv[1], L"--child-write-stdout") == 0) return child_write_stdout(_wtoi(argv[2]));
+  if (argc >= 2 && wcscmp(argv[1], L"--child-read-stdin") == 0) return child_read_stdin();
   if (argc >= 6 && wcscmp(argv[1], L"--child-io") == 0) return child_io(argv[2], argv[3], _wtoi(argv[4]), _wtoi(argv[5]));
   if (argc >= 5 && wcscmp(argv[1], L"--child-io-log") == 0) return child_io_log(argv[2], _wtoi(argv[3]), argv[4]);
   if (argc >= 3 && wcscmp(argv[1], L"--child-spawn-try") == 0) return child_spawn_try(argv[2]);
@@ -1353,5 +1540,7 @@ int main(void) {
   if (all || wcscmp(which, L"silo") == 0) probe_silo();
   if (all || wcscmp(which, L"period") == 0) probe_period();
   if (all || wcscmp(which, L"iorate") == 0) probe_iorate();
+  if (all || wcscmp(which, L"pipes") == 0) probe_pipes();
+  if (all || wcscmp(which, L"pidreuse") == 0) probe_pidreuse();
   return 0;
 }

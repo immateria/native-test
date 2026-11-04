@@ -12,6 +12,7 @@ on:
       - "explore/linux/**"
       - "explore/macos/**"
       - "explore/windows/proc_explore.c"
+      - "explore/windows/crystal_spawn_win.cr"
       - ".github/workflows/explore-matrix.yml"
 
 permissions:
@@ -254,7 +255,7 @@ jobs:
         run: |
           $exe = (Resolve-Path explore-out\proc_explore.exe).Path
           $tag = "windows-${{ matrix.runner }}-elevated"
-          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate") {
+          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate", "pipes", "pidreuse") {
             $t = [Diagnostics.Stopwatch]::StartNew()
             & $exe $g > "explore-out\$tag-$g.jsonl" 2> "explore-out\$tag-$g.err"
             "$g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-$g.jsonl").Count)"
@@ -273,6 +274,14 @@ jobs:
           $t = Get-Content explore-out\launcher-token.jsonl | Select-Object -First 1 | ConvertFrom-Json
           if ($t.token_is_elevated -ne 0) { throw "launcher produced an elevated token" }
 
+      - name: Crystal Process on Windows (crystal_spawn_win)
+        if: matrix.unelevated
+        run: |
+          crystal build --no-color explore/windows/crystal_spawn_win.cr -o explore-out/crystal_spawn_win.exe
+          $exe = (Resolve-Path explore-out\crystal_spawn_win.exe).Path
+          & $exe > "explore-out\windows-${{ matrix.runner }}-crystal_spawn_win.jsonl" 2> "explore-out\windows-${{ matrix.runner }}-crystal_spawn_win.err"
+          "crystal_spawn_win exit=$LASTEXITCODE"
+
       - name: Run proc_explore groups (unelevated, filtered token)
         if: matrix.unelevated && steps.launcher.outcome == 'success'
         timeout-minutes: 25
@@ -280,7 +289,7 @@ jobs:
           $exe = (Resolve-Path explore-out\proc_explore.exe).Path
           $je = (Resolve-Path explore-out\job_explore.exe).Path
           $tag = "windows-${{ matrix.runner }}-unelevated"
-          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate") {
+          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate", "pipes", "pidreuse") {
             $t = [Diagnostics.Stopwatch]::StartNew()
             & $je launch-unelevated -- $exe $g > "explore-out\$tag-$g.jsonl" 2> "explore-out\$tag-$g.err"
             "$g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-$g.jsonl").Count)"

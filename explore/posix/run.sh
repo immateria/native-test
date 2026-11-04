@@ -11,7 +11,7 @@ tag="posix-$os-$arch"
 libs=""
 [ "$os" = Linux ] && libs="-lutil"
 
-for p in orphan_pgrp supervisor_death rusage rlimit stopcont_chld sigstate spawn_errors pty; do
+for p in orphan_pgrp supervisor_death rusage rlimit stopcont_chld sigstate spawn_errors pty pipes pid_reuse; do
   l=""
   [ "$p" = pty ] && l="$libs"
   if cc -O1 -Wall -Wextra -o "$out/build/$p" "$here/$p.c" $l > "$out/$tag-$p.build.txt" 2>&1; then
