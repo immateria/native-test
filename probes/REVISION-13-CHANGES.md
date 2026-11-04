@@ -62,8 +62,10 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
   pending the caller-class experiment in `explore`.
 * The Windows run was elevated (`runneradmin`). The kit says never to run elevated; CI now also runs
   the kit with a filtered, unelevated token (`explore/windows/job_explore.cr launch-unelevated`: Medium
-  integrity, Administrators deny-only, only SeChangeNotify). Under it `C:\crystal` needed an explicit
-  BUILTIN\Users grant (`Access is denied` otherwise), now done by the setup action.
+  integrity, Administrators deny-only, only SeChangeNotify). Under it the kit wrapper fails at its first
+  `crystal` invocation with `Access is denied`; `C:\crystal\crystal.exe` already grants Users RX and
+  Authenticated Users Modify with no mandatory label, so this is **not** a file ACL problem. Cause under
+  investigation (`explore/windows/unelevated-diag.ps1`).
 
 ## Evidence boundary
 

@@ -52,6 +52,14 @@ jobs:
         working-directory: probes
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1
 
+      - name: Compare tokens - direct launch vs Start-Process (the kit's launch method)
+        if: always()
+        run: |
+          $exe = (Resolve-Path explore-out\job_explore.exe).Path
+          & $exe token > explore-out\windows-elevated-token-direct.jsonl
+          Start-Process -FilePath $exe -ArgumentList "token" -Wait -NoNewWindow -RedirectStandardOutput explore-out\windows-elevated-token-startprocess.jsonl
+          Get-Content explore-out\windows-elevated-token-direct.jsonl, explore-out\windows-elevated-token-startprocess.jsonl | ForEach-Object { $_.Substring(0, [Math]::Min($_.Length, 400)) }
+
       - name: Explore job-object behaviour
         if: always()
         env:
@@ -106,6 +114,14 @@ jobs:
           $t = Get-Content explore-out\windows-unelevated-token.jsonl | Select-Object -First 1 | ConvertFrom-Json
           if ($null -eq $t) { throw "launcher produced no token record" }
           if ($t.token_is_elevated -ne 0) { throw "launcher produced an elevated token" }
+
+      - name: Diagnose what the filtered token can launch
+        if: always() && steps.selfcheck.outcome == 'success'
+        run: |
+          $exe = (Resolve-Path explore-out\job_explore.exe).Path
+          & $exe launch-unelevated -- pwsh -NoProfile -File explore\windows\unelevated-diag.ps1
+          "diag exit=$LASTEXITCODE"
+          Get-Content explore-out\unelevated-diag.txt -ErrorAction SilentlyContinue
 
       - name: Run native probes (kit, unelevated)
         if: always() && steps.selfcheck.outcome == 'success'

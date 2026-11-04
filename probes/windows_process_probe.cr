@@ -23,6 +23,7 @@ end
 # Additional probe-only Win32 declarations used to exercise native behavior
 # adjacent to the public shards. These declarations never ship in the shards.
 @[Link("kernel32")]
+@[Link("advapi32")]
 lib WindowsProbeExtra
   struct JobNotificationLimit
     io_read_bytes_limit : UInt64
@@ -50,6 +51,9 @@ lib WindowsProbeExtra
   end
 
   fun QueryInformationJobObject(job : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
+  fun OpenProcessToken(process : LibC::HANDLE, access : UInt32, token : LibC::HANDLE*) : LibC::BOOL
+  fun GetTokenInformation(token : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
+  fun LookupPrivilegeNameW(system_name : UInt16*, luid : UInt64*, name : UInt16*, length : UInt32*) : LibC::BOOL
   fun GetPriorityClass(process : LibC::HANDLE) : UInt32
   fun GetProcessAffinityMask(process : LibC::HANDLE, process_mask : LibC::DWORD_PTR*, system_mask : LibC::DWORD_PTR*) : LibC::BOOL
   fun ExitProcess(code : UInt32) : NoReturn
@@ -338,6 +342,38 @@ module NativeProbe
     rc = WindowsProbeNative.IsProcessInJob(WindowsProbeNative.GetCurrentProcess, LibC::HANDLE.null, pointerof(in_job))
     raise "IsProcessInJob(current) failed: #{LibC.GetLastError}" if rc == 0
     in_job != 0
+  end
+
+  # Records the token this very process runs under. Several Win32 limits (job priority class above
+  # NORMAL, for one) depend on which privileges the token holds, so a result is only interpretable next
+  # to it. Privileges are listed as NAME+ (enabled) or NAME- (held, disabled).
+  def self.token_note : Nil
+    token = LibC::HANDLE.null
+    if WindowsProbeExtra.OpenProcessToken(WindowsProbeNative.GetCurrentProcess, 0x8_u32, pointerof(token)) == 0 # TOKEN_QUERY
+      note("process_token", details(error: LibC.GetLastError))
+      return
+    end
+    elevated = 0_u32
+    returned = 0_u32
+    WindowsProbeExtra.GetTokenInformation(token, 20_u32, pointerof(elevated).as(Void*), 4_u32, pointerof(returned)) # TokenElevation
+    privileges = [] of String
+    buffer = Slice(UInt8).new(4096)
+    if WindowsProbeExtra.GetTokenInformation(token, 3_u32, buffer.to_unsafe.as(Void*), 4096_u32, pointerof(returned)) != 0 # TokenPrivileges
+      buffer.to_unsafe.as(Pointer(UInt32)).value.times do |i|
+        entry = buffer.to_unsafe + 4 + 12 * i
+        luid = ((entry + 4).as(Pointer(Int32)).value.to_u64 << 32) | entry.as(Pointer(UInt32)).value.to_u64
+        attributes = (entry + 8).as(Pointer(UInt32)).value
+        name_buffer = Slice(UInt16).new(128)
+        length = 128_u32
+        name = WindowsProbeExtra.LookupPrivilegeNameW(Pointer(UInt16).null, pointerof(luid), name_buffer.to_unsafe, pointerof(length)) != 0 ? String.from_utf16(name_buffer[0, length.to_i]) : "luid:#{luid}"
+        privileges << "#{name}#{(attributes & 0x2_u32) != 0 ? "+" : "-"}"
+      end
+    end
+    LibC.CloseHandle(token)
+    note("process_token", details(is_elevated: elevated,
+      priority_class_hex: WindowsProbeExtra.GetPriorityClass(WindowsProbeNative.GetCurrentProcess).to_s(16),
+      has_se_increase_base_priority: privileges.any?(&.starts_with?("SeIncreaseBasePriorityPrivilege")),
+      privileges: privileges.join(",")))
   end
 
   def self.wait_until(timeout : Time::Span, interval : Time::Span = 10.milliseconds, & : -> Bool) : Bool
@@ -5546,6 +5582,7 @@ module NativeProbe
     Dir.mkdir_p(workdir)
     note("environment", details(crystal: Crystal::VERSION, os: "windows", pid: Process.pid,
       executable: self_exe, workdir: workdir, pointer_bytes: sizeof(Void*)))
+    token_note
 
     test("win32_parent_job_membership") do
       in_job = LibC::BOOL.new(0)
