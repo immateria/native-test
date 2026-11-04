@@ -547,6 +547,138 @@ parent ignores only `SIGINT` and `SIGHUP`, yet its children list `SIGPIPE` too).
   So a supervisor that holds the process handle (as the kit does) cannot hit a recycled pid; one that keeps only the
   number can, within seconds.
 
+## Signals and threads, crashes, process trees, scale (`explore/posix/signals_threads.c`, `crash_latency.c`, `tree_enum.c`, `scale.c`)
+
+Eight POSIX runners (runs `41805839970`, `41807338781`, `41808488438`). Identical within an OS family unless stated.
+
+### Signals and threads (verified)
+
+* **A process-directed signal (`kill(pid)` from another process) goes to the main thread if it has the signal
+  unblocked** (40 of 40 on all eight). If the main thread blocks it, **all 40 went to the first-created worker that
+  had it unblocked**; with only thread 3 unblocked, to thread 3. `pthread_kill` reaches exactly its target.
+* 40 sends while every thread blocked the signal left **one** pending instance (standard signals coalesce).
+  Unblocking in the main thread delivers it on both systems. **Unblocking in a worker thread delivers it on Linux but
+  not on macOS**: the already-pending signal stayed undelivered for a full second after the worker unblocked it; a
+  *new* signal sent afterwards was delivered to that worker (and counted once). A macOS program that blocks a signal
+  everywhere and later enables it on a worker only can lose the wake-up it was waiting for.
+* **A blocking `read` is interrupted only if the thread that blocks in it takes the signal**: main unblocked, workers
+  blocked: `EINTR` after 100 ms; main blocked and a worker unblocked: the handler ran in the worker and `read` kept
+  waiting (returned the data 300 ms later). With `SA_RESTART` the read restarts. Identical on both.
+* **A signal that is blocked and pending is cleared by `fork` but kept across `exec`**: the exec'd program inherited
+  the blocked mask and the pending bit, and its new handler ran when it unblocked (both `kill(getpid())` and `raise`).
+* **A signal sent to a forked child before it execs runs the parent's handler in the child** (the handler wrote the
+  child's pid; observed on both). This is the reason a fork-based spawner blocks signals around the fork.
+
+### A crashing process is held back by the crash handler on Linux, not on macOS (verified)
+
+The child wrote a timestamp and then faulted; the table is the time until the pipe reached EOF / `waitpid` returned.
+
+| | macOS (all five) | Ubuntu 22.04, 24.04, 24.04 arm |
+|---|---|---|
+| baselines: exit, `SIGKILL` | 0.1–0.5 ms | 0.0–0.2 ms |
+| null dereference, `abort()`, trap (`RLIMIT_CORE` 0) | **0.1–0.7 ms** | **45–75 ms typical, up to 185 ms** |
+| `kill(pid, SIGSEGV)` from outside | 0.3–0.6 ms | **48–77 ms** |
+| `RLIMIT_CORE` raised to 256 MiB | same as above; no core file appeared, no `core` flag in the status | same delay; no core file in the cwd |
+| `core_pattern` | files in `/cores/core.%P` (`kern.coredump=1`), none produced | **`|/usr/lib/systemd/systemd-coredump ...`** on every image |
+| status | `signaled(SIGSEGV)` | `signaled(SIGSEGV,core)` — the core flag is set although `RLIMIT_CORE` was 0 |
+| crash reports | `ReportCrash` wrote 4–5 `.ips` reports under `~/Library/Logs/DiagnosticReports` within 3 s, **asynchronously: it did not delay the exit** | none |
+
+So on the Ubuntu runners a core-dumping signal (measured: a `SIGSEGV` fault, `SIGSEGV` sent with `kill`, `abort`, the
+trap instruction; the others on the default-core list, `QUIT`, `FPE`, `BUS`, `XCPU`, were not measured) keeps the process
+alive for tens of milliseconds while `systemd-coredump` reads the dump, even with a core limit of zero; `SIGKILL` is not
+affected. A supervisor that stops a child with `SIGQUIT` would pay that delay, and tests that assert on the instant a
+crashed child disappears must allow ~200 ms. The `__builtin_trap`
+instruction raises `SIGTRAP` on arm64 (macOS, Linux) and `SIGILL` on x86.
+
+### Finding the descendants of a process without groups or cgroups (verified, identical on all eight)
+
+The probe builds `probe -> A -> {A1, X -> D}` where `X` exits at once (`D` is reparented to pid 1) and `D` calls
+`setsid()`; every node carries an environment tag.
+
+| method | finds A, A1 | finds D (orphaned, new session) | cost |
+|---|---|---|---|
+| walk the parent-pid table (`/proc/*/stat`, `sysctl KERN_PROC_ALL`) | yes | **no** | 0.4–1 ms |
+| kernel child lists (`proc_listchildpids`, `/proc/<pid>/task/<tid>/children`) | yes | **no** | 0.03–0.07 ms |
+| same process group (probe made group leader) | yes | no (it called `setsid`) | 0.2–1 ms |
+| same session | yes (+ every other process of the runner's session: 7 on Linux, 206–228 on macOS) | no | 0.2–0.9 ms |
+| **read every process's environment for a tag** (`/proc/<pid>/environ`, `sysctl KERN_PROCARGS2`) | yes | **yes** | Linux 1 ms; macOS 11 ms (arm64), 150 ms (Intel) for 400–500 processes |
+
+Only the environment tag finds a daemonized orphan without a cgroup. It works only for programs that were `exec`ed
+with the tag (a bare `fork` keeps the parent's original environment area) and only for processes of the same user
+(`EACCES` for other users' on Linux; macOS returned an error for ~half of the process list, mostly other users' and
+zombies). Start times are available for pid-reuse checks: microseconds on macOS (`pbi_start_tvsec/usec`), 10 ms ticks on
+Linux (`/proc/<pid>/stat` field 22).
+
+### Process creation at scale (verified)
+
+* **Spawn latency** (median, until the child exited and was reaped; trivial program): Linux 0.28–0.55 ms
+  (fork+exec 0.36, `posix_spawn` 0.28; arm 0.43–0.55), macOS 1.0–4.2 ms (Intel runners slowest, 3.6–4.2 ms; `posix_spawn`
+  15–40 % faster than fork+exec), **Windows `CreateProcess` 0.8 ms (2022) / 1.5 ms (2025) / 2.4 ms (arm64) to return, 6.9 / 10.4 / 13 ms until
+  exit**. `JOB assign + resume` added nothing measurable.
+* **A big parent matters only for `fork` on Linux**: with 512 MiB resident, fork+exec took 3.3–6.4 ms to return
+  (7.8–15 ms in total) against 0.05 ms for a small parent; `vfork` and `posix_spawn` did not change (0.06–0.15 ms).
+  On macOS and Windows a 512 MiB parent changed nothing.
+* **First start of a new executable** costs about twice a repeat: macOS 1.4→3.2 ms (one macOS 26 run: 44 ms, then
+  5.6, then 35 — erratic, probably Gatekeeper's assessment), Windows 19→9 ms (2022), 26→12.5 ms (2025), 38→20 ms (arm64); Linux none.
+* **Concurrent children.** Linux forked 299 sleeping children in 14–23 ms (0.05–0.08 ms each) with no slowdown;
+  macOS 505–550 in 180–390 ms (0.4–0.7 ms each; the second hundred was often slower than the first); Windows 400
+  `CreateProcess`+job assignment in 0.7–1.1 s with no failure; `TerminateJobObject` had all 400 gone in 105–185 ms,
+  `kill`+`waitpid` of 300–550 POSIX children in 6–60 ms.
+* **`RLIMIT_NPROC` counts tasks, including unreaped zombies.** With the limit set to the current count plus 20,
+  `fork` of children that exit at once started failing with `EAGAIN` after 21 children on Linux and macOS, and
+  worked again after reaping one (21–26 children; the macOS 14 estimate of the baseline was a few off). Linux counts every thread of the user (the probe counted `/proc/*/task/*`: 47–54 for
+  an idle runner). **On macOS the kernel's count is about half of what `sysctl KERN_PROC_UID` lists** (kernel
+  ~209–269 against 414–519 listed on the five runners; found by seeing how many children fit under a known limit) — I
+  do not know what the listing includes that the kernel does not charge. Defaults: macOS `kern.maxproc` 2000 (arm64) /
+  3132 (Intel), `maxprocperuid` 1333 / 2088; Linux soft = hard = 58 000–64 000.
+
+---
+
+## Windows: suspend, freeze, WM_CLOSE, emulation, scale (`proc_explore suspend|wmclose|emulation|scale`)
+
+Runs `41807338781`, `41808488438`: windows-2022, windows-2025, windows-11-arm; elevated and unelevated gave identical
+results unless stated.
+
+### Suspending and freezing (verified)
+
+* **`NtSuspendProcess` stops all CPU use at once and counts**: 312 ms of CPU in 300 ms running, 0 suspended; two
+  suspends and one resume still 0; the second resume restores the full rate. An extra `NtResumeProcess` without a
+  suspend returns success. `CREATE_SUSPENDED` is one suspend count (`SuspendThread` returned 1, the two `ResumeThread`
+  calls returned 2 and 1).
+* **`TerminateProcess` kills a suspended process at once** (1–2 ms, exit code as given).
+* **A thread-by-thread suspend (Toolhelp snapshot, `SuspendThread`) lost no thread** in 8 trials against a process
+  creating a thread every millisecond (about 100–220 threads), neither one pass nor repeated passes — a window exists
+  but was never hit.
+* **Job freeze works and is the better tool**: `SetInformationJobObject(job, 18 /* JobObjectFreezeInformation */,
+  {Flags=1, Freeze=TRUE})` with a 16-byte struct succeeded on all three builds, elevated or not. Frozen: 0 ms CPU in 300
+  ms (297–312 running). **A process assigned to the frozen job was frozen too** (0 ms). Unfreezing resumed both. **
+  `TerminateJobObject` on a frozen job killed it in 2 ms.** The struct and class number are undocumented in the
+  public headers (written from memory of the community `ntpsapi.h`; the call working is the evidence the layout is right).
+
+### WM_CLOSE and `taskkill` (verified, hosted runners have an interactive desktop: session 2, `WinSta0\Default`)
+
+* A GUI child that handles `WM_CLOSE` by destroying its window exited with its message-loop code **3–4 ms** after the
+  `PostMessage`; one that ignores it was still running after 1.5 s (exit code 259).
+* A GUI thread with one window of its own showed **two** top-level windows in `EnumWindows` (presumably the thread's
+  default IME window as the second; not checked); filter by class, not by "the" window of the pid.
+* **`SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, 1000)` to a thread that never pumps messages waited the full
+  1000 ms (`ERROR_TIMEOUT` 1460) even after `IsHungAppWindow` had turned true (6 s)**, so `SMTO_ABORTIFHUNG` did not
+  shorten it here.
+* `taskkill /PID n` **without `/F`**: on a console program it fails (exit 1, "can only be terminated forcefully (with
+  /F option)") and the process lives; on a GUI process it posts `WM_CLOSE` ("SUCCESS: Sent termination signal") and the
+  child was gone in 60–110 ms.
+
+### x64 and x86 children on Windows 11 arm64 (verified, one runner)
+
+* An **x64 child reports `IsWow64Process2` process machine `0x0000` (not WOW64) with native machine `0xAA64`**,
+  `PROCESSOR_ARCHITECTURE=AMD64`, `GetSystemInfo` architecture 9; an x86 child reports `0x014C`, `x86`, 0, 32-bit
+  pointers; a native child 12 / `ARM64`.
+* Under a job: CPU accounting of an emulated spinner matched the native one (484–516 ms in 500 ms); a 100 ms
+  per-process CPU limit killed the x64 and x86 children with `0xC0000044` exactly as it killed the native one (after
+  1.7 / 6.5 / 6.5 s, which is the phase of the periodic enforcement pass, not a difference between architectures); a
+  200 MiB per-process memory limit let an 80 MiB allocation through and refused 300 MiB (`ERROR_COMMITMENT_LIMIT`) for all
+  three. Nothing the kit relies on behaves differently for emulated children.
+
 ---
 
 ## Still open
