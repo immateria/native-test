@@ -171,7 +171,7 @@ cases = [
   {"garbage_bytes_executable", garbage, [] of String},
   {"symlink_loop", loop_path, [] of String},
   {"path_longer_than_PATH_MAX", "a" * 5000, [] of String},
-  {"argv_over_ARG_MAX", sigstate, ["--dump"] + Array.new(40) { "x" * 100_000 }},
+  {"argv_over_ARG_MAX", sigstate, ["--dump"] + Array.new(100) { "x" * 100_000 }}, # 10 MB: above ARG_MAX everywhere (Linux: stack limit / 4)
   {"component_is_a_file", File.join(noexec, "child"), [] of String},
 ]
 cases.each do |(name, cmd, args)|
