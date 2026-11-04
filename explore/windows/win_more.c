@@ -579,6 +579,7 @@ static wchar_t g_svc_dir[MAX_PATH * 2];
 /* In the service (session 0, outside the runner's job): crash a child plain, in a job with
  * JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, and in a job without it; how long until each child is gone? */
 static void svc_crash_lab(void) {
+  log_to(g_svc_log, "lab service_error_mode=0x%x\n", GetErrorMode());
   for (int v = 0; v < 3; v++) {
     wchar_t lp[MAX_PATH * 2], args[MAX_PATH * 3];
     swprintf(lp, MAX_PATH * 2, L"%ls\\lab-%d.log", g_svc_dir, v);
@@ -803,19 +804,33 @@ static void svc_case_stop(SC_HANDLE scm, const char *kase, const wchar_t *mode, 
   if (!svc_start_ready(&s, kase, &r, &t_start)) return;
   double start_to_ready = r.t - t_start;
   HANDLE hs = open_proc(r.pid), hw = open_proc(r.worker);
-  char cross[256] = "null";
+  char cross[768] = "null";
   if (try_cross_session) {
-    /* AssignProcessToJobObject needs PROCESS_SET_QUOTA | PROCESS_TERMINATE on the process */
+    /* AssignProcessToJobObject needs PROCESS_SET_QUOTA | PROCESS_TERMINATE on the process. First a job whose first member
+     * is a session-2 process (the worker is in no job yet, so only the session rule can refuse), then an empty job. */
     HANDLE ha = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, r.worker);
     DWORD oe = ha ? 0 : GetLastError();
+    HANDLE j2 = CreateJobObjectW(NULL, NULL);
+    PROCESS_INFORMATION pm;
+    memset(&pm, 0, sizeof pm);
+    DWORD se = 0;
+    BOOL m_ok = spawn_self(L"--child-sleep 5000", CREATE_SUSPENDED, NULL, &pm, &se) && AssignProcessToJobObject(j2, pm.hProcess);
+    if (pm.hThread) ResumeThread(pm.hThread);
+    BOOL ok2 = m_ok && ha && AssignProcessToJobObject(j2, ha);
+    DWORD ae2 = ok2 ? 0 : GetLastError();
+    if (pm.hProcess) kill_close(&pm);
+    BOOL in_any = FALSE;
+    if (ha) IsProcessInJob(ha, NULL, &in_any);
     HANDLE j = CreateJobObjectW(NULL, NULL);
     BOOL ok = ha && AssignProcessToJobObject(j, ha);
     DWORD ae = ok ? 0 : GetLastError();
     BOOL inj = FALSE;
     if (ok) IsProcessInJob(ha, j, &inj);
-    snprintf(cross, sizeof cross, "{\"open_with_set_quota_error\":%lu,\"assign_session0_worker_to_session2_job_ok\":%s,\"error\":%lu,\"in_that_job_after\":%s}",
-             (unsigned long)oe, bstr(ok), (unsigned long)ae, bstr(inj));
+    snprintf(cross, sizeof cross, "{\"open_with_set_quota_error\":%lu,\"session2_member_added_first\":%s,\"assign_session0_worker_to_job_with_session2_member_ok\":%s,\"error\":%lu,"
+             "\"worker_in_a_job_before_next\":%s,\"assign_session0_worker_to_empty_job_ok\":%s,\"empty_job_error\":%lu,\"in_that_job_after\":%s}",
+             (unsigned long)oe, bstr(m_ok), bstr(ok2), (unsigned long)ae2, bstr(in_any), bstr(ok), (unsigned long)ae, bstr(inj));
     CloseHandle(j);
+    CloseHandle(j2);
     if (ha) CloseHandle(ha);
   }
   double t0 = abs_ms();
@@ -979,8 +994,12 @@ static void svc_case_failure(SC_HANDLE scm, const char *kase, DWORD ctl, int non
   set_local_dumps(-1, NULL);
 }
 
-static int crash_now(const wchar_t *logpath) {
+/* mode < 0: keep the inherited error mode (SEM_NOGPFAULTERRORBOX etc. are inherited from the parent) */
+static int crash_now(const wchar_t *logpath, int mode) {
   HANDLE log = open_log(logpath);
+  UINT inherited = GetErrorMode();
+  if (mode >= 0) SetErrorMode((UINT)mode);
+  log_to(log, "inherited_error_mode=0x%x error_mode=0x%x\n", inherited, GetErrorMode());
   log_to(log, "crash_at=%.3f\n", abs_ms());
   volatile int *p = NULL;
   *p = 1;
@@ -988,15 +1007,15 @@ static int crash_now(const wchar_t *logpath) {
 }
 
 /* the same crash in an ordinary child in this (interactive) session, for comparison */
-static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags);
-static void plain_crash_case(const char *kase, int dumptype) { plain_crash_case_flags(kase, dumptype, 0); }
-static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags) {
+static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags, int error_mode);
+static void plain_crash_case(const char *kase, int dumptype) { plain_crash_case_flags(kase, dumptype, 0, -1); }
+static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags, int error_mode) {
   wchar_t dir[MAX_PATH * 2], logp[MAX_PATH * 2], args[MAX_PATH * 3];
   swprintf(dir, MAX_PATH * 2, L"%ls\\plain-crash-%d", g_tmp, dumptype + 1);
   CreateDirectoryW(dir, NULL);
   swprintf(logp, MAX_PATH * 2, L"%ls\\crash.log", dir);
   set_local_dumps(dumptype, dir);
-  swprintf(args, MAX_PATH * 3, L"--crash-now \"%ls\"", logp);
+  swprintf(args, MAX_PATH * 3, L"--crash-now \"%ls\" %d", logp, error_mode);
   PROCESS_INFORMATION pi;
   DWORD e;
   if (!spawn_self(args, flags, NULL, &pi, &e)) { emit(kase, "\"spawn_error\":%lu", (unsigned long)e); set_local_dumps(-1, NULL); return; }
@@ -1008,8 +1027,11 @@ static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags) 
   char b[256] = "";
   read_text(logp, b, sizeof b);
   double t_crash = -1;
+  unsigned inh = 0xFFFF, used = 0xFFFF;
   char *q = strstr(b, "crash_at=");
   if (q) sscanf(q + 9, "%lf", &t_crash);
+  q = strstr(b, "inherited_error_mode=");
+  if (q) sscanf(q, "inherited_error_mode=0x%x error_mode=0x%x", &inh, &used);
   double ex = t_crash > 0 ? exit_after(pi.hProcess, t_crash) : -1;
   DWORD code = 0;
   GetExitCodeProcess(pi.hProcess, &code);
@@ -1018,8 +1040,8 @@ static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags) 
   dumps_in(dir, &dumps, &mib);
   DWORD sess = 0;
   ProcessIdToSessionId(GetCurrentProcessId(), &sess);
-  emit(kase, "\"session\":%lu,\"child_in_a_job\":%s,\"local_dumps_type\":%d,\"process_exit_after_crash_ms\":%.0f,\"exit_code\":\"0x%08lx\",\"werfault_processes_seen\":%d,\"werfault_session_mask\":\"0x%lx\",\"dumps\":%d,\"dump_MiB\":%.1f",
-       (unsigned long)sess, bstr(child_in_job), dumptype, ex, (unsigned long)code, wer_max, (unsigned long)wer_sess, dumps, mib);
+  emit(kase, "\"session\":%lu,\"child_inherited_error_mode\":\"0x%x\",\"child_error_mode_at_crash\":\"0x%x\",\"child_in_a_job\":%s,\"local_dumps_type\":%d,\"process_exit_after_crash_ms\":%.0f,\"exit_code\":\"0x%08lx\",\"werfault_processes_seen\":%d,\"werfault_session_mask\":\"0x%lx\",\"dumps\":%d,\"dump_MiB\":%.1f",
+       (unsigned long)sess, inh, used, bstr(child_in_job), dumptype, ex, (unsigned long)code, wer_max, (unsigned long)wer_sess, dumps, mib);
   kill_close(&pi);
   set_local_dumps(-1, NULL);
 }
@@ -1050,7 +1072,10 @@ static void svc_case_crashlab(SC_HANDLE scm, const char *kase, int dumptype) {
   int dumps = 0;
   double mib = 0;
   dumps_in(s.dir, &dumps, &mib);
-  emit(kase, "\"where\":\"children of a session-0 service, outside the runner's job\",\"local_dumps_type\":%d,%s,\"dumps\":%d,\"dump_MiB\":%.1f", dumptype, res, dumps, mib);
+  unsigned sem = 0xFFFF;
+  char *qe = strstr(buf, "lab service_error_mode=");
+  if (qe) sscanf(qe, "lab service_error_mode=0x%x", &sem);
+  emit(kase, "\"where\":\"children of a session-0 service, outside the runner's job\",\"service_error_mode\":\"0x%x\",\"local_dumps_type\":%d,%s,\"dumps\":%d,\"dump_MiB\":%.1f", sem, dumptype, res, dumps, mib);
   svc_cleanup(&s);
   set_local_dumps(-1, NULL);
 }
@@ -1110,7 +1135,10 @@ static void probe_services(void) {
   plain_crash_case("interactive_child_crash_no_local_dumps", -1);
   plain_crash_case("interactive_child_crash_minidump", 1);
   plain_crash_case("interactive_child_crash_full_dump", 2);
-  plain_crash_case_flags("interactive_child_crash_breakaway_from_runner_job_minidump", 1, CREATE_BREAKAWAY_FROM_JOB);
+  plain_crash_case_flags("interactive_child_crash_breakaway_from_runner_job_minidump", 1, CREATE_BREAKAWAY_FROM_JOB, -1);
+  plain_crash_case_flags("interactive_child_crash_error_mode_reset_to_0_minidump", 1, 0, 0);
+  plain_crash_case_flags("interactive_child_crash_error_mode_reset_to_0_no_local_dumps", -1, 0, 0);
+  plain_crash_case_flags("interactive_child_crash_SEM_NOGPFAULTERRORBOX_only_minidump", 1, 0, SEM_NOGPFAULTERRORBOX);
 }
 
 /* ================================================================== exitproc */
@@ -1199,8 +1227,8 @@ static void header(void) {
   ProcessIdToSessionId(GetCurrentProcessId(), &session);
   SYSTEM_INFO si;
   GetNativeSystemInfo(&si);
-  emit("_platform", "\"windows\":\"%lu.%lu.%lu\",\"native_arch\":%u,\"elevated\":%s,\"in_job\":%s,\"session_id\":%lu", (unsigned long)v.dwMajorVersion,
-       (unsigned long)v.dwMinorVersion, (unsigned long)v.dwBuildNumber, (unsigned)si.wProcessorArchitecture, bstr(is_elevated()), bstr(in_job), (unsigned long)session);
+  emit("_platform", "\"windows\":\"%lu.%lu.%lu\",\"native_arch\":%u,\"elevated\":%s,\"in_job\":%s,\"session_id\":%lu,\"error_mode\":\"0x%x\"", (unsigned long)v.dwMajorVersion,
+       (unsigned long)v.dwMinorVersion, (unsigned long)v.dwBuildNumber, (unsigned)si.wProcessorArchitecture, bstr(is_elevated()), bstr(in_job), (unsigned long)session, GetErrorMode());
 }
 
 int main(void) {
@@ -1210,7 +1238,7 @@ int main(void) {
   if (argc >= 3 && wcscmp(argv[1], L"--child-sleep") == 0) { RemoveDirectoryW(g_tmp); Sleep((DWORD)_wtoi(argv[2])); return 0; }
   if (argc >= 4 && wcscmp(argv[1], L"--service") == 0) { RemoveDirectoryW(g_tmp); return service_entry(argv[2], argv[3]); }
   if (argc >= 4 && wcscmp(argv[1], L"--exitproc-child") == 0) { RemoveDirectoryW(g_tmp); return exitproc_child(_wtoi(argv[2]), argv[3]); }
-  if (argc >= 3 && wcscmp(argv[1], L"--crash-now") == 0) { RemoveDirectoryW(g_tmp); return crash_now(argv[2]); }
+  if (argc >= 3 && wcscmp(argv[1], L"--crash-now") == 0) { RemoveDirectoryW(g_tmp); return crash_now(argv[2], argc >= 4 ? _wtoi(argv[3]) : -1); }
 
   CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
   const wchar_t *which = argc >= 2 ? argv[1] : L"";
