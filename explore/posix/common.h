@@ -79,6 +79,8 @@ static const char *errno_name(int e) {
     case ELOOP: return "ELOOP";
     case ENOSYS: return "ENOSYS";
     case ENOTSUP: return "ENOTSUP";
+    case EXDEV: return "EXDEV";
+    case EROFS: return "EROFS";
 #ifdef EBADARCH
     case EBADARCH: return "EBADARCH";
 #endif
