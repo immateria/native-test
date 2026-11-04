@@ -9,7 +9,7 @@ observed directly; "inferred" means it fits the data but was not isolated.
 
 Final state: kit r13 qualifies on **macOS** (386 Crystal + 45 C/SDK cases), on **Windows as the runner provides it
 (elevated)** (459 cases) and on **Windows with a filtered, unelevated token** (459 cases) — run `41776017433`, all
-three validators pass.
+three validators pass; again with the `kevent` EINTR fix (below) in run `41793011070`.
 
 ---
 
@@ -122,8 +122,19 @@ at a 1–50 ms gap in each, 6–26 % at 0 ms; 0 on all three Ubuntu runners.
 
 200/200 zombie registrations failed with `ESRCH` (never "registered but silent"); 100/100 registrations before exit
 delivered. The 16-child kit case lost two registrations that way when spawning outlasted the children's 90–162 ms
-delays. One 8-child failure (8 successful registrations, 7 events) is **unexplained**. Same 200/200 and 100/100 on
-all five macOS runners.
+delays. Same 200/200 and 100/100 on all five macOS runners.
+
+### `kevent` is never restarted after a signal, `SA_RESTART` or not (verified)
+
+The one 8-child failure (8 successful registrations, 7 events) was a **harness bug**. XNU's `kevent_cleanup` turns
+`ERESTART` into `EINTR` ("don't restart after signals", `bsd/kern/kern_event.c`), and Crystal's runtime handles
+`SIGCHLD` (with `SA_RESTART`) for every child that exits. The kit's `kevent_wait` returned that `EINTR` as "no
+event", and the case makes exactly eight single-event waits. `kqueue_zombie.c` emulates it on all five macOS runners
+(run `41791776012`): with a Crystal-like handler 6–23 of 320 waits returned `EINTR` and 15–55 % of trials got fewer
+than 8 events — with or without a second thread that could have taken the signal. The kernel itself lost nothing:
+about 11 000 registrations per runner, with and without a concurrent reaper, at the kit's and at tight exit delays,
+all delivered (run `41790549832`). `kevent_wait` now retries with the remaining time; in the next kit run the case
+needed one retry (`eintr_retries: 1`, run `41793011070`) and passed.
 
 ---
 
@@ -235,13 +246,25 @@ the same in all five configurations unless a difference is stated.
   (`ERROR_CHILD_PROCESS_BLOCKED`), also with the override flag; `..._RESTRICTED_UNLESS_SECURE` lets it create.
 * `JobObjectNetRateControlInformation` (bandwidth, DSCP tag) is accepted and read back, also with the filtered token
   (verified).
-* **I/O rate control works, although Microsoft marks it unsupported.** Both `SetIoRateControlInformationJobObject` and
-  `QueryIoRateControlInformationJobObject` carry "Windows 10, version 1607, and newer: This function is not
-  supported", and the query does fail (24 elevated, 5 with the filtered token). But with `MaxIops = 20`
-  (`ControlFlags = ENABLE`, no volume name) a child doing 4 KiB write-through writes managed 224–240 writes in 25 s
-  (9–10 per second) on every build and token, against 300 writes in 0.7–3.6 s without the limit (run
-  `41788061976`). That the rate is about half of `MaxIops` was not explained (inferred: a write-through write counts
-  as two I/Os).
+* **I/O rate control works, although Microsoft marks it unsupported** — the docs for
+  `SetIoRateControlInformationJobObject`, `QueryIoRateControlInformationJobObject` and the structure all say
+  "Windows 10, version 1607, and newer: ... not supported". Measured on every build, elevated and filtered (runs
+  `41788061976`, `41790104512`, `41791776012`, `41793150011`; `proc_explore iorate`, 5 s windows, unlimited rates
+  0.1–8.6 k ops/s for comparison):
+  * `Set` follows the documented convention (nonzero on success; 0 and error 6 for a non-job handle). It accepts a
+    nonzero `BaseIoSize` (documented as must be 0) and ignores it. `Query` always fails (error 24, or 5 with the
+    filtered token), also for the C: volume's device name; the registry value `StorageBaseIOSize` does not exist.
+  * `MaxIops = 20`: 4 KiB unbuffered overwrites in place run at exactly **20.0** writes/s (with or without
+    write-through), 4 KiB unbuffered reads at 20.6–24.6/s; `MaxIops = 40` gives 39.8–40.0/s. Reads and writes count
+    alike.
+  * I/O is counted in **8 KiB units**: 64 KiB writes run at 2.4–2.6/s (20 / 8), whatever `BaseIoSize` says.
+  * **Appending write-through writes cost two I/Os** (9.2–9.6/s) — the first run's "half rate"; appending without
+    write-through costs one (19.6–19.8/s), so the second is the written-through file-size update (inferred).
+    Buffered writes with `FlushFileBuffers` after each run at 6.6–8.6/s.
+  * `MaxBandwidth` throttles accurately (1 MB/s: 14–15 × 64 KiB or about 243 × 4 KiB per second; 10 MB/s: about
+    150 × 64 KiB per second) but **about once per second one write fails with `ERROR_INVALID_PARAMETER` (87)**, usually
+    the first at about 1.0 s, with or without `MaxIops` as well. Only one 4 KiB run (Server 2022, elevated) had no failure. An
+    IOPS-only limit never failed a write. A bandwidth-limited child therefore sees spurious write errors.
 * Creating a silo through `NtSetInformationJobObject(JobObjectCreateSilo)` returned `STATUS_INVALID_PARAMETER`
   everywhere, and the extended limit `JOB_OBJECT_LIMIT_SILO_READY` was rejected (87). Not pursued.
 
@@ -386,8 +409,7 @@ runners).
 ## Still open
 
 * the in-loop HIGH success in the exploration tool (above);
-* the single macOS 8-child kqueue failure (8 registrations, 7 events);
 * why `pwsh` cannot launch native commands under the filtered token on the hosted runner;
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect) is not documented
   anywhere I found, and why arm64's pass runs later is not known;
-* why an I/O rate limit of 20 IOPS allows about 10 write-through writes per second.
+* why a job bandwidth limit makes about one write per second fail with `ERROR_INVALID_PARAMETER`.
