@@ -354,7 +354,10 @@ module Explore
   # --- privilege enable ----------------------------------------------------
 
   def self.enable_privilege(name : String) : {Bool, UInt32}
-    token = open_token(0x0028_u32) # TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+    token = LibC::HANDLE.null
+    if WX.OpenProcessToken(WX.GetCurrentProcess, 0x0028_u32, pointerof(token)) == 0 # ADJUST_PRIVILEGES | QUERY
+      return {false, LibC.GetLastError}
+    end
     luid = 0_u64
     return {false, LibC.GetLastError} if WX.LookupPrivilegeValueW(Pointer(UInt16).null, wide(name).to_unsafe, pointerof(luid)) == 0
     state = WX::TokenPrivilege1.new
@@ -433,6 +436,38 @@ module Explore
         emit("priority_self") { |j| j.field "phase", phase; j.field "class", name; j.field "set_ok", rc != 0; j.field "set_error", err }
       end
     end
+    exp_priority_caller
+  end
+
+  # The kit gets 1314 requesting a HIGH job class; the same request from this program succeeds. The two
+  # callers differ in their own priority class (this program inherits BELOW_NORMAL from the runner), so
+  # test the request from each caller class.
+  def self.exp_priority_caller : Nil
+    original = WX.GetPriorityClass(WX.GetCurrentProcess)
+    PRIORITY_CLASSES.each do |caller_name, caller_value|
+      next if caller_name == "realtime"
+      WX.SetPriorityClass(WX.GetCurrentProcess, caller_value)
+      actual_caller = WX.GetPriorityClass(WX.GetCurrentProcess)
+      {"high", "realtime", "above_normal"}.each do |target|
+        job = new_job
+        begin
+          info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
+          info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE # the kit's request
+          info.basicLimitInformation.priorityClass = PRIORITY_CLASSES[target]
+          ok, err = set_job_info(job, CLASS_EXTENDED_LIMIT, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
+          emit("priority_caller") do |j|
+            j.field "caller_class", caller_name
+            j.field "caller_actual_hex", "0x#{actual_caller.to_s(16)}"
+            j.field "target_class", target
+            j.field "set_ok", ok
+            j.field "set_error", err
+          end
+        ensure
+          LibC.CloseHandle(job)
+        end
+      end
+    end
+    WX.SetPriorityClass(WX.GetCurrentProcess, original)
   end
 
   # --- cpu time --------------------------------------------------------------

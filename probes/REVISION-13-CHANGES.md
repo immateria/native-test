@@ -29,8 +29,11 @@ checks ran. The first (libproc) pair is renamed `pid_list_count` / `pid_list_err
 The r13 harness fixes cleared 20 of the 28 failures (Windows 15 -> 5, macOS 13 -> 3) and made the C/SDK lane build (all 45 checks pass and
 r12's validator accepts the lane). Native exploration (`explore/`) then explained most of what remained:
 
-* **Windows evaluates job CPU-time limits and notification limits in a periodic system-wide pass of about
-  7 s**, not when a limit is crossed. Evidence: ten trials per setting alternated killed / not killed
+* **Windows evaluates job CPU-time limits and notification limits in a periodic system-wide pass every
+  7.000 s**, not when a limit is crossed. Measured directly (`explore` cpu-period, elevated and unelevated
+  identical): successive kills of a job-time-limited spinner were 7004.6 / 6998.6 / 7000.7 / 6998.9 /
+  6998.5 ms apart, the first kill landing at an arbitrary phase; two jobs started 2.5 s apart were killed at
+  the *same* instant (one global pass, not a per-job timer). Earlier evidence: ten trials per setting alternated killed / not killed
   regardless of the configured limit (50, 150 or 300 ms), killed trials all died ~3.48 s into a 3.5 s spin
   because each firing ends the running trial and phase-locks the next, and the write/read notification
   messages arrived 0.6-4.7 s after the I/O, with two read messages 6.995 s apart. The kit's 4 s spin / 7 s
@@ -48,12 +51,19 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
 * `r9_concurrent_failed_spawn_fd_reuse_stress`: `ProbeThread` contexts keep their event-loop descriptors
   until exit (reproduced: +24 fds for 8 contexts on Linux, 0 for 8 fibers), so this case uses `ProbeFiber`.
 
+* `job_user_time_limit_enforced_and_event` (the one remaining short-window enforcement assertion) also spins and
+  waits two periods.
+
 ## Not changed on purpose
 
-* `r6_priority_applied_high` (`SetInformationJobObject` fails with 1314 in the kit but not in an isolated
-  exploration of the same request) is still asserted as before pending `explore/` priority variants.
+* `r6_priority_applied_high` (`SetInformationJobObject` fails with 1314 in the kit but the identical request
+  succeeds from `explore`; the exploration also shows a job priority class is *not* applied to a process
+  assigned after creation, whereas the kit's create-into-job path applies it) is still asserted as before
+  pending the caller-class experiment in `explore`.
 * The Windows run was elevated (`runneradmin`). The kit says never to run elevated; CI now also runs
-  the kit with a filtered, unelevated token (see `.github/workflows/native-probes.yml`).
+  the kit with a filtered, unelevated token (`explore/windows/job_explore.cr launch-unelevated`: Medium
+  integrity, Administrators deny-only, only SeChangeNotify). Under it `C:\crystal` needed an explicit
+  BUILTIN\Users grant (`Access is denied` otherwise), now done by the setup action.
 
 ## Evidence boundary
 

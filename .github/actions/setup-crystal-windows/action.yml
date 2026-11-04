@@ -48,6 +48,10 @@ runs:
         Expand-Archive -Path crystal.zip -DestinationPath C:\crystal
         Remove-Item crystal.zip
         "C:\crystal" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        # A filtered (unelevated) token has the Administrators group deny-only; make sure the install is
+        # readable and executable through BUILTIN\Users (S-1-5-32-545) too.
+        icacls C:\crystal /grant "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
+        icacls C:\crystal\crystal.exe
         # The zip bundles gc, pcre2, yaml, libxml2, OpenSSL, zlib, LLVM-C and their .lib files.
 
     - name: Verify toolchain

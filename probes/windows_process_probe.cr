@@ -2646,9 +2646,11 @@ module NativeProbe
       job = ProcessSupervision.job(ProcessSupervision::Windows::Job::Limits.new(job_user_time: 260.milliseconds))
       child = nil.as(ProcessSupervision::Child?)
       begin
-        child = job.spawn(self_exe, ["--child", "cpu-spin", "2500"])
-        status = child.wait(6.seconds)
-        event = wait_for_limit_kind(job, ProcessSupervision::Windows::Job::Limit::Event::Kind::EndOfJobTime, 2.seconds)
+        # Job CPU-time limits are enforced by a periodic system-wide pass (7.000 s measured), not when the
+        # limit is crossed; spin and wait for two periods. See REVISION-13-CHANGES.md.
+        child = job.spawn(self_exe, ["--child", "cpu-spin", "15000"])
+        status = child.wait(18.seconds)
+        event = wait_for_limit_kind(job, ProcessSupervision::Windows::Job::Limit::Event::Kind::EndOfJobTime, 3.seconds)
         {event != nil && status != nil, details(event: event.try(&.kind), exit: status.try(&.system_exit_status))}
       ensure
         close_child(child)

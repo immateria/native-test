@@ -55,7 +55,7 @@ jobs:
       - name: Explore job-object behaviour
         if: always()
         env:
-          EXPLORE_CPU_TRIALS: "6"
+          EXPLORE_CPU_TRIALS: "2"
         run: |
           $exe = (Resolve-Path explore-out\job_explore.exe).Path
           foreach ($e in "token", "priority", "notify", "cpu-period", "cpu-time") {
@@ -118,7 +118,7 @@ jobs:
       - name: Explore job-object behaviour (unelevated)
         if: always() && steps.selfcheck.outcome == 'success'
         env:
-          EXPLORE_CPU_TRIALS: "6"
+          EXPLORE_CPU_TRIALS: "2"
         run: |
           $exe = (Resolve-Path explore-out\job_explore.exe).Path
           foreach ($e in "priority", "notify", "cpu-period", "cpu-time") {
