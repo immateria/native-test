@@ -3496,14 +3496,17 @@ module NativeProbe
     children = [] of Process
     reaped = [] of Bool
     begin
-      count.times do |i|
-        children << Process.new(self_exe, ["--child", "delayed-exit-code", (90 + (i % 7) * 12).to_s, (i % 200).to_s])
-        reaped << false
-      end
       result = with_kqueue do |kq|
-        registrations = children.count do |child|
+        # Register each child right after it starts. The children exit 90-162 ms after their own start and
+        # spawning many Crystal processes in a row takes longer than that on a loaded runner; a registration
+        # for a child that has already exited fails with ESRCH (explore/macos/kqueue_zombie.c, 200/200).
+        registrations = 0
+        count.times do |i|
+          child = Process.new(self_exe, ["--child", "delayed-exit-code", (90 + (i % 7) * 12).to_s, (i % 200).to_s])
+          children << child
+          reaped << false
           rc, _, _ = kevent_register(kq, child.pid, NOTE_EXIT, EV_ADD | EV_ONESHOT)
-          rc == 0
+          registrations += 1 if rc == 0
         end
         seen = Set(UInt64).new
         deadline = Time.instant + 5.seconds

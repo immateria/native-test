@@ -500,7 +500,49 @@ module Explore
     emit("priority_minimal") do |j|
       j.field "raw", variants.join(" ")
       j.field "thread_token", thread
+      j.field "privilege_enabled", privilege_enabled?("SeIncreaseBasePriorityPrivilege").to_s
     end
+
+    # The first request above fails. The long exploration run earlier succeeded, so SOMETHING it did first
+    # enabled the privilege. Repeat the HIGH request after each SetPriorityClass(self, ...) to see which call.
+    original = WX.GetPriorityClass(WX.GetCurrentProcess)
+    PRIORITY_CLASSES.each do |name, value|
+      WX.SetPriorityClass(WX.GetCurrentProcess, value)
+      WX.SetPriorityClass(WX.GetCurrentProcess, original)
+      outcome = high_request_outcome
+      emit("priority_flip") do |j|
+        j.field "after_SetPriorityClass_self", name
+        j.field "high_job_request", outcome
+        j.field "privilege_enabled", privilege_enabled?("SeIncreaseBasePriorityPrivilege").to_s
+      end
+    end
+  end
+
+  def self.high_request_outcome : String
+    job = new_job
+    info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
+    info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    info.basicLimitInformation.priorityClass = PRIORITY_CLASSES["high"]
+    ok, err = set_job_info(job, CLASS_EXTENDED_LIMIT, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
+    LibC.CloseHandle(job)
+    ok ? "ok" : err.to_s
+  end
+
+  # nil = the token does not hold the privilege
+  def self.privilege_enabled?(name : String) : Bool?
+    token = open_token(0x0008_u32)
+    returned = 0_u32
+    big = Slice(UInt8).new(4096)
+    result = nil.as(Bool?)
+    if WX.GetTokenInformation(token, 3_u32, big.to_unsafe.as(Void*), 4096_u32, pointerof(returned)) != 0
+      big.to_unsafe.as(Pointer(UInt32)).value.times do |i|
+        entry = big.to_unsafe + 4 + 12 * i
+        luid = ((entry + 4).as(Pointer(Int32)).value.to_u64 << 32) | entry.as(Pointer(UInt32)).value.to_u64
+        result = ((entry + 8).as(Pointer(UInt32)).value & 0x2_u32) != 0 if privilege_name(luid) == name
+      end
+    end
+    LibC.CloseHandle(token)
+    result
   end
 
   # --- cpu time --------------------------------------------------------------

@@ -53,6 +53,8 @@ lib WindowsProbeExtra
   fun QueryInformationJobObject(job : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
   fun OpenProcessToken(process : LibC::HANDLE, access : UInt32, token : LibC::HANDLE*) : LibC::BOOL
   fun OpenThreadToken(thread : LibC::HANDLE, access : UInt32, open_as_self : LibC::BOOL, token : LibC::HANDLE*) : LibC::BOOL
+  fun LookupPrivilegeValueW(system_name : UInt16*, name : UInt16*, luid : UInt64*) : LibC::BOOL
+  fun AdjustTokenPrivileges(token : LibC::HANDLE, disable_all : LibC::BOOL, new_state : Void*, buffer_length : UInt32, previous_state : Void*, return_length : UInt32*) : LibC::BOOL
   fun GetTokenInformation(token : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
   fun LookupPrivilegeNameW(system_name : UInt16*, luid : UInt64*, name : UInt16*, length : UInt32*) : LibC::BOOL
   fun GetPriorityClass(process : LibC::HANDLE) : UInt32
@@ -427,6 +429,28 @@ module NativeProbe
     held
   end
 
+  # Enables or disables SeIncreaseBasePriorityPrivilege on the process token. Returns true when the adjustment
+  # took effect (false when the token does not hold the privilege: ERROR_NOT_ALL_ASSIGNED).
+  def self.set_se_increase_base_priority(enabled : Bool) : Bool
+    token = LibC::HANDLE.null
+    return false if WindowsProbeExtra.OpenProcessToken(WindowsProbeNative.GetCurrentProcess, 0x28_u32, pointerof(token)) == 0 # ADJUST_PRIVILEGES | QUERY
+    luid = 0_u64
+    name = "SeIncreaseBasePriorityPrivilege".to_utf16
+    ok = false
+    if WindowsProbeExtra.LookupPrivilegeValueW(Pointer(UInt16).null, name.to_unsafe, pointerof(luid)) != 0
+      state = uninitialized UInt8[16] # TOKEN_PRIVILEGES with one entry: u32 count, u32 luid low, i32 luid high, u32 attributes
+      pointer = state.to_unsafe
+      pointer.as(Pointer(UInt32)).value = 1_u32
+      (pointer + 4).as(Pointer(UInt32)).value = (luid & 0xffff_ffff_u64).to_u32
+      (pointer + 8).as(Pointer(Int32)).value = (luid >> 32).to_i32
+      (pointer + 12).as(Pointer(UInt32)).value = enabled ? 0x2_u32 : 0_u32
+      WindowsProbeExtra.AdjustTokenPrivileges(token, 0, pointer.as(Void*), 0_u32, Pointer(Void).null, Pointer(UInt32).null)
+      ok = LibC.GetLastError == 0_u32 # 1300 = ERROR_NOT_ALL_ASSIGNED
+    end
+    LibC.CloseHandle(token)
+    ok
+  end
+
   def self.priority_checkpoint(label : String) : Nil
     note("priority_checkpoint_#{label}", details(high: raw_priority_variants(ProcessSupervision::Windows::Job::PriorityClass::High.value)))
   end
@@ -767,7 +791,8 @@ module NativeProbe
       flags = 0_u32
       rc = WindowsProbeNative.GetHandleInformation(probe_handle, pointerof(flags))
       code = rc == 0 ? LibC.GetLastError : 0_u32
-      File.write(marker, {"accessible" => (rc != 0), "error" => code, "flags" => flags}.to_json)
+      signaled = rc != 0 && LibC.WaitForSingleObject(probe_handle, 0_u32) == 0_u32
+      File.write(marker, {"accessible" => (rc != 0), "signaled" => signaled, "error" => code, "flags" => flags}.to_json)
       exit 0
     when "check-handles"
       marker = ARGV[2]? || raise "missing marker"
@@ -5232,17 +5257,23 @@ module NativeProbe
     end
 
     test("r6_priority_applied_high") do
+      # Microsoft: "The calling process must enable the SE_INC_BASE_PRIORITY_NAME privilege" for a priority class
+      # above ABOVE_NORMAL. An administrator token HOLDS it disabled, so the request is rejected with 1314 unless
+      # the caller enables it first (measured: a fresh process fails with 1314 for all three request shapes).
+      # A token that does not hold it at all (unelevated / standard user) is rejected regardless.
+      held = token_holds_se_increase_base_priority?
+      enabled = held && set_se_increase_base_priority(true)
       begin
-        probe_priority_applied(ProcessSupervision::Windows::Job::PriorityClass::High, "r6_high")
+        passed, data = probe_priority_applied(ProcessSupervision::Windows::Job::PriorityClass::High, "r6_high")
+        {passed, data.merge(details(privilege_held: held, privilege_enabled_for_test: enabled))}
       rescue ex : ProcessSupervision::Error::Native
-        # A token without SeIncreaseBasePriorityPrivilege (an unelevated / standard user) is rejected with 1314:
-        # that is the documented behaviour, not a defect. A token that DOES hold it and is still rejected is
-        # unexplained (see REVISION-13-CHANGES.md) and stays a failure.
-        if ex.native_code == 1314 && !token_holds_se_increase_base_priority?
+        if ex.native_code == 1314 && !held
           {true, details(outcome: "privilege_not_held_1314_expected", native_code: ex.native_code)}
         else
           raise ex
         end
+      ensure
+        set_se_increase_base_priority(false) if enabled
       end
     end
 
@@ -5852,7 +5883,10 @@ module NativeProbe
         lpSecurityDescriptor: Pointer(Void).null,
         bInheritHandle: 1
       )
-      event = WindowsProbeNative.CreateEventW(pointerof(security), 1, 0, Pointer(UInt16).null)
+      # Created SIGNALED: a handle number alone proves nothing (the child owns handles of its own, and an unelevated
+      # child owns different ones, so number 216 can be valid in it for an unrelated object). The child reports
+      # whether the handle it finds at that number is a signaled waitable object, i.e. our event.
+      event = WindowsProbeNative.CreateEventW(pointerof(security), 1, 1, Pointer(UInt16).null)
       raise "CreateEventW failed: #{LibC.GetLastError}" if event.null?
       job = nil.as(ProcessSupervision::Windows::Job?)
       child = nil.as(ProcessSupervision::Child?)
@@ -5864,8 +5898,10 @@ module NativeProbe
         raise "child did not complete" unless status
         payload = JSON.parse(File.read(marker))
         accessible = payload["accessible"].as_bool
-        {status.success? && !accessible,
-         details(handle: event.address.to_s, wrongly_inherited: accessible,
+        wrongly_inherited = accessible && payload["signaled"].as_bool
+        {status.success? && !wrongly_inherited,
+         details(handle: event.address.to_s, wrongly_inherited: wrongly_inherited,
+           number_valid_in_child: accessible, number_collision_only: accessible && !wrongly_inherited,
            child_error_code: payload["error"].as_i, child_exit_code: status.exit_code)}
       ensure
         close_child(child)

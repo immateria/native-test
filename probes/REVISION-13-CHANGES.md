@@ -56,14 +56,20 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
   (`explore/macos/kqueue_zombie.c`: 200 of 200 trials; 100 of 100 live registrations delivered), which would have
   shown as a failed registration, not a missing event. The case now registers each child right after spawning it
   (removing that ESRCH path on slow runners) and records `event_rcs` and `missing_pids` so a recurrence says more.
-* **Unexplained: HIGH job priority class is rejected with 1314 from the elevated kit process, from its very first
-  instruction** (`priority_checkpoint_start`; the raw API fails the same way, so it is not the shard), while an
-  identical request from `job_explore` succeeds under an identical token (same privileges, held and disabled; same
-  priority class; same launch method). Microsoft documents that the caller needs `SeIncreaseBasePriorityPrivilege`;
-  a Stack Overflow report fixed the same 1314 by enabling it. `job_explore priority-minimal` and
-  `windows_process_probe --child raw-priority` now run the request first in a fresh process, with the thread
-  token. `r6_priority_applied_high` accepts 1314 only when the token does not hold the privilege (the unelevated
-  run); the elevated 1314 stays a failure.
+* **A HIGH job priority class is rejected with 1314 by an elevated token that merely holds
+  `SeIncreaseBasePriorityPrivilege` disabled.** Measured in fresh processes (no earlier calls): the kit executable
+  and `job_explore` both get 1314 for all three request shapes (basic, extended, extended + KILL_ON_JOB_CLOSE), with
+  no thread token. This matches Microsoft's "the calling process must enable" the privilege (and a Stack Overflow
+  report that fixed the same 1314 by enabling it). An earlier `job_explore` run appeared to succeed because calls it
+  made first changed the process state; `priority_flip` rows locate which. `r6_priority_applied_high` now enables the
+  privilege when the token holds it (and disables it afterwards) and expects success; a token that does not hold it
+  (the unelevated run) is expected to get 1314.
+* `handle_allowlist_blocks_unrelated_inheritable_event` passed elevated and failed unelevated with
+  `wrongly_inherited: true`, but only because the check treated "some valid handle has this number in the child" as
+  inheritance, and a filtered-token child owns different handles. The event is now created signaled and the child
+  reports whether that handle is a signaled waitable object (`number_collision_only` records the benign case).
+* `r6_kqueue_many_children_16` had 14 of 16 successful registrations: the same spawn-all-then-register race as the
+  8-child case (late registration fails with `ESRCH`, measured); it now registers each child right after spawning.
 * `job_user_time_limit_enforced_and_event` (the one remaining short-window enforcement assertion) also spins and
   waits two periods.
 
