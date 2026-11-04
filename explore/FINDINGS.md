@@ -173,6 +173,29 @@ From `explore/posix/crystal_spawn.cr` on all eight POSIX runners (macOS and Linu
   and 127).
 * `Process::Status#exit_reason` maps TERM → `SessionEnded`, KILL → `Aborted`, SEGV → `AccessViolation`.
 
+From `explore/windows/crystal_spawn_win.cr` on Windows Server 2025 and 2022 (runs `41798991357`, `41800538877`):
+
+* **Every inheritable handle in the parent reaches every child**: `Process.new` calls `CreateProcessW` with
+  `bInheritHandles = TRUE` and no handle list; an inheritable event created by the parent was valid and signaled in the
+  child (a non-inheritable one was not; on Server 2022 its number happened to be some other valid handle there).
+* **`Process#terminate` is `TerminateProcess(handle, 1)`**, `graceful: true` or not: the status reads `1`,
+  `exit_reason Normal`, indistinguishable from a child that exited with 1. `Process#signal` raises
+  `NotImplementedError`.
+* Exit codes: `259` (`STILL_ACTIVE`) reads as a normal exit 259; `0xC0000005` and `0xC00000FD` → `AccessViolation`,
+  `0xC000013A` → `Interrupted`; `0xC0000409` (fail-fast), `0xC0000094` (integer divide by zero), `0x40010004` and
+  `0xE0000001` → `Unknown`. Any status with the top bits set has `exit_code` nil and `normal_exit?` false.
+* Spawn errors: missing file → `File::NotFoundError`; directory → `File::AccessDeniedError`; `.bat`, `.cmd` (also with
+  a trailing `. `) and a `.txt` → `File::BadExecutableError` (Crystal refuses batch files on purpose, "BatBadBut"); a
+  garbage `.exe` → plain `IO::Error` with an **empty message** (`ERROR_EXE_MACHINE_TYPE_MISMATCH`, 216, is not mapped);
+  a missing `chdir:` → `File::NotFoundError` naming the command ("The directory name is invalid").
+* **Executable search includes the current directory before the system directories**: with a `whoami.exe` in the
+  parent's current directory, `Process.run("whoami")` ran that copy. `chdir:` does not take part: the bare name and a
+  relative path are both resolved in the parent's directory — the opposite of POSIX, where the relative path is
+  resolved after `chdir`.
+* Arguments with spaces, quotes, backslashes, empty strings, `%PATH%`, `^&|<>`, tabs and non-ASCII round-trip exactly.
+* `env: {"PROBE_A" => "1", "probe_a" => "2"}` puts **both** into the child's environment block, although Windows
+  environment names are case-insensitive; `clear_env: true` leaves only what was given.
+
 ## Windows process control beyond Job objects (`explore/windows/proc_explore.c`)
 
 Measured on Windows Server 2025 (26100) and Server 2022 (20348) x64, elevated and with the filtered token, and on
@@ -481,6 +504,48 @@ below then runs **unprivileged** inside that subtree, and was identical on all t
 * **`signalfd`**: 12 simultaneous child exits gave **one** `SIGCHLD` record; one `waitpid(WNOHANG)` loop found all 12.
 * **`oom_score_adj`**: runner processes start at 500; an unprivileged parent can raise its child's value to 1000 and
   lower it to 0, but not to a negative value (`-500`: `EACCES`).
+
+---
+
+## Pipes, stdio and PID reuse (`explore/posix/pipes.c`, `pid_reuse.c`, `proc_explore pipes|pidreuse`)
+
+All eight POSIX runners and all five Windows configurations (runs `41798991357`, `41800538877`). Results were the
+same within each OS family unless stated.
+
+**A fact about the runners first: GitHub Actions steps on macOS and Linux start with `SIGPIPE` ignored**, inherited
+from the runner process (verified: `pipes` reports `inherited_sigpipe_disposition: ignored` on all eight; `sigstate`'s
+parent ignores only `SIGINT` and `SIGHUP`, yet its children list `SIGPIPE` too). Any test that relies on the default
+`SIGPIPE` action must set it explicitly.
+
+### Pipes and stdio (verified)
+
+| | macOS | Linux | Windows (anonymous pipe) |
+|---|---|---|---|
+| capacity before the writer blocks | 64 KiB (any write size) | 64 KiB; `F_SETPIPE_SZ` up to `pipe-max-size` 1 MiB unprivileged, 64 MiB `EPERM` | the `nSize` asked for; `0` gives **4 KiB** |
+| child writes 1 MiB while the supervisor waits for exit first | blocked (deadlock until read) | blocked, state `S` | blocked |
+| supervisor closes its read end, default `SIGPIPE` | child killed by `SIGPIPE` | killed by `SIGPIPE` | `WriteFile` fails `ERROR_NO_DATA` (232) |
+| same with `SIGPIPE` ignored (every Crystal child, every CI step) | `write` fails `EPIPE` | `EPIPE` | — |
+| **the child also inherited the read end** | **blocks forever** (it is its own reader) | blocks forever | blocks forever (inheritable read handle) |
+| supervisor closes the child's stdin | `read` returns 0 | returns 0 | `ReadFile` **fails** `ERROR_BROKEN_PIPE` (109), no 0-byte success |
+| child started with descriptors 0–2 closed | its first `open` gets fd **0** and the next fd 1, so whatever it later writes to "stdout" lands in that file (inferred); writes to 1/2 before that fail `EBADF` | same | (a child given `NULL` std handles under `CREATE_NO_WINDOW` wrote successfully — inferred: to its new console) |
+| `O_NONBLOCK` set on the supervisor's copy of the child's stdin | the child's blocking `read` fails `EAGAIN`: one open file description, one flag | same | — |
+| EOF on a pipe whose write end a grandchild inherited | only when the grandchild exits (612 ms later) | same | — |
+
+### PID reuse (verified)
+
+* **macOS and Linux hand out pids sequentially** (200 of 200 consecutive children got pid + 1; on one macOS 26 run
+  other activity made 33 steps of 2).
+* **macOS reuses a pid after one wrap of its 99 999 limit**: the first pid came back after 98 400–99 000 forks, i.e.
+  **40–86 s** of continuous spawning (1 100–2 500 forks/s), on four of five runners; the fifth (macOS 15 Intel) had
+  wrapped when the 90 s budget ran out. A held, unreaped zombie's pid was never reissued.
+* **Linux** (`pid_max` 4 194 304, 6 400–9 300 forks/s): a full cycle takes about 7.5–11 minutes of spawning — but
+  inside an unprivileged user + PID namespace, writing `ns_last_pid` made the very next child get the pid just freed
+  (Ubuntu 22.04). On 24.04 AppArmor's userns restriction blocks that (`uid_map`, mount and `ns_last_pid` all `EPERM`).
+* **Windows reuses pids almost at once**: 600 spawn/wait/close cycles produced only 325–471 distinct pids, the first
+  repeat after 104–304 children (4–10 s). **An open handle to an exited process keeps its pid out of circulation**
+  (0 reissues in 600 children while held); after closing it the pid came back within 600 children once in five.
+  So a supervisor that holds the process handle (as the kit does) cannot hit a recycled pid; one that keeps only the
+  number can, within seconds.
 
 ---
 
