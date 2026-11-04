@@ -830,7 +830,7 @@ The test service is an own-process service running this executable as LocalSyste
 | access violation in the service | `ControlService` returned `ERROR_BROKEN_PIPE` (109) when the process died, **161–942 ms after the crash** (WER, below); with the restart action (1000 ms delay) the new instance was ready 1.004–1.032 s after the old one exited, **while the old instance's worker was still running** |
 | `ExitProcess(3)` without reporting `STOPPED` | treated as a failure: restarted after the delay |
 | reports `STOPPED` with `ERROR_SERVICE_SPECIFIC_ERROR` | not restarted — unless `FailureActionsOnNonCrashFailures` is set, then restarted after the delay |
-| a session-0 worker assigned to a job created by this session-2 process | **succeeded** (with `PROCESS_SET_QUOTA`; a first attempt without it gave error 5) |
+| a session-0 worker assigned to a job created by this session-2 process | **into an empty job: succeeded** (with `PROCESS_SET_QUOTA`; a first attempt without it gave error 5). **Into a job that already holds a session-2 process: `ERROR_ACCESS_DENIED` (5)** — the worker in no job before, so only the session rule refused it (run `41891670151`). A job takes the session of its first process |
 
 **Crash reporting, and why the runner's own crashes are fast.** A crashing *service* goes through WER: 161–942 ms
 between the fault and the process exit, and with a per-program `LocalDumps` key a minidump (0.6–0.9 MiB) or a full
@@ -898,14 +898,11 @@ says nothing about whether its cleanup ran.
 
 ## Still open
 
-* the in-loop HIGH success in the exploration tool (above);
-* why `pwsh` cannot launch native commands under the filtered token on the hosted runner;
-* the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect) is not documented
-  anywhere I found, and why arm64's pass runs later is not known;
-* why a job bandwidth limit makes about one write per second fail with `ERROR_INVALID_PARAMETER`;
-* why a signal that is pending process-wide is not delivered on macOS when a non-main thread unblocks it (only a new
-  signal, or the main thread unblocking, delivers it);
-* why the macOS kernel's `RLIMIT_NPROC` count is about half of what `KERN_PROC_UID` lists;
-* `memorystatus_control(SET_JETSAM_TASK_LIMIT)` failing `EINVAL` for root (probably wrong arguments);
-* the unmeasured parts of this round: the core-dumping signals other than `SEGV`/`ABRT`/trap on Linux; `SIGTERM`
-  stopping a process stuck in a crash handler; WER timing on a *service* process; Windows services and session 0.
+* the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time
+  timer is in the Windows Research Kernel (`PSP_JOB_TIME_LIMITS_TIME = -7`, `psjob.c`) and a third-party disassembly of
+  a later x64 kernel shows the balance-set manager counting it down; why arm64's pass runs later is not known;
+* which code returns `ERROR_INVALID_PARAMETER` for a write when `MaxBandwidth` is not a multiple of 4 KiB;
+* why a hung service STOP handler blocks `ControlService` for 240 s on these runners, and what ends the service process
+  then (exit code 0);
+* not measured: a shared-process (`svchost`-style) service, preshutdown and system shutdown ordering; the macOS
+  `posix_spawnattr_setjetsam_ext` limit for grandchildren and after `exec`; GitHub Actions' own cancellation timing.
