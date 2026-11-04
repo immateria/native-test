@@ -1011,7 +1011,9 @@ static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags, 
 static void plain_crash_case(const char *kase, int dumptype) { plain_crash_case_flags(kase, dumptype, 0, -1); }
 static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags, int error_mode) {
   wchar_t dir[MAX_PATH * 2], logp[MAX_PATH * 2], args[MAX_PATH * 3];
-  swprintf(dir, MAX_PATH * 2, L"%ls\\plain-crash-%d", g_tmp, dumptype + 1);
+  static int n_case;
+  /* one directory per case: a shared, appended log would hand a later case an earlier case's timestamp and dumps */
+  swprintf(dir, MAX_PATH * 2, L"%ls\\plain-crash-%d", g_tmp, ++n_case);
   CreateDirectoryW(dir, NULL);
   swprintf(logp, MAX_PATH * 2, L"%ls\\crash.log", dir);
   set_local_dumps(dumptype, dir);

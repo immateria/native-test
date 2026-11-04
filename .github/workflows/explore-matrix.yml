@@ -6,6 +6,12 @@ name: explore-matrix
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: "which jobs to run"
+        type: choice
+        options: [all, posix, linux, windows]
+        default: all
   push:
     paths:
       - "explore/posix/**"
@@ -23,6 +29,7 @@ env:
 jobs:
   posix:
     name: POSIX ${{ matrix.runner }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'posix'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -157,6 +164,7 @@ jobs:
   # service manager would), subreaper, pidfd, PDEATHSIG, PID namespaces; plus the kit's own Linux shards.
   linux:
     name: Linux ${{ matrix.runner }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -252,6 +260,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.runner }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     strategy:
