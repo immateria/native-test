@@ -689,6 +689,26 @@ results unless stated.
   /F option)") and the process lives; on a GUI process it posts `WM_CLOSE` ("SUCCESS: Sent termination signal") and the
   child was gone in 60–110 ms.
 
+### AppContainer children (verified on windows-2022, 2025, 11-arm; elevated and unelevated alike)
+
+`CreateAppContainerProfile` worked for the runner (also unelevated); the child was started with
+`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` (no capabilities), suspended, assigned to a job (kill on close), resumed.
+The container SID was given read/execute on the program directory and full access on a scratch directory with
+`icacls` (it exited 5 for the program directory when unelevated, but the program started anyway: the workspace ACL
+already allowed it).
+
+* **It starts, runs and exits normally; the job controls it.** Token: `TokenIsAppContainer` 1, integrity **Low**
+  (`0x1000`), in the supervisor's job. Its exit code (0) and wait semantics are those of any child.
+* **It cannot touch the supervisor**: `OpenProcess(supervisor)` for `PROCESS_QUERY_LIMITED_INFORMATION`,
+  `SYNCHRONIZE` and `PROCESS_TERMINATE` all failed with access denied (5).
+* **File system**: it wrote to the granted scratch directory and to its own `GetTempPath` (a per-container
+  directory), and was denied (5) in `C:\Users\Public` and `C:\Windows\Temp`.
+* **Loopback networking is silently blocked**: `connect` to a listener on `127.0.0.1` neither succeeded nor was
+  refused — **no answer within 3 s** (the packets are dropped; a blocking `connect` waits ~21 s, which is what made my
+  first version of the probe look hung).
+* **It can start grandchildren** (`ok`), which are in the job too, and **create a job object and assign itself to
+  it** (nested job, `ok`).
+
 ### x64 and x86 children on Windows 11 arm64 (verified, one runner)
 
 * An **x64 child reports `IsWow64Process2` process machine `0x0000` (not WOW64) with native machine `0xAA64`**,
@@ -708,4 +728,10 @@ results unless stated.
 * why `pwsh` cannot launch native commands under the filtered token on the hosted runner;
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect) is not documented
   anywhere I found, and why arm64's pass runs later is not known;
-* why a job bandwidth limit makes about one write per second fail with `ERROR_INVALID_PARAMETER`.
+* why a job bandwidth limit makes about one write per second fail with `ERROR_INVALID_PARAMETER`;
+* why a signal that is pending process-wide is not delivered on macOS when a non-main thread unblocks it (only a new
+  signal, or the main thread unblocking, delivers it);
+* why the macOS kernel's `RLIMIT_NPROC` count is about half of what `KERN_PROC_UID` lists;
+* `memorystatus_control(SET_JETSAM_TASK_LIMIT)` failing `EINVAL` for root (probably wrong arguments);
+* the unmeasured parts of this round: the core-dumping signals other than `SEGV`/`ABRT`/trap on Linux; `SIGTERM`
+  stopping a process stuck in a crash handler; WER timing on a *service* process; Windows services and session 0.
