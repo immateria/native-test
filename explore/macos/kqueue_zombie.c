@@ -14,6 +14,7 @@
 
 #ifdef __APPLE__
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
@@ -172,6 +173,68 @@ static void many_children(const char *label, int n, int concurrent_reap, int bas
   fflush(stdout);
 }
 
+/* XNU's kevent_cleanup turns ERESTART into EINTR ("don't restart after signals"), so SA_RESTART does not restart
+ * kevent. The kit's kevent_wait does not retry on EINTR and its 8-child case makes exactly 8 single-event calls:
+ * a SIGCHLD that lands on the waiting thread before the event is queued costs one attempt. Emulate that:
+ * Crystal-like handler (SA_RESTART, writes the signal number to a pipe), children exiting 180+25*i ms after
+ * start, 8 kevent calls of one event each with a 2 s timeout and no retry. With helper_thread, a second thread
+ * that does not block SIGCHLD exists, so the signal can land on either thread (as in a multi-threaded runtime). */
+#include <pthread.h>
+static int g_sigpipe[2];
+static void pipe_handler(int sig) {
+  int saved = errno;
+  unsigned char b = (unsigned char)sig;
+  (void)!write(g_sigpipe[1], &b, 1);
+  errno = saved;
+}
+static void *idle_thread(void *arg) { (void)arg; for (;;) pause(); return NULL; }
+
+static void kit_emulation(const char *label, int helper_thread, int trials) {
+  if (pipe(g_sigpipe) != 0) return;
+  fcntl(g_sigpipe[0], F_SETFL, O_NONBLOCK);
+  fcntl(g_sigpipe[1], F_SETFL, O_NONBLOCK);
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sigemptyset(&sa.sa_mask);
+  sa.sa_handler = pipe_handler;
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGCHLD, &sa, NULL);
+  pthread_t th;
+  if (helper_thread) pthread_create(&th, NULL, idle_thread, NULL);
+  int eintr = 0, timeouts = 0, short_trials = 0, events_total = 0, reg_ok = 0;
+  for (int t = 0; t < trials; t++) {
+    int kq = kqueue();
+    pid_t pids[8];
+    for (int i = 0; i < 8; i++) {
+      pids[i] = fork();
+      if (pids[i] == 0) { usleep((useconds_t)(180 + i * 25) * 1000); _exit(i); }
+      if (register_exit(kq, pids[i]) == 0) reg_ok++;
+    }
+    int got = 0;
+    for (int k = 0; k < 8; k++) {
+      struct kevent ev;
+      struct timespec ts = {2, 0};
+      int r = kevent(kq, NULL, 0, &ev, 1, &ts);
+      if (r == 1 && (ev.fflags & NOTE_EXIT)) got++;
+      else if (r < 0 && errno == EINTR) eintr++;
+      else if (r == 0) timeouts++;
+    }
+    events_total += got;
+    if (got < 8) short_trials++;
+    close(kq);
+    for (int i = 0; i < 8; i++) { int st; waitpid(pids[i], &st, 0); }
+    unsigned char drain[64];
+    while (read(g_sigpipe[0], drain, sizeof drain) > 0) {}
+  }
+  sa.sa_handler = SIG_DFL;
+  sigaction(SIGCHLD, &sa, NULL);
+  close(g_sigpipe[0]); close(g_sigpipe[1]);
+  printf("{\"scenario\":\"kqueue_kit_emulation\",\"case\":\"%s\",\"helper_thread\":%s,\"trials\":%d,\"registered_ok\":%d,"
+         "\"kevent_calls_returning_EINTR\":%d,\"kevent_calls_timing_out\":%d,\"exit_events\":%d,\"trials_with_fewer_than_8_events\":%d}\n",
+         label, helper_thread ? "true" : "false", trials, reg_ok, eintr, timeouts, events_total, short_trials);
+  fflush(stdout);
+}
+
 int main(void) {
   trial_set("register_before_exit", 0, 100);
   trial_set("register_after_exit_zombie", 1, 200);
@@ -181,6 +244,8 @@ int main(void) {
   many_children("tight_delays_concurrent_reaper", 8, 1, 2, 1, 300);
   many_children("immediate_exit_concurrent_reaper", 8, 1, 0, 0, 300);
   many_children("sixteen_tight_concurrent_reaper", 16, 1, 1, 1, 200);
+  kit_emulation("sa_restart_handler_single_thread", 0, 40);
+  kit_emulation("sa_restart_handler_with_second_thread", 1, 40); /* last: the helper thread stays */
   return 0;
 }
 #else

@@ -833,12 +833,12 @@ static int child_io(const wchar_t *mode, const wchar_t *path, int size, int flag
       pos += size;
     }
     BOOL ok = reading ? ReadFile(h, buf, (DWORD)size, &n, NULL) : WriteFile(h, buf, (DWORD)size, &n, NULL);
-    if (!ok) return 3;
+    if (!ok) return (int)(0x10000u | GetLastError()); /* exit code says which error */
     if (mode[0] == L'f') FlushFileBuffers(h); /* buffered overwrite + flush after each write */
   }
 }
 
-typedef struct { const char *name; const wchar_t *mode; int size, flags; LONG64 max_iops, max_bw; } io_case_t;
+typedef struct { const char *name; const wchar_t *mode; int size, flags; LONG64 max_iops, max_bw; ULONG base; } io_case_t;
 
 static void prefill(const wchar_t *path, LONGLONG bytes) {
   HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -859,6 +859,7 @@ static void io_run(const io_case_t *c, int limited, PFN_SetIoRate setio, const w
     memset(&r, 0, sizeof r);
     r.MaxIops = c->max_iops;
     r.MaxBandwidth = c->max_bw;
+    r.BaseIoSize = c->base; /* documented as "must be 0" for Set, but a nonzero value was accepted */
     r.ControlFlags = 1;
     SetLastError(0);
     sret = setio(j, &r);
@@ -950,15 +951,19 @@ static void probe_iorate(void) {
   tmp_file(fapp, MAX_PATH * 2, L"io-append.bin");
   prefill(fpre, 8LL << 20);
   static const io_case_t cases[] = {
-    {"iorate_4k_append_writethrough_unbuffered", L"a", 4096, 3, 20, 0},
-    {"iorate_4k_overwrite_writethrough_unbuffered", L"o", 4096, 3, 20, 0},
-    {"iorate_4k_overwrite_unbuffered", L"o", 4096, 1, 20, 0},
-    {"iorate_4k_append_unbuffered", L"a", 4096, 1, 20, 0},
-    {"iorate_4k_overwrite_buffered_flush_each", L"f", 4096, 0, 20, 0},
-    {"iorate_4k_read_unbuffered", L"r", 4096, 1, 20, 0},
-    {"iorate_64k_overwrite_unbuffered", L"o", 65536, 1, 20, 0},
-    {"iorate_4k_overwrite_unbuffered_limit_40", L"o", 4096, 1, 40, 0},
-    {"iorate_64k_overwrite_unbuffered_bandwidth_1MB", L"o", 65536, 1, 0, 1000000},
+    {"iorate_4k_append_writethrough_unbuffered", L"a", 4096, 3, 20, 0, 0},
+    {"iorate_4k_overwrite_writethrough_unbuffered", L"o", 4096, 3, 20, 0, 0},
+    {"iorate_4k_overwrite_unbuffered", L"o", 4096, 1, 20, 0, 0},
+    {"iorate_4k_append_unbuffered", L"a", 4096, 1, 20, 0, 0},
+    {"iorate_4k_overwrite_buffered_flush_each", L"f", 4096, 0, 20, 0, 0},
+    {"iorate_4k_read_unbuffered", L"r", 4096, 1, 20, 0, 0},
+    {"iorate_64k_overwrite_unbuffered", L"o", 65536, 1, 20, 0, 0},
+    {"iorate_4k_overwrite_unbuffered_limit_40", L"o", 4096, 1, 40, 0, 0},
+    {"iorate_64k_overwrite_unbuffered_bandwidth_1MB", L"o", 65536, 1, 0, 1000000, 0},
+    {"iorate_4k_overwrite_unbuffered_bandwidth_1MB", L"o", 4096, 1, 0, 1000000, 0},
+    {"iorate_64k_overwrite_unbuffered_bandwidth_10MB", L"o", 65536, 1, 0, 10000000, 0},
+    {"iorate_64k_overwrite_unbuffered_iops_20_base_io_size_4096", L"o", 65536, 1, 20, 0, 4096},
+    {"iorate_64k_overwrite_unbuffered_iops_20_base_io_size_65536", L"o", 65536, 1, 20, 0, 65536},
   };
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
     const io_case_t *c = &cases[i];
@@ -966,7 +971,8 @@ static void probe_iorate(void) {
     char lim[512], free_[512];
     io_run(c, 1, setio, path, 5000, lim, sizeof lim);
     io_run(c, 0, setio, path, 1500, free_, sizeof free_);
-    emit(c->name, "\"max_iops\":%lld,\"max_bandwidth\":%lld,\"io_size\":%d,\"limited\":{%s},\"unlimited\":{%s}", (long long)c->max_iops, (long long)c->max_bw, c->size, lim, free_);
+    emit(c->name, "\"max_iops\":%lld,\"max_bandwidth\":%lld,\"base_io_size\":%lu,\"io_size\":%d,\"limited\":{%s},\"unlimited\":{%s}", (long long)c->max_iops, (long long)c->max_bw,
+         (unsigned long)c->base, c->size, lim, free_);
   }
   DeleteFileW(fpre);
   DeleteFileW(fapp);
