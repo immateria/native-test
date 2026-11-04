@@ -954,8 +954,8 @@ idle: a race that a test on an idle machine will not show.
   `EACCES`; the delegated cgroup that has controllers in `subtree_control` → `EBUSY`. A directory opened read-only is enough.
 * With `CLONE_PIDFD` in the same call the pidfd is valid, `pidfd_send_signal` and `waitid(P_PIDFD)` work at once
   (`CLD_KILLED`, 9), and a later `waitpid` gives `ECHILD`.
-* Into a frozen cgroup: the call returns in 0.08 ms and succeeds, the child does not run (state `S`, `frozen 1`,
-  `waitpid(WNOHANG)` 0) and runs 0.18 ms after the thaw. A `Process.new`-style spawn that waits for the exec would block
+* Into a frozen cgroup: the call succeeds at once (0.08 ms on Ubuntu 24.04), the child does not run (state `S`, `frozen 1`,
+  `waitpid(WNOHANG)` 0) and runs 0.18 ms after the thaw (same on all three). A `Process.new`-style spawn that waits for the exec would block
   until someone thaws the cgroup. At `pids.max 1` the second `clone3` fails `EAGAIN` and `pids.events` counts `max 1`.
 * **A cgroup that has been written `cgroup.kill` kills every later `clone3(CLONE_INTO_CGROUP)` child at once** (SIGKILL,
   before it ran; also when the cgroup was empty when killed; also 500 ms later; also through a fresh descriptor).
@@ -1006,7 +1006,7 @@ idle: a race that a test on an idle machine will not show.
   on Linux `Process.new` (fork) took 0.5–0.7 ms with an empty heap, 6.3–10.5 ms with 256 MiB and 12.2–22.3 ms with
   512 MiB; `posix_spawn` 0.14–0.31 / 0.16–0.40 / 0.30–0.43 ms; raw `clone3` (fork semantics) 0.16–0.26 / 2.4–4.8 /
   4.5–9.5 ms. On macOS the heap barely mattered: `Process.new` 0.6–1.8 ms (7.6–8.8 on macos-26-intel) and
-  ≤ 5.0 ms at 512 MiB, `posix_spawn` 0.2–0.7 ms (2.0 on macos-26-intel).
+  ≤ 5.0 ms at 512 MiB, `posix_spawn` 0.2–1.3 ms (2.0 on macos-26-intel).
 * The macOS START_SUSPENDED path works through `Process`: wrapped while suspended, `SIGCONT` → output and `exited(0)`;
   `SIGKILL` while suspended → `Process#wait` returned `signaled(KILL)`.
 
