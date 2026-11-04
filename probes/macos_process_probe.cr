@@ -2346,10 +2346,11 @@ module NativeProbe
       reaped = [] of Bool
       begin
         result = with_kqueue do |kq|
-          # Register each child immediately after it starts. Spawning eight Crystal children one after another
-          # can take longer than the first child's 180 ms delay on a loaded runner; a registration made after
-          # the child has already exited is a zombie registration (see explore/macos/kqueue_zombie.c) and
-          # made this case a coin flip.
+          # Register each child immediately after it starts. A registration made after the child has exited
+          # fails with ESRCH (measured 200/200: explore/macos/kqueue_zombie.c), which spawning eight Crystal
+          # children one after another can cause on a loaded runner. NOTE: that does not explain the one
+          # observed failure (8 successful registrations, 7 events); `missing_pids`/`event_rcs` below record
+          # more if it recurs.
           registrations = 0
           8.times do |i|
             child = Process.new(self_exe, ["--child", "delayed-exit-code", (180 + i * 25).to_s, i.to_s])
@@ -2359,17 +2360,21 @@ module NativeProbe
             registrations += 1 if rc == 0
           end
           seen = Set(UInt64).new
+          event_rcs = [] of Int32
           8.times do
             rc, event, _ = kevent_next(kq, 2.seconds)
+            event_rcs << rc
             seen << event.ident if rc == 1 && (event.fflags & NOTE_EXIT) != 0
           end
+          missing_pids = children.map(&.pid.to_u64).reject { |pid| seen.includes?(pid) }
           statuses = children.map_with_index do |child, i|
             status = child.wait
             reaped[i] = true
             status
           end
           {registrations == 8 && seen.size == 8 && statuses.all?(&.normal_exit?),
-           details(registrations: registrations, unique_events: seen.size, exit_codes: statuses.map(&.exit_code?).join(","))}
+           details(registrations: registrations, unique_events: seen.size, exit_codes: statuses.map(&.exit_code?).join(","),
+             event_rcs: event_rcs.join(","), missing_pids: missing_pids.join(","))}
         end
         result
       ensure

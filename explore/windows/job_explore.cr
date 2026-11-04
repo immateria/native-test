@@ -78,6 +78,11 @@ lib WX
     attributes : UInt32
   end
 
+  # TOKEN_OWNER and TOKEN_DEFAULT_DACL are both a single pointer
+  struct PointerBox
+    value : Void*
+  end
+
   fun QueryInformationJobObject(job : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
   fun IsProcessInJob(process : LibC::HANDLE, job : LibC::HANDLE, result : LibC::BOOL*) : LibC::BOOL
   fun GetCurrentProcess : LibC::HANDLE
@@ -91,6 +96,9 @@ lib WX
   fun AdjustTokenPrivileges(token : LibC::HANDLE, disable_all : LibC::BOOL, new_state : Void*, buffer_length : UInt32, previous_state : Void*, return_length : UInt32*) : LibC::BOOL
   fun CheckTokenMembership(token : LibC::HANDLE, sid : Void*, is_member : LibC::BOOL*) : LibC::BOOL
   fun SetHandleInformation(handle : LibC::HANDLE, mask : UInt32, flags : UInt32) : LibC::BOOL
+  fun OpenThreadToken(thread : LibC::HANDLE, access : UInt32, open_as_self : LibC::BOOL, token : LibC::HANDLE*) : LibC::BOOL
+  fun ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl : UInt16*, revision : UInt32, descriptor : Void**, size : UInt32*) : LibC::BOOL
+  fun GetSecurityDescriptorDacl(descriptor : Void*, present : LibC::BOOL*, dacl : Void**, defaulted : LibC::BOOL*) : LibC::BOOL
   fun CreateWellKnownSid(sid_type : Int32, domain_sid : Void*, sid : Void*, size : UInt32*) : LibC::BOOL
   fun CreateRestrictedToken(existing : LibC::HANDLE, flags : UInt32, disable_count : UInt32, disable_sids : Void*,
                             delete_count : UInt32, delete_privs : Void*, restrict_count : UInt32, restrict_sids : Void*,
@@ -470,6 +478,31 @@ module Explore
     WX.SetPriorityClass(WX.GetCurrentProcess, original)
   end
 
+  # The kit's own process gets 1314 for a HIGH job class from its very first instruction while this program,
+  # with an identical token, does not. This does ONLY that request first, in a fresh process, using the same
+  # three variants as the kit's raw_priority_variants, then reports the thread token (an impersonating thread
+  # would explain a token difference the process token cannot show).
+  def self.exp_priority_minimal : Nil
+    variants = [] of String
+    [{"basic", CLASS_BASIC_LIMIT, 0_u32}, {"extended", CLASS_EXTENDED_LIMIT, 0_u32}, {"extended+kill_on_close", CLASS_EXTENDED_LIMIT, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE}].each do |label, info_class, extra|
+      job = new_job
+      info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
+      info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | extra
+      info.basicLimitInformation.priorityClass = PRIORITY_CLASSES["high"]
+      size = info_class == CLASS_BASIC_LIMIT ? sizeof(LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION) : sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+      ok, err = set_job_info(job, info_class, pointerof(info).as(Void*), size)
+      variants << "#{label}=#{ok ? "ok" : err.to_s}"
+      LibC.CloseHandle(job)
+    end
+    thread_token = LibC::HANDLE.null
+    thread = WX.OpenThreadToken(LibC.GetCurrentThread, 0x8_u32, 1, pointerof(thread_token)) != 0 ? "present" : "none:#{LibC.GetLastError}"
+    LibC.CloseHandle(thread_token) unless thread_token.null?
+    emit("priority_minimal") do |j|
+      j.field "raw", variants.join(" ")
+      j.field "thread_token", thread
+    end
+  end
+
   # --- cpu time --------------------------------------------------------------
 
   # One trial: a child that spins ~3.5 s of wall time inside a job (or with a per-process
@@ -754,6 +787,35 @@ module Explore
       STDERR.puts "SetTokenInformation(integrity) failed: #{LibC.GetLastError} (continuing at the inherited integrity level)"
     end
 
+    # A UAC-filtered token owns what it creates as the USER, with a default DACL granting the user and SYSTEM.
+    # The elevated token's owner/default DACL name Administrators, which is deny-only here, so without this the
+    # unelevated process cannot open the child processes and jobs it creates itself (AccessDenied on adopt).
+    user_buffer = Slice(UInt8).new(512)
+    user_returned = 0_u32
+    if WX.GetTokenInformation(restricted, 1_u32, user_buffer.to_unsafe.as(Void*), 512_u32, pointerof(user_returned)) != 0 # TokenUser
+      user_sid = user_buffer.to_unsafe.as(Pointer(Pointer(Void))).value
+      sid_text = Pointer(UInt16).null
+      if LibC.ConvertSidToStringSidW(user_sid.as(Pointer(LibC::SID)), pointerof(sid_text)) != 0
+        sddl = "D:(A;;GA;;;#{String.from_utf16(sid_text)[0]})(A;;GA;;;SY)"
+        owner = WX::PointerBox.new
+        owner.value = user_sid
+        STDERR.puts "SetTokenInformation(owner) failed: #{LibC.GetLastError}" if WX.SetTokenInformation(restricted, 4_u32, pointerof(owner).as(Void*), sizeof(WX::PointerBox).to_u32) == 0
+        descriptor = Pointer(Void).null
+        if WX.ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(sddl).to_unsafe, 1_u32, pointerof(descriptor), Pointer(UInt32).null) != 0
+          present = 0
+          defaulted = 0
+          acl = Pointer(Void).null
+          if WX.GetSecurityDescriptorDacl(descriptor, pointerof(present), pointerof(acl), pointerof(defaulted)) != 0 && present != 0
+            box = WX::PointerBox.new
+            box.value = acl
+            STDERR.puts "SetTokenInformation(default dacl) failed: #{LibC.GetLastError}" if WX.SetTokenInformation(restricted, 6_u32, pointerof(box).as(Void*), sizeof(WX::PointerBox).to_u32) == 0
+          end
+        else
+          STDERR.puts "ConvertStringSecurityDescriptor failed: #{LibC.GetLastError}"
+        end
+      end
+    end
+
     # CreateProcessAsUser may need SeIncreaseQuotaPrivilege; the caller is elevated, so enable it if held.
     enable_privilege("SeIncreaseQuotaPrivilege")
     enable_privilege("SeAssignPrimaryTokenPrivilege")
@@ -826,6 +888,7 @@ module Explore
     case ARGV[0]?
     when "token"    then exp_token
     when "priority" then exp_priority
+    when "priority-minimal" then exp_priority_minimal
     when "cpu-time" then exp_cpu_time
     when "cpu-period" then exp_cpu_period
     when "notify"   then exp_notify

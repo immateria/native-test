@@ -51,15 +51,19 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
 * `r9_concurrent_failed_spawn_fd_reuse_stress`: `ProbeThread` contexts keep their event-loop descriptors
   until exit (reproduced: +24 fds for 8 contexts on Linux, 0 for 8 fibers), so this case uses `ProbeFiber`.
 
-* `kqueue_many_children_one_queue_all_exit_events` failed once in five native runs (7 of 8 exit events).
-  It registered for the children only after spawning all eight, whose exits are scheduled ~180 ms after each
-  child's own start; on a loaded runner the first child can already be a zombie by then. It now registers each
-  child immediately after spawning it. `explore/macos/kqueue_zombie.c` measures whether a zombie registration
-  delivers an event at all.
-* The kit's HIGH job-priority request returns 1314 in the elevated kit process while an identical request from
-  a fresh elevated process succeeds, and the raw API fails the same way from inside the kit process (so it is
-  not the shard). Informational rows `priority_checkpoint_*` now record the raw request at section
-  boundaries to locate when the process enters that state.
+* `kqueue_many_children_one_queue_all_exit_events` failed once in six native runs: 8 successful registrations
+  but 7 exit events. **Unexplained.** A registration made after the child has exited fails with `ESRCH`
+  (`explore/macos/kqueue_zombie.c`: 200 of 200 trials; 100 of 100 live registrations delivered), which would have
+  shown as a failed registration, not a missing event. The case now registers each child right after spawning it
+  (removing that ESRCH path on slow runners) and records `event_rcs` and `missing_pids` so a recurrence says more.
+* **Unexplained: HIGH job priority class is rejected with 1314 from the elevated kit process, from its very first
+  instruction** (`priority_checkpoint_start`; the raw API fails the same way, so it is not the shard), while an
+  identical request from `job_explore` succeeds under an identical token (same privileges, held and disabled; same
+  priority class; same launch method). Microsoft documents that the caller needs `SeIncreaseBasePriorityPrivilege`;
+  a Stack Overflow report fixed the same 1314 by enabling it. `job_explore priority-minimal` and
+  `windows_process_probe --child raw-priority` now run the request first in a fresh process, with the thread
+  token. `r6_priority_applied_high` accepts 1314 only when the token does not hold the privilege (the unelevated
+  run); the elevated 1314 stays a failure.
 * `job_user_time_limit_enforced_and_event` (the one remaining short-window enforcement assertion) also spins and
   waits two periods.
 

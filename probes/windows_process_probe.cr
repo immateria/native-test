@@ -52,6 +52,7 @@ lib WindowsProbeExtra
 
   fun QueryInformationJobObject(job : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
   fun OpenProcessToken(process : LibC::HANDLE, access : UInt32, token : LibC::HANDLE*) : LibC::BOOL
+  fun OpenThreadToken(thread : LibC::HANDLE, access : UInt32, open_as_self : LibC::BOOL, token : LibC::HANDLE*) : LibC::BOOL
   fun GetTokenInformation(token : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
   fun LookupPrivilegeNameW(system_name : UInt16*, luid : UInt64*, name : UInt16*, length : UInt32*) : LibC::BOOL
   fun GetPriorityClass(process : LibC::HANDLE) : UInt32
@@ -402,6 +403,30 @@ module NativeProbe
   # Informational: would a HIGH job priority class be accepted right now? Recorded at section boundaries so a
   # change in the process's state over the run (the kit's request is rejected, an identical one from a fresh
   # process is not) can be located.
+  # True when the token holds SeIncreaseBasePriorityPrivilege (enabled or not). Without it a HIGH or REALTIME
+  # job priority class is rejected with 1314; Microsoft documents the requirement on
+  # JOBOBJECT_BASIC_LIMIT_INFORMATION.PriorityClass.
+  def self.token_holds_se_increase_base_priority? : Bool
+    token = LibC::HANDLE.null
+    return false if WindowsProbeExtra.OpenProcessToken(WindowsProbeNative.GetCurrentProcess, 0x8_u32, pointerof(token)) == 0
+    returned = 0_u32
+    buffer = Slice(UInt8).new(4096)
+    held = false
+    if WindowsProbeExtra.GetTokenInformation(token, 3_u32, buffer.to_unsafe.as(Void*), 4096_u32, pointerof(returned)) != 0
+      buffer.to_unsafe.as(Pointer(UInt32)).value.times do |i|
+        entry = buffer.to_unsafe + 4 + 12 * i
+        luid = ((entry + 4).as(Pointer(Int32)).value.to_u64 << 32) | entry.as(Pointer(UInt32)).value.to_u64
+        name_buffer = Slice(UInt16).new(128)
+        length = 128_u32
+        if WindowsProbeExtra.LookupPrivilegeNameW(Pointer(UInt16).null, pointerof(luid), name_buffer.to_unsafe, pointerof(length)) != 0
+          held = true if String.from_utf16(name_buffer[0, length.to_i]) == "SeIncreaseBasePriorityPrivilege"
+        end
+      end
+    end
+    LibC.CloseHandle(token)
+    held
+  end
+
   def self.priority_checkpoint(label : String) : Nil
     note("priority_checkpoint_#{label}", details(high: raw_priority_variants(ProcessSupervision::Windows::Job::PriorityClass::High.value)))
   end
@@ -846,6 +871,15 @@ module NativeProbe
         result["#{name}_flags"] = flags.to_s
       end
       File.write(marker, result.to_json)
+      exit 0
+    when "raw-priority"
+      # Fresh-process HIGH job priority request as the very first action (nothing else has run), plus the thread
+      # token. Compare with `job_explore priority-minimal`.
+      raw = raw_priority_variants(ProcessSupervision::Windows::Job::PriorityClass::High.value)
+      thread_token = LibC::HANDLE.null
+      thread = WindowsProbeExtra.OpenThreadToken(LibC.GetCurrentThread, 0x8_u32, 1, pointerof(thread_token)) != 0 ? "present" : "none:#{LibC.GetLastError}"
+      LibC.CloseHandle(thread_token) unless thread_token.null?
+      puts({"raw" => raw, "thread_token" => thread}.to_json)
       exit 0
     when "priority-info"
       marker = ARGV[2]? || raise "missing marker"
@@ -5198,7 +5232,18 @@ module NativeProbe
     end
 
     test("r6_priority_applied_high") do
-      probe_priority_applied(ProcessSupervision::Windows::Job::PriorityClass::High, "r6_high")
+      begin
+        probe_priority_applied(ProcessSupervision::Windows::Job::PriorityClass::High, "r6_high")
+      rescue ex : ProcessSupervision::Error::Native
+        # A token without SeIncreaseBasePriorityPrivilege (an unelevated / standard user) is rejected with 1314:
+        # that is the documented behaviour, not a defect. A token that DOES hold it and is still rejected is
+        # unexplained (see REVISION-13-CHANGES.md) and stays a failure.
+        if ex.native_code == 1314 && !token_holds_se_increase_base_priority?
+          {true, details(outcome: "privilege_not_held_1314_expected", native_code: ex.native_code)}
+        else
+          raise ex
+        end
+      end
     end
 
     test("r6_invalid_limits_job_memory_zero") do

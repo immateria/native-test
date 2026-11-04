@@ -60,6 +60,17 @@ jobs:
           Start-Process -FilePath $exe -ArgumentList "token" -Wait -NoNewWindow -RedirectStandardOutput explore-out\windows-elevated-token-startprocess.jsonl
           Get-Content explore-out\windows-elevated-token-direct.jsonl, explore-out\windows-elevated-token-startprocess.jsonl | ForEach-Object { $_.Substring(0, [Math]::Min($_.Length, 400)) }
 
+      - name: Fresh-process HIGH priority request - kit executable vs exploration executable
+        if: always()
+        run: |
+          $kit = (Resolve-Path probes\.build\windows_process_probe.exe).Path
+          $exp = (Resolve-Path explore-out\job_explore.exe).Path
+          $o = "explore-out\windows-elevated-priority-fresh.txt"
+          "kit exe:" | Tee-Object $o
+          & $kit --child raw-priority | Tee-Object $o -Append
+          "exploration exe:" | Tee-Object $o -Append
+          & $exp priority-minimal | Tee-Object $o -Append
+
       - name: Priority exploration launched via Start-Process (the kit wrapper's launch method)
         if: always()
         run: |
@@ -129,6 +140,17 @@ jobs:
           # the wrapper (and the Crystal build) stay elevated; only the probe process gets the filtered token
           PROCESS_PROBE_LAUNCHER: ${{ github.workspace }}\explore-out\job_explore.exe
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1
+
+      - name: Fresh-process HIGH priority request, unelevated
+        if: always() && steps.selfcheck.outcome == 'success'
+        run: |
+          $kit = (Resolve-Path probes\.build\windows_process_probe.exe).Path
+          $exp = (Resolve-Path explore-out\job_explore.exe).Path
+          $o = "explore-out\windows-unelevated-priority-fresh.txt"
+          "kit exe:" | Tee-Object $o
+          & $exp launch-unelevated -- $kit --child raw-priority | Tee-Object $o -Append
+          "exploration exe:" | Tee-Object $o -Append
+          & $exp launch-unelevated -- $exp priority-minimal | Tee-Object $o -Append
 
       - name: Explore job-object behaviour (unelevated)
         if: always() && steps.selfcheck.outcome == 'success'
