@@ -78,6 +78,7 @@ jobs:
       - name: Linux crash handler details
         if: runner.os == 'Linux'
         run: |
+          set +e +o pipefail   # grep finding nothing is an answer here, not a failure
           {
             echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
             echo "core_pipe_limit: $(cat /proc/sys/kernel/core_pipe_limit)"
