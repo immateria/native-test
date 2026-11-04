@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+probes/windows-probe-output/
+probes/macos-probe-output/
+probes/*-handback.zip
+explore-out/

@@ -1,14 +1,18 @@
 name: native-probes
 
-# Native runtime qualification for the Crystal process-supervision kit in probes/.
-# Linux is intentionally absent: the kit has no Linux native lane (its cgroup work is a separate lane).
+# Native runtime qualification for the Crystal process-supervision kit in probes/, plus
+# standalone exploration probes in explore/ that record raw OS behaviour for the questions
+# the kit raised but could not settle. Linux is intentionally absent: the kit has no Linux
+# native lane (its cgroup work is a separate lane).
 
 on:
   workflow_dispatch:
   push:
     paths:
       - "probes/**"
+      - "explore/**"
       - ".github/workflows/native-probes.yml"
+      - ".github/actions/**"
 
 permissions:
   contents: read
@@ -17,10 +21,11 @@ env:
   CRYSTAL_VERSION: "1.21.1"
 
 jobs:
+  # Hosted Windows runners run as an elevated administrator (runneradmin). The kit says
+  # "never run elevated", so this job is the as-shipped baseline and the next one is the
+  # contract-conforming run.
   windows-x64:
-    name: Windows x64 (Crystal MSVC)
-    # Windows Server 2025 image: x64, Visual Studio 2022 Enterprise with VC tools,
-    # Windows SDK 10.0.26100, Python, Git. Pinned rather than windows-latest.
+    name: Windows x64 - elevated (as runner provides)
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
@@ -35,57 +40,98 @@ jobs:
           $p  = New-Object Security.Principal.WindowsPrincipal($id)
           "user=$($id.Name)"
           "elevated=$($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
-          # The probe README asks for a non-elevated run. Hosted runners may be
-          # elevated; this step records which case this run was.
 
-      - name: Enable Developer Mode (Crystal MSVC prerequisite)
+      - uses: ./.github/actions/setup-crystal-windows
+
+      - name: Build exploration probe
         run: |
-          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" /t REG_DWORD /f /v AllowDevelopmentWithoutDevLicense /d 1
+          New-Item -ItemType Directory -Force explore-out | Out-Null
+          crystal build --no-color explore/windows/job_explore.cr -o explore-out/job_explore.exe
 
-      - name: Activate MSVC build environment
-        # The image has VS 2022 with VC tools, but link.exe is only on PATH after vcvars64.
-        run: |
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vs) { throw "No Visual Studio install with VC tools found" }
-          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-          cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') {
-              "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            }
-          }
-
-      - name: Install Crystal ${{ env.CRYSTAL_VERSION }}
-        run: |
-          $url = "https://github.com/crystal-lang/crystal/releases/download/$env:CRYSTAL_VERSION/crystal-$env:CRYSTAL_VERSION-windows-x86_64-msvc-unsupported.zip"
-          # SHA-256 computed from this release asset when the workflow was drafted.
-          # Upstream does not publish a checksum file we could verify against.
-          $expected = "696db553299ca120100c0d81682e2aa78d6d230a1e176623e8f2b43d7149163d"
-          Invoke-WebRequest -Uri $url -OutFile crystal.zip
-          $actual = (Get-FileHash crystal.zip -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne $expected) { throw "Crystal zip hash mismatch: $actual" }
-          Expand-Archive -Path crystal.zip -DestinationPath C:\crystal
-          "C:\crystal" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          # The zip bundles gc, pcre2, yaml, libxml2, OpenSSL, zlib, LLVM-C and their .lib files.
-
-      - name: Verify toolchain
-        run: |
-          crystal --version
-          cl 2>&1 | Select-Object -First 1
-          link /? 2>&1 | Select-Object -First 1
-
-      - name: Run native probes
+      - name: Run native probes (kit)
         working-directory: probes
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1
 
-      - name: Upload Windows probe output
+      - name: Explore job-object behaviour
+        if: always()
+        run: |
+          $exe = (Resolve-Path explore-out\job_explore.exe).Path
+          foreach ($e in "token", "priority", "notify", "cpu-time") {
+            & $exe $e > "explore-out\windows-elevated-$e.jsonl" 2> "explore-out\windows-elevated-$e.err"
+            "$e exit=$LASTEXITCODE"
+          }
+
+      - name: Upload output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-x64-probe-output
+          name: windows-elevated-output
           path: |
             probes/windows-probe-output/
             probes/windows-probe-handback.zip
+            explore-out/*.jsonl
+            explore-out/*.err
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Same kit, run with a UAC-style filtered token (admin groups deny-only, privileges
+  # stripped, Medium integrity), which is what "non-elevated" means for an admin account.
+  windows-x64-unelevated:
+    name: Windows x64 - unelevated (filtered token)
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-crystal-windows
+
+      - name: Build exploration probe
+        run: |
+          New-Item -ItemType Directory -Force explore-out | Out-Null
+          crystal build --no-color explore/windows/job_explore.cr -o explore-out/job_explore.exe
+
+      - name: Self-check the unelevated launcher
+        id: selfcheck
+        run: |
+          $exe = (Resolve-Path explore-out\job_explore.exe).Path
+          & $exe launch-unelevated -- $exe token > explore-out\windows-unelevated-token.jsonl 2> explore-out\windows-unelevated-token.err
+          "launcher exit=$LASTEXITCODE"
+          Get-Content explore-out\windows-unelevated-token.jsonl
+          Get-Content explore-out\windows-unelevated-token.err -ErrorAction SilentlyContinue
+          $t = Get-Content explore-out\windows-unelevated-token.jsonl | Select-Object -First 1 | ConvertFrom-Json
+          if ($null -eq $t) { throw "launcher produced no token record" }
+          if ($t.token_is_elevated -ne 0) { throw "launcher produced an elevated token" }
+
+      - name: Run native probes (kit, unelevated)
+        if: always() && steps.selfcheck.outcome == 'success'
+        working-directory: probes
+        run: |
+          $exe = (Resolve-Path ..\explore-out\job_explore.exe).Path
+          & $exe launch-unelevated -- pwsh -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1
+          exit $LASTEXITCODE
+
+      - name: Explore job-object behaviour (unelevated)
+        if: always() && steps.selfcheck.outcome == 'success'
+        run: |
+          $exe = (Resolve-Path explore-out\job_explore.exe).Path
+          foreach ($e in "priority", "notify", "cpu-time") {
+            & $exe launch-unelevated -- $exe $e > "explore-out\windows-unelevated-$e.jsonl" 2> "explore-out\windows-unelevated-$e.err"
+            "$e exit=$LASTEXITCODE"
+          }
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-unelevated-output
+          path: |
+            probes/windows-probe-output/
+            probes/windows-probe-handback.zip
+            explore-out/*.jsonl
+            explore-out/*.err
           if-no-files-found: warn
           retention-days: 30
 
@@ -117,18 +163,28 @@ jobs:
           crystal --version
           clang --version | head -1
           python3 --version
+          sw_vers
 
-      - name: Run native probes
+      - name: Run native probes (kit)
         working-directory: probes
         run: sh ./run-macos.sh
 
-      - name: Upload macOS probe output
+      - name: Explore process-group signalling
+        if: always()
+        run: |
+          mkdir -p explore-out
+          clang -O1 -Wall -Wextra -o explore-out/signal_matrix explore/macos/signal_matrix.c
+          ./explore-out/signal_matrix > explore-out/macos-signal-matrix.jsonl
+          wc -l explore-out/macos-signal-matrix.jsonl
+
+      - name: Upload output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-arm64-probe-output
+          name: macos-arm64-output
           path: |
             probes/macos-probe-output/
             probes/macos-probe-handback.zip
+            explore-out/*.jsonl
           if-no-files-found: warn
           retention-days: 30

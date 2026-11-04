@@ -1,0 +1,58 @@
+name: Set up Crystal (Windows x64, MSVC)
+description: >
+  Enables Developer Mode, imports the MSVC build environment, and installs a pinned,
+  hash-verified Crystal release. Leaves crystal, cl and link on PATH for later steps.
+
+inputs:
+  version:
+    description: Crystal release to install
+    default: "1.21.1"
+  sha256:
+    description: Expected SHA-256 of crystal-<version>-windows-x86_64-msvc-unsupported.zip
+    default: "696db553299ca120100c0d81682e2aa78d6d230a1e176623e8f2b43d7149163d"
+
+runs:
+  using: composite
+  steps:
+    - name: Enable Developer Mode (Crystal MSVC prerequisite)
+      shell: pwsh
+      run: |
+        reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" /t REG_DWORD /f /v AllowDevelopmentWithoutDevLicense /d 1
+
+    - name: Activate MSVC build environment
+      shell: pwsh
+      # link.exe is only on PATH after vcvars64; export the resulting environment to later steps.
+      run: |
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+        $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if (-not $vs) { throw "No Visual Studio install with VC tools found" }
+        "visual_studio=$vs"
+        $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+        cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
+          if ($_ -match '^([^=]+)=(.*)$') {
+            "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+        }
+
+    - name: Install Crystal ${{ inputs.version }}
+      shell: pwsh
+      env:
+        CRYSTAL_VERSION: ${{ inputs.version }}
+        CRYSTAL_SHA256: ${{ inputs.sha256 }}
+      run: |
+        $url = "https://github.com/crystal-lang/crystal/releases/download/$env:CRYSTAL_VERSION/crystal-$env:CRYSTAL_VERSION-windows-x86_64-msvc-unsupported.zip"
+        # Upstream publishes no checksum file; the hash was computed from the release asset when pinned.
+        Invoke-WebRequest -Uri $url -OutFile crystal.zip
+        $actual = (Get-FileHash crystal.zip -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $env:CRYSTAL_SHA256) { throw "Crystal zip hash mismatch: $actual" }
+        Expand-Archive -Path crystal.zip -DestinationPath C:\crystal
+        Remove-Item crystal.zip
+        "C:\crystal" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        # The zip bundles gc, pcre2, yaml, libxml2, OpenSSL, zlib, LLVM-C and their .lib files.
+
+    - name: Verify toolchain
+      shell: pwsh
+      run: |
+        crystal --version
+        cl 2>&1 | Select-Object -First 1
+        link /? 2>&1 | Select-Object -First 1
