@@ -3,7 +3,7 @@ require "file_utils"
 
 # Several examples use the spec process's own group as a stand-in group. Inside a container the spec binary is
 # commonly PID 1 and leads process group 1, which ProcessGroup refuses to address (kill(-1, sig) is a broadcast).
-private def spec_pgid : Int32
+private def spec_pgid : Int64
   pgid = Process.pgid
   pending!("this process leads process group 1 (PID 1 of a container)") if pgid == 1
   pgid
