@@ -10,7 +10,7 @@ on:
       only:
         description: "which jobs to run"
         type: choice
-        options: [all, posix, linux, windows]
+        options: [all, unix, posix, linux, windows]
         default: all
   push:
     paths:
@@ -29,7 +29,7 @@ env:
 jobs:
   posix:
     name: POSIX ${{ matrix.runner }}
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'posix'
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'unix' || inputs.only == 'posix'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -115,6 +115,28 @@ jobs:
           ./explore-out/build/kqueue_zombie > "explore-out/$tag-kqueue_zombie.jsonl"
           wc -l explore-out/*.jsonl
 
+      # posix_spawn attributes on every runner; kqueue descendant tracking and Crystal's own spawn path on macOS (the
+      # Linux versions of the Crystal probe run in the Linux job, where a delegated cgroup exists for clone3).
+      - name: Spawn attributes, kqueue tracking (macOS), Crystal spawn without Process.new (macOS)
+        run: |
+          set +e
+          tag="posix-$(uname -s)-$(uname -m)"
+          cc -O1 -Wall -Wextra -o explore-out/build/spawn_attrs explore/posix/spawn_attrs.c
+          ./explore-out/build/spawn_attrs > "explore-out/$tag-spawn_attrs.jsonl" 2> "explore-out/$tag-spawn_attrs.err"; echo "spawn_attrs exit=$?"
+          if [ "$(uname -s)" = Darwin ]; then
+            cc -O1 -Wall -Wextra -o explore-out/build/kqueue_track explore/macos/kqueue_track.c
+            ./explore-out/build/kqueue_track > "explore-out/$tag-kqueue_track.jsonl" 2> "explore-out/$tag-kqueue_track.err"; echo "kqueue_track exit=$?"
+            if command -v crystal > /dev/null; then
+              crystal build --no-color explore/posix/crystal_own_spawn.cr -o explore-out/build/crystal_own_spawn > "explore-out/$tag-crystal_own_spawn-build.txt" 2>&1; echo "crystal build exit=$?"
+              ./explore-out/build/crystal_own_spawn explore-out/build/spawn_attrs > "explore-out/$tag-crystal_own_spawn.jsonl" 2> "explore-out/$tag-crystal_own_spawn.err"; echo "crystal_own_spawn exit=$?"
+              crystal build --no-color -Dpreview_mt -Dexecution_context explore/posix/crystal_own_spawn.cr -o explore-out/build/crystal_own_spawn_mt > "explore-out/$tag-crystal_own_spawn_mt-build.txt" 2>&1; echo "crystal mt build exit=$?"
+              ./explore-out/build/crystal_own_spawn_mt explore-out/build/spawn_attrs > "explore-out/$tag-crystal_own_spawn_mt.jsonl" 2> "explore-out/$tag-crystal_own_spawn_mt.err"; echo "crystal_own_spawn_mt exit=$?"
+            fi
+          fi
+          for f in explore-out/$tag-spawn_attrs.jsonl explore-out/$tag-kqueue_track.jsonl explore-out/$tag-crystal_own_spawn*.jsonl; do [ -f "$f" ] && { echo "=== $f"; cut -c1-500 "$f"; }; done
+          for f in explore-out/$tag-crystal_own_spawn*-build.txt; do [ -s "$f" ] && { echo "=== $f"; head -c 2500 "$f"; }; done
+          exit 0
+
       - name: macOS memory limits (as the runner user, then as root)
         if: runner.os == 'macOS'
         run: |
@@ -164,7 +186,7 @@ jobs:
   # service manager would), subreaper, pidfd, PDEATHSIG, PID namespaces; plus the kit's own Linux shards.
   linux:
     name: Linux ${{ matrix.runner }}
-    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'unix' || inputs.only == 'linux'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -216,6 +238,11 @@ jobs:
           cc -O1 -Wall -Wextra -o explore-out/build/cgroup_explore explore/linux/cgroup_explore.c
           cc -O1 -Wall -Wextra -pthread -o explore-out/build/linux_proc explore/linux/linux_proc.c
           cc -O1 -Wall -Wextra -pthread -o explore-out/build/linux_extras explore/linux/linux_extras.c
+          cc -O1 -Wall -Wextra -o explore-out/build/spawn_cgroup explore/linux/spawn_cgroup.c
+          cc -O1 -Wall -Wextra -o explore-out/build/spawn_attrs explore/posix/spawn_attrs.c
+          # the Crystal spawn probe: a compile error here must not hide the C probes, so the output goes to a file
+          crystal build --no-color explore/posix/crystal_own_spawn.cr -o explore-out/build/crystal_own_spawn > "explore-out/linux-$(uname -m)-${{ matrix.runner }}-crystal_own_spawn-build.txt" 2>&1 || echo "crystal_own_spawn build failed"
+          crystal build --no-color -Dpreview_mt -Dexecution_context explore/posix/crystal_own_spawn.cr -o explore-out/build/crystal_own_spawn_mt > "explore-out/linux-$(uname -m)-${{ matrix.runner }}-crystal_own_spawn_mt-build.txt" 2>&1 || echo "crystal_own_spawn_mt build failed"
           CRYSTAL_PATH="$PWD/probes/workspace/process-supervision/src:$PWD/probes/workspace/process-handle/src:$(crystal env CRYSTAL_PATH)" \
             crystal build --no-color explore/linux/kit_linux.cr -o explore-out/build/kit_linux
 
@@ -237,6 +264,10 @@ jobs:
           ./explore-out/build/linux_proc > "explore-out/$tag-linux_proc.jsonl" 2> "explore-out/$tag-linux_proc.err"; echo "linux_proc exit=$?"
           ./explore-out/build/kit_linux "$D" > "explore-out/$tag-kit_linux.jsonl" 2> "explore-out/$tag-kit_linux.err"; echo "kit_linux exit=$?"
           ./explore-out/build/linux_extras > "explore-out/$tag-linux_extras.jsonl" 2> "explore-out/$tag-linux_extras.err"; echo "linux_extras exit=$?"
+          timeout 400 ./explore-out/build/spawn_cgroup "$D" > "explore-out/$tag-spawn_cgroup.jsonl" 2> "explore-out/$tag-spawn_cgroup.err"; echo "spawn_cgroup exit=$?"
+          ./explore-out/build/spawn_attrs > "explore-out/$tag-spawn_attrs.jsonl" 2> "explore-out/$tag-spawn_attrs.err"; echo "spawn_attrs exit=$?"
+          [ -x explore-out/build/crystal_own_spawn ] && { timeout 300 ./explore-out/build/crystal_own_spawn ./explore-out/build/spawn_attrs "$D" > "explore-out/$tag-crystal_own_spawn.jsonl" 2> "explore-out/$tag-crystal_own_spawn.err"; echo "crystal_own_spawn exit=$?"; }
+          [ -x explore-out/build/crystal_own_spawn_mt ] && { timeout 300 ./explore-out/build/crystal_own_spawn_mt ./explore-out/build/spawn_attrs "$D" > "explore-out/$tag-crystal_own_spawn_mt.jsonl" 2> "explore-out/$tag-crystal_own_spawn_mt.err"; echo "crystal_own_spawn_mt exit=$?"; }
           echo "left in $D: $(ls $D | grep -v '\.' | tr '\n' ' ')"
 
       - name: Show results
