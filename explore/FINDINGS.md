@@ -1107,6 +1107,9 @@ What building it found:
 * The kit pins its sources by hash, so `MANIFEST.sha256` was regenerated and the four new files added; the kit's case names
   and meaning are unchanged.
 
+The kit's own native qualification, run against the modified source (run `41926248879`): macOS arm64 386 Crystal + 45 C/SDK
+cases, Windows x64 elevated 459 and unelevated 459, all `qualification_validation=pass`, manifest checks before and after pass.
+
 Not built yet: redirecting stdio (children inherit 0-2, as on Windows); descendant tracking on macOS (the marker scan is
 measured, not implemented); `posix_spawn` as the Linux engine for process groups (the fork cost grows with the heap);
 kit qualification cases for the new API (the shard specs cover it on Linux and macOS; no Windows case exercises
