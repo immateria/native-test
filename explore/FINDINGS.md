@@ -1110,7 +1110,18 @@ What building it found:
 The kit's own native qualification, run against the modified source (run `41926248879`): macOS arm64 386 Crystal + 45 C/SDK
 cases, Windows x64 elevated 459 and unelevated 459, all `qualification_validation=pass`, manifest checks before and after pass.
 
-Not built yet: redirecting stdio (children inherit 0-2, as on Windows); descendant tracking on macOS (the marker scan is
+Standard stream redirection (`input:`/`output:`/`error:` with `Redirect::Inherit`/`Close`/`Pipe` or an `IO::FileDescriptor`;
+`Child#input`/`#output`/`#error`) was added afterwards for Linux and macOS (runs `41928042954`, `41928059007` and the other
+runners): 49 examples on Linux in all eight environments and 32 on macOS, 0 failures, including a megabyte through `cat`
+in both directions without deadlock, the same pipes for a child inside a cgroup on both the `clone3` and the fork path, a
+failed exec leaking no descriptor (30 attempts with three pipes each), and `Child#close` closing the pipes. Design points that
+mattered: the child's end of each pipe must be blocking and the parent's non-blocking (O_NONBLOCK is per open file
+description); the parent has to close the child's ends as soon as the process exists or EOF never arrives; every source
+descriptor is first copied above 2 so that a `dup2` cannot overwrite a later source (a process with a closed stdin gets
+descriptor 0 back from `pipe()`).
+
+Not built yet: stream redirection for Windows Jobs (they still inherit only, and `ProcessSupervision.spawn` raises
+`Unsupported` if asked for more) and for arbitrary `IO` objects; descendant tracking on macOS (the marker scan is
 measured, not implemented); `posix_spawn` as the Linux engine for process groups (the fork cost grows with the heap);
 kit qualification cases for the new API (the shard specs cover it on Linux and macOS; no Windows case exercises
 `ProcessSupervision.spawn`, whose Windows branch only compiles).
