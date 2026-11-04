@@ -126,8 +126,10 @@ semantics remain with `pty`.
    accounting and events.
 2. Linux delegated-cgroup runtime qualification with real child migration,
    recursive descendants, `cgroup.kill`, drain and owned-directory teardown.
-3. Race-free Linux initial cgroup containment; evaluate an appropriate
-   `clone3(CLONE_INTO_CGROUP)`/helper strategy without weakening Crystal child
-   ownership or portability.
-4. FreeBSD process-reaper investigation; macOS/BSD capability matrix.
-5. Adoption semantics and capability reporting for already-supervised hosts.
+3. ~~Race-free Linux initial cgroup containment.~~ Done: `CgroupV2#spawn` (clone3 `CLONE_INTO_CGROUP`, fork fallback),
+   qualified in plain, root, systemd `Delegate=yes`, user-manager and container environments.
+4. FreeBSD process-reaper investigation. The macOS capability matrix is measured (kqueue tracking refused, environment
+   marker scan works, `START_SUSPENDED` works); a macOS descendant tracker is not implemented.
+5. Capability reporting is done by trying (`CgroupV2.usable?`, `delegated_parent`, `ProcessSupervision.strongest_mechanism`);
+   adopting an already-running process into a group is still open.
+6. Stdio redirection for supervised children; `posix_spawn` as the Linux engine for process groups.

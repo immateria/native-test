@@ -18,6 +18,14 @@ Checkpoint 0009 adds explicit Linux signed-native-PID range validation before pi
 
 Checkpoint 0008's first-error-wins block-scoped `ProcessHandle.open` cleanup and corrected Linux pidfd access-denied diagnostics remain intact.
 
+## Source changed after checkpoint 0009
+
+The workspace below no longer matches the checkpoint hashes quoted above: the spawn work added `posix/spawn.cr`,
+`posix/darwin_spawn.cr`, `linux/raw_spawn.cr` (process-supervision) and `darwin/kqueue_handle.cr`, `Linux.adopt_child`
+(process-handle), `ProcessGroup#spawn`/`spawn_leader`, `CgroupV2#spawn`/`usable?`/`delegated_parent`,
+`ProcessSupervision.spawn`/`strongest_mechanism`, and refuses process group 1. `MANIFEST.sha256` pins the current files; every
+kit case keeps its name and meaning. The measurements behind the changes are in `explore/FINDINGS.md`.
+
 ## Handoff integrity
 
 Both native launchers verify every file listed in `MANIFEST.sha256` before compilation, reject redirected build/output paths, and recreate `.build` from scratch. Revision 12 additionally re-verifies the manifest hash and every covered file after execution so changes during a native run cannot silently qualify.

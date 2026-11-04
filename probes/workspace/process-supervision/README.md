@@ -16,8 +16,10 @@ Current mechanisms:
   kernel `cgroup.kill`. Creation requires an already delegated/writable parent;
   this shard does not change controller delegation policy.
 - POSIX `ProcessSupervision::POSIX::ProcessGroup`: controller for an existing
-  process group, with TERM/KILL and drain observation. It explicitly reports
-  `kill_on_close? == false`; a descendant that changes session/group can escape.
+  process group, with TERM/KILL and drain observation, and (Linux, macOS) a race-free
+  `spawn` / `spawn_leader`. It explicitly reports `kill_on_close? == false`; a
+  descendant that changes session/group can escape. Process group 1 is refused:
+  `kill(-1, sig)` would signal every process.
 
 ```crystal
 require "process-supervision"
@@ -51,6 +53,48 @@ job.shutdown(kill_after: 2.seconds)
 child.close
 ```
 
+
+## Spawning on Linux and macOS
+
+Every backend can now create its child already contained, the way `Windows::Job#spawn` does:
+
+```crystal
+# Strongest containment this host offers; child.group.mechanism says which one was used
+child = ProcessSupervision.spawn("worker", ["--serve"], env: {"MODE" => "x"}, chdir: "/srv")
+child.group.shutdown(grace: 2.seconds)   # ends the whole tree and releases the group
+child.close
+
+# Explicitly
+cg = ProcessSupervision::Linux::CgroupV2.create(parent, "job-1")
+child = cg.spawn("worker")               # in the cgroup before it runs one instruction
+leader = ProcessSupervision::POSIX::ProcessGroup.spawn_leader("worker")   # new group, child == leader
+helper = leader.group.as(ProcessSupervision::POSIX::ProcessGroup).spawn("helper")  # joins that group
+
+ProcessSupervision.strongest_mechanism   # => CgroupV2 / ProcessGroup / JobObject, decided by trying
+ProcessSupervision::Linux::CgroupV2.delegated_parent   # where this process may create a cgroup, or nil
+```
+
+Contract, all of it measured natively (explore/FINDINGS.md, "Spawning into containment" and "Where cgroups are usable"):
+
+- `command` is resolved in the caller before `chdir` takes effect (a name is searched in the caller's `PATH`, a path with
+  a slash is made absolute against the caller's directory). Standard streams 0-2 are inherited and nothing else is.
+- The child starts with default signal dispositions and an empty signal mask. The stdlib's `Process.new` hands on an
+  ignored `SIGPIPE`; a supervisor should not.
+- Errors use the stdlib's classes: `File::NotFoundError`, `File::AccessDeniedError`, `IO::Error`, plus `ArgumentError`
+  for NUL bytes and `Error::Unavailable` when a group cannot be joined or a cgroup is unusable.
+- **Linux, cgroup:** `clone3(CLONE_INTO_CGROUP | CLONE_PIDFD)`; where the kernel or a seccomp filter refuses it (a default
+  Docker profile answers `ENOSYS`) a fork whose child enters the cgroup before exec. Writing the pid to `cgroup.procs`
+  after the child exists lost children in 36-73% of trials under CPU contention, so nothing here does that.
+  A cgroup that was killed accepts no new children (`Error::Killed`): every later `clone3` into it is killed at once.
+- **Linux, process group:** the same engine with `setpgid` in the child; the pidfd comes with the process, so a command that
+  exits at once is still supervised. **macOS:** `posix_spawn` with `SETPGROUP`, started suspended so the exit watch
+  (`ProcessHandle::Kqueue`) exists before the child can exit, then resumed.
+- Detection is by trying: `CgroupV2.available?` only says a hierarchy is mounted (a default container mounts it read-only).
+  `usable?(parent)` and `delegated_parent` create and remove a probe cgroup. A refused create (`EACCES`, `EROFS`) is
+  `Error::Unavailable`, so `ProcessSupervision.cgroup_v2(path, fallback_pgid:)` falls back.
+- Not yet: redirecting stdio, descendant tracking on macOS (kqueue `NOTE_TRACK` is refused with `ENOTSUP`; an environment
+  marker scan finds reparented descendants), and `posix_spawn` on Linux for supervisors with very large heaps (fork copies
+  the page tables: 12-22 ms at a 512 MiB Crystal heap).
 
 ## PTY-derived lifecycle semantics
 

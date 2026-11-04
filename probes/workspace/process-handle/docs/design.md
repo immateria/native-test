@@ -79,3 +79,12 @@ not extracted.
 - explicit borrowed/adopted handle constructors.
 
 Native macOS 15.4.1 evidence shows `PROC_PIDTBSDINFO` can report `ESRCH` for an unreaped zombie while `KERN_PROC_PID` still exposes `SZOMB`. The Darwin observer therefore uses a secondary `KERN_PROC_PID` snapshot only after its 64-bit `extern_proc` prefix offsets are runtime-validated against libproc for the current process. This can recover exact zombie/generation evidence without treating the legacy ABI as an unconditional compile-time promise. If that validation or secondary observation is unavailable, signal-presence still prevents a present but unclassifiable PID from being called `Dead`. Neither snapshot surface is a retained process-control capability.
+
+## Adopting a child (`Linux.adopt_child`, `Kqueue.adopt_child`)
+
+`open` refuses a process that has already exited, which is right for an arbitrary pid and wrong for a child the caller has
+just created: a command that finishes at once would be unsupervisable. `ProcessHandle::Linux.adopt_child(pid, pidfd)` takes
+the pidfd that `clone3(CLONE_PIDFD)` returned together with the process (or opens one) and accepts an exited, unreaped child.
+On macOS `ProcessHandle::Kqueue.adopt_child(pid)` registers a kqueue exit watch; it is deliberately not reachable through
+`ProcessHandle.open` (the kernel retains no reference, so it is only reliable when registered before the child can exit, which
+the supervision layer guarantees by starting the child suspended) and it never signals a process whose exit it has observed.
