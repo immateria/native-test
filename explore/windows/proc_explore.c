@@ -6,7 +6,7 @@
  * timing with and without a debugger, the debugger as a "die with my parent" mechanism, and silo creation.
  *
  * Build (from a VS developer prompt):  cl /nologo /O1 /Fe:proc_explore.exe proc_explore.c user32.lib advapi32.lib
- * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|period|all]
+ * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|period|iorate|all]
  *       (each group runs well inside the 300 s watchdog; "all" may not, so CI runs groups one by one)
  */
 #ifndef _WIN32_WINNT
@@ -804,43 +804,172 @@ static void probe_rate(void) {
   }
   CloseHandle(job);
 
-  /* the call reports success; measure whether it changes anything: 300 write-through 4 KiB writes with and without
-   * MaxIops = 20 (enforced, that would take ~15 s) */
-  for (int limited = 0; limited < 2; limited++) {
-    HANDLE j = CreateJobObjectW(NULL, NULL);
-    DWORD sret = 0, serr = 0;
-    if (limited && setio) {
-      MY_IO_RATE r;
-      memset(&r, 0, sizeof r);
-      r.MaxIops = 20;
-      r.ControlFlags = 1; /* JOB_OBJECT_IO_RATE_CONTROL_ENABLE */
-      SetLastError(0);
-      sret = setio(j, &r);
-      serr = GetLastError();
+}
+
+/* ------------------------------------------------------------------ I/O rate control, in detail */
+/* With MaxIops = 20 a child doing 4 KiB write-through appends managed 9-10 writes/s (run 41788061976). Which I/Os
+ * count? Each variant runs a child for a fixed window inside a job with a limit, and once without, and reports the
+ * job's I/O counters. Appending writes also extend the file (metadata), so overwrite-in-place variants use a file
+ * the parent created and filled beforehand. */
+static int child_io(const wchar_t *mode, const wchar_t *path, int size, int flags) {
+  DWORD fl = ((flags & 1) ? FILE_FLAG_NO_BUFFERING : 0) | ((flags & 2) ? FILE_FLAG_WRITE_THROUGH : 0);
+  int reading = mode[0] == L'r', appending = mode[0] == L'a';
+  HANDLE h = CreateFileW(path, reading ? GENERIC_READ : GENERIC_WRITE, FILE_SHARE_READ, NULL, appending ? CREATE_ALWAYS : OPEN_EXISTING,
+                         fl ? fl : FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 2;
+  void *buf = VirtualAlloc(NULL, (SIZE_T)size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!buf) return 4;
+  memset(buf, 'w', (size_t)size);
+  LARGE_INTEGER fsz;
+  GetFileSizeEx(h, &fsz);
+  LONGLONG pos = 0;
+  for (;;) {
+    DWORD n;
+    if (!appending) {
+      if (pos + size > fsz.QuadPart) pos = 0;
+      LARGE_INTEGER li;
+      li.QuadPart = pos;
+      SetFilePointerEx(h, li, NULL, FILE_BEGIN);
+      pos += size;
     }
-    wchar_t path[MAX_PATH * 2], args[1024];
-    tmp_file(path, MAX_PATH * 2, limited ? L"io-limited.bin" : L"io-plain.bin");
-    swprintf(args, 1024, L"--child-write \"%ls\" 300", path);
-    PROCESS_INFORMATION pi;
-    DWORD e = 0;
-    if (!spawn_self(args, CREATE_SUSPENDED, NULL, &pi, &e)) { emit("io_rate_effect", "\"spawn_error\":%lu", (unsigned long)e); CloseHandle(j); continue; }
-    BOOL as = AssignProcessToJobObject(j, pi.hProcess);
-    double t0 = abs_ms();
-    ResumeThread(pi.hThread);
-    int ex;
-    DWORD code = wait_exit(pi.hProcess, 25000, &ex);
-    double dt = abs_ms() - t0;
-    JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION io;
-    memset(&io, 0, sizeof io);
-    QueryInformationJobObject(j, JobObjectBasicAndIoAccountingInformation, &io, sizeof io, NULL);
-    emit(limited ? "io_rate_effect_max_iops_20" : "io_rate_effect_no_limit",
-         "\"set_return\":%lu,\"set_err\":%lu,\"assign_ok\":%s,\"writes\":300,\"exited\":%s,\"exit_code\":\"0x%08lX\",\"ms\":%.0f,"
-         "\"job_write_ops\":%llu,\"write_ops_per_s\":%.0f",
-         (unsigned long)sret, (unsigned long)serr, bstr(as), bstr(ex), (unsigned long)code, dt, (unsigned long long)io.IoInfo.WriteOperationCount,
-         dt > 0 ? (double)io.IoInfo.WriteOperationCount * 1000.0 / dt : 0.0);
-    kill_close(&pi);
-    CloseHandle(j);
+    BOOL ok = reading ? ReadFile(h, buf, (DWORD)size, &n, NULL) : WriteFile(h, buf, (DWORD)size, &n, NULL);
+    if (!ok) return 3;
+    if (mode[0] == L'f') FlushFileBuffers(h); /* buffered overwrite + flush after each write */
   }
+}
+
+typedef struct { const char *name; const wchar_t *mode; int size, flags; LONG64 max_iops, max_bw; } io_case_t;
+
+static void prefill(const wchar_t *path, LONGLONG bytes) {
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return;
+  char *b = (char *)malloc(1 << 20);
+  memset(b, 'p', 1 << 20);
+  for (LONGLONG done = 0; done < bytes; done += 1 << 20) { DWORD w; WriteFile(h, b, 1 << 20, &w, NULL); }
+  FlushFileBuffers(h);
+  CloseHandle(h);
+  free(b);
+}
+
+static void io_run(const io_case_t *c, int limited, PFN_SetIoRate setio, const wchar_t *path, DWORD window_ms, char *out, size_t cap) {
+  HANDLE j = CreateJobObjectW(NULL, NULL);
+  DWORD sret = 0, serr = 0;
+  if (limited) {
+    MY_IO_RATE r;
+    memset(&r, 0, sizeof r);
+    r.MaxIops = c->max_iops;
+    r.MaxBandwidth = c->max_bw;
+    r.ControlFlags = 1;
+    SetLastError(0);
+    sret = setio(j, &r);
+    serr = GetLastError();
+  }
+  wchar_t args[1024];
+  swprintf(args, 1024, L"--child-io %ls \"%ls\" %d %d", c->mode, path, c->size, c->flags);
+  PROCESS_INFORMATION pi;
+  DWORD e = 0;
+  if (!spawn_self(args, CREATE_SUSPENDED, NULL, &pi, &e)) { snprintf(out, cap, "\"spawn_error\":%lu", (unsigned long)e); CloseHandle(j); return; }
+  AssignProcessToJobObject(j, pi.hProcess);
+  ResumeThread(pi.hThread);
+  Sleep(window_ms);
+  int ex = WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0;
+  DWORD code = 0;
+  GetExitCodeProcess(pi.hProcess, &code);
+  JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION io;
+  memset(&io, 0, sizeof io);
+  QueryInformationJobObject(j, JobObjectBasicAndIoAccountingInformation, &io, sizeof io, NULL);
+  double s = window_ms / 1000.0;
+  snprintf(out, cap, "\"set_return\":%lu,\"set_err\":%lu,\"child_ended_early\":%s,\"child_exit\":\"0x%08lX\",\"reads_per_s\":%.1f,\"writes_per_s\":%.1f,\"other_per_s\":%.1f,\"kib_per_s\":%.0f",
+           (unsigned long)sret, (unsigned long)serr, bstr(ex), (unsigned long)code, io.IoInfo.ReadOperationCount / s, io.IoInfo.WriteOperationCount / s,
+           io.IoInfo.OtherOperationCount / s, (double)(io.IoInfo.ReadTransferCount + io.IoInfo.WriteTransferCount) / 1024.0 / s);
+  kill_close(&pi);
+  CloseHandle(j);
+}
+
+static void probe_iorate(void) {
+  HMODULE k = GetModuleHandleW(L"kernel32.dll");
+  PFN_SetIoRate setio = (PFN_SetIoRate)(void *)GetProcAddress(k, "SetIoRateControlInformationJobObject");
+  PFN_QueryIoRate queryio = (PFN_QueryIoRate)(void *)GetProcAddress(k, "QueryIoRateControlInformationJobObject");
+  if (!setio || !queryio) { emit("iorate", "\"unsupported\":\"not exported\""); return; }
+
+  /* return convention: what does Set return for a handle that is not a job? */
+  {
+    HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    MY_IO_RATE r;
+    memset(&r, 0, sizeof r);
+    r.MaxIops = 20; r.ControlFlags = 1;
+    SetLastError(0);
+    DWORD bad = setio(ev, &r);
+    DWORD bad_err = GetLastError();
+    HANDLE j = CreateJobObjectW(NULL, NULL);
+    SetLastError(0);
+    DWORD good = setio(j, &r);
+    DWORD good_err = GetLastError();
+    r.BaseIoSize = 4096;
+    SetLastError(0);
+    DWORD nonzero_base = setio(j, &r);
+    DWORD nonzero_base_err = GetLastError();
+    emit("iorate_return_convention", "\"event_handle_return\":%lu,\"event_handle_err\":%lu,\"job_return\":%lu,\"job_err\":%lu,\"job_base_io_size_4096_return\":%lu,\"job_base_io_size_4096_err\":%lu",
+         (unsigned long)bad, (unsigned long)bad_err, (unsigned long)good, (unsigned long)good_err, (unsigned long)nonzero_base, (unsigned long)nonzero_base_err);
+    /* query with the C: volume's NT device name */
+    wchar_t dev[512] = L"";
+    QueryDosDeviceW(L"C:", dev, 512);
+    MY_IO_RATE *blocks = NULL;
+    ULONG count = 0;
+    SetLastError(0);
+    DWORD q1 = queryio(j, NULL, &blocks, &count);
+    DWORD q1e = GetLastError();
+    ULONG c1 = count;
+    LONG64 iops1 = blocks && count ? blocks[0].MaxIops : -1;
+    ULONG base1 = blocks && count ? blocks[0].BaseIoSize : 0;
+    blocks = NULL; count = 0;
+    SetLastError(0);
+    DWORD q2 = queryio(j, dev, &blocks, &count);
+    DWORD q2e = GetLastError();
+    char devn[512];
+    WideCharToMultiByte(CP_UTF8, 0, dev, -1, devn, sizeof devn, NULL, NULL);
+    for (char *p = devn; *p; p++) if (*p == '\\') *p = '/';
+    emit("iorate_query", "\"c_volume_device\":\"%s\",\"query_all_return\":%lu,\"query_all_err\":%lu,\"query_all_blocks\":%lu,\"query_all_max_iops\":%lld,\"query_all_base_io_size\":%lu,"
+         "\"query_c_return\":%lu,\"query_c_err\":%lu,\"query_c_blocks\":%lu,\"query_c_max_iops\":%lld,\"query_c_base_io_size\":%lu",
+         devn, (unsigned long)q1, (unsigned long)q1e, (unsigned long)c1, (long long)iops1, (unsigned long)base1,
+         (unsigned long)q2, (unsigned long)q2e, (unsigned long)count, (long long)(blocks && count ? blocks[0].MaxIops : -1), (unsigned long)(blocks && count ? blocks[0].BaseIoSize : 0));
+    CloseHandle(j);
+    CloseHandle(ev);
+  }
+  {
+    HKEY key;
+    DWORD v = 0, sz = sizeof v, type = 0;
+    LONG rr = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\QoS", 0, KEY_READ, &key);
+    LONG rv = -1;
+    if (rr == ERROR_SUCCESS) { rv = RegQueryValueExW(key, L"StorageBaseIOSize", NULL, &type, (LPBYTE)&v, &sz); RegCloseKey(key); }
+    emit("iorate_registry", "\"qos_key_open\":%ld,\"StorageBaseIOSize_query\":%ld,\"StorageBaseIOSize\":%lu", (long)rr, (long)rv, (unsigned long)(rv == 0 ? v : 0));
+  }
+
+  wchar_t fpre[MAX_PATH * 2], fapp[MAX_PATH * 2];
+  tmp_file(fpre, MAX_PATH * 2, L"io-prefilled.bin");
+  tmp_file(fapp, MAX_PATH * 2, L"io-append.bin");
+  prefill(fpre, 8LL << 20);
+  static const io_case_t cases[] = {
+    {"iorate_4k_append_writethrough_unbuffered", L"a", 4096, 3, 20, 0},
+    {"iorate_4k_overwrite_writethrough_unbuffered", L"o", 4096, 3, 20, 0},
+    {"iorate_4k_overwrite_unbuffered", L"o", 4096, 1, 20, 0},
+    {"iorate_4k_append_unbuffered", L"a", 4096, 1, 20, 0},
+    {"iorate_4k_overwrite_buffered_flush_each", L"f", 4096, 0, 20, 0},
+    {"iorate_4k_read_unbuffered", L"r", 4096, 1, 20, 0},
+    {"iorate_64k_overwrite_unbuffered", L"o", 65536, 1, 20, 0},
+    {"iorate_4k_overwrite_unbuffered_limit_40", L"o", 4096, 1, 40, 0},
+    {"iorate_64k_overwrite_unbuffered_bandwidth_1MB", L"o", 65536, 1, 0, 1000000},
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    const io_case_t *c = &cases[i];
+    const wchar_t *path = c->mode[0] == L'a' ? fapp : fpre;
+    char lim[512], free_[512];
+    io_run(c, 1, setio, path, 5000, lim, sizeof lim);
+    io_run(c, 0, setio, path, 1500, free_, sizeof free_);
+    emit(c->name, "\"max_iops\":%lld,\"max_bandwidth\":%lld,\"io_size\":%d,\"limited\":{%s},\"unlimited\":{%s}", (long long)c->max_iops, (long long)c->max_bw, c->size, lim, free_);
+  }
+  DeleteFileW(fpre);
+  DeleteFileW(fapp);
 }
 
 /* ------------------------------------------------------------------ child-process policy */
@@ -1133,6 +1262,7 @@ int main(void) {
   if (argc >= 2 && wcscmp(argv[1], L"--child-spin") == 0) { double end = abs_ms() + 60000; volatile unsigned long x = 0; while (abs_ms() < end) { for (int i = 0; i < 100000; i++) x++; } return 0; }
   if (argc >= 3 && wcscmp(argv[1], L"--child-crash") == 0) return child_crash(_wtoi(argv[2]));
   if (argc >= 4 && wcscmp(argv[1], L"--child-write") == 0) return child_write(argv[2], _wtoi(argv[3]));
+  if (argc >= 6 && wcscmp(argv[1], L"--child-io") == 0) return child_io(argv[2], argv[3], _wtoi(argv[4]), _wtoi(argv[5]));
   if (argc >= 3 && wcscmp(argv[1], L"--child-spawn-try") == 0) return child_spawn_try(argv[2]);
   if (argc >= 5 && wcscmp(argv[1], L"--sender") == 0) return child_sender(argv[2], (DWORD)_wtoi(argv[3]), argv[4]);
   if (argc >= 4 && wcscmp(argv[1], L"--child-debugger") == 0) return child_debugger(argv[2], _wtoi(argv[3]));
@@ -1150,5 +1280,6 @@ int main(void) {
   if (all || wcscmp(which, L"debug") == 0) probe_debug();
   if (all || wcscmp(which, L"silo") == 0) probe_silo();
   if (all || wcscmp(which, L"period") == 0) probe_period();
+  if (all || wcscmp(which, L"iorate") == 0) probe_iorate();
   return 0;
 }

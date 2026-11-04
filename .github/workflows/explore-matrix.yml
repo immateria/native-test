@@ -158,7 +158,7 @@ jobs:
         run: |
           $exe = (Resolve-Path explore-out\proc_explore.exe).Path
           $tag = "windows-${{ matrix.runner }}-elevated"
-          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period") {
+          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate") {
             $t = [Diagnostics.Stopwatch]::StartNew()
             & $exe $g > "explore-out\$tag-$g.jsonl" 2> "explore-out\$tag-$g.err"
             "$g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-$g.jsonl").Count)"
@@ -184,7 +184,7 @@ jobs:
           $exe = (Resolve-Path explore-out\proc_explore.exe).Path
           $je = (Resolve-Path explore-out\job_explore.exe).Path
           $tag = "windows-${{ matrix.runner }}-unelevated"
-          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period") {
+          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate") {
             $t = [Diagnostics.Stopwatch]::StartNew()
             & $je launch-unelevated -- $exe $g > "explore-out\$tag-$g.jsonl" 2> "explore-out\$tag-$g.err"
             "$g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-$g.jsonl").Count)"
