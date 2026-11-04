@@ -429,6 +429,29 @@ module NativeProbe
     held
   end
 
+  # "absent" (not in the token), "disabled" (held), or "enabled".
+  def self.se_increase_base_priority_state : String
+    token = LibC::HANDLE.null
+    return "unknown" if WindowsProbeExtra.OpenProcessToken(WindowsProbeNative.GetCurrentProcess, 0x8_u32, pointerof(token)) == 0
+    returned = 0_u32
+    buffer = Slice(UInt8).new(4096)
+    state = "absent"
+    if WindowsProbeExtra.GetTokenInformation(token, 3_u32, buffer.to_unsafe.as(Void*), 4096_u32, pointerof(returned)) != 0
+      buffer.to_unsafe.as(Pointer(UInt32)).value.times do |i|
+        entry = buffer.to_unsafe + 4 + 12 * i
+        luid = ((entry + 4).as(Pointer(Int32)).value.to_u64 << 32) | entry.as(Pointer(UInt32)).value.to_u64
+        name_buffer = Slice(UInt16).new(128)
+        length = 128_u32
+        if WindowsProbeExtra.LookupPrivilegeNameW(Pointer(UInt16).null, pointerof(luid), name_buffer.to_unsafe, pointerof(length)) != 0 &&
+           String.from_utf16(name_buffer[0, length.to_i]) == "SeIncreaseBasePriorityPrivilege"
+          state = ((entry + 8).as(Pointer(UInt32)).value & 0x2_u32) != 0 ? "enabled" : "disabled"
+        end
+      end
+    end
+    LibC.CloseHandle(token)
+    state
+  end
+
   # Enables or disables SeIncreaseBasePriorityPrivilege on the process token. Returns true when the adjustment
   # took effect (false when the token does not hold the privilege: ERROR_NOT_ALL_ASSIGNED).
   def self.set_se_increase_base_priority(enabled : Bool) : Bool
@@ -445,10 +468,9 @@ module NativeProbe
       (pointer + 8).as(Pointer(Int32)).value = (luid >> 32).to_i32
       (pointer + 12).as(Pointer(UInt32)).value = enabled ? 0x2_u32 : 0_u32
       WindowsProbeExtra.AdjustTokenPrivileges(token, 0, pointer.as(Void*), 0_u32, Pointer(Void).null, Pointer(UInt32).null)
-      ok = LibC.GetLastError == 0_u32 # 1300 = ERROR_NOT_ALL_ASSIGNED
     end
     LibC.CloseHandle(token)
-    ok
+    se_increase_base_priority_state == (enabled ? "enabled" : "disabled")
   end
 
   def self.priority_checkpoint(label : String) : Nil
@@ -5261,17 +5283,16 @@ module NativeProbe
       # above ABOVE_NORMAL. An administrator token HOLDS it disabled, so the request is rejected with 1314 unless
       # the caller enables it first (measured: a fresh process fails with 1314 for all three request shapes).
       # A token that does not hold it at all (unelevated / standard user) is rejected regardless.
-      held = token_holds_se_increase_base_priority?
-      enabled = held && set_se_increase_base_priority(true)
+      before = se_increase_base_priority_state
+      enabled = before == "disabled" && set_se_increase_base_priority(true)
+      during = se_increase_base_priority_state
       begin
         passed, data = probe_priority_applied(ProcessSupervision::Windows::Job::PriorityClass::High, "r6_high")
-        {passed, data.merge(details(privilege_held: held, privilege_enabled_for_test: enabled))}
+        {passed, data.merge(details(privilege_before: before, privilege_during: during))}
       rescue ex : ProcessSupervision::Error::Native
-        if ex.native_code == 1314 && !held
-          {true, details(outcome: "privilege_not_held_1314_expected", native_code: ex.native_code)}
-        else
-          raise ex
-        end
+        {ex.native_code == 1314 && before == "absent",
+         details(outcome: "native_rejected:#{ex.native_code}", privilege_before: before, privilege_during: during,
+           note: before == "absent" ? "token does not hold the privilege: 1314 is expected" : "token holds the privilege but the request was rejected")}
       ensure
         set_se_increase_base_priority(false) if enabled
       end

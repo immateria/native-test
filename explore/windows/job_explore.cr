@@ -516,6 +516,34 @@ module Explore
         j.field "privilege_enabled", privilege_enabled?("SeIncreaseBasePriorityPrivilege").to_s
       end
     end
+
+    # SetPriorityClass(self) is not it. The long run also created jobs with lower classes, started a suspended
+    # child, assigned it to a job and terminated it before the first HIGH request. Replay those one at a time.
+    report = ->(after : String) do
+      emit("priority_flip") do |j|
+        j.field "after", after
+        j.field "high_job_request", high_request_outcome
+        j.field "privilege_enabled", privilege_enabled?("SeIncreaseBasePriorityPrivilege").to_s
+      end
+    end
+
+    lower = new_job
+    info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
+    info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    info.basicLimitInformation.priorityClass = PRIORITY_CLASSES["above_normal"]
+    set_job_info(lower, CLASS_EXTENDED_LIMIT, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
+    report.call("a job with an ABOVE_NORMAL class limit was created")
+
+    process, thread, _pid = spawn_suspended([exe, "child-sleep", "300"])
+    report.call("a suspended child process was created")
+    LibC.AssignProcessToJobObject(lower, process)
+    report.call("that child was assigned to the ABOVE_NORMAL job")
+    LibC.ResumeThread(thread)
+    LibC.CloseHandle(thread)
+    sleep 100.milliseconds
+    report.call("that child was resumed and ran")
+    cleanup(process, lower)
+    report.call("the child was terminated and its job closed")
   end
 
   def self.high_request_outcome : String

@@ -60,10 +60,13 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
   `SeIncreaseBasePriorityPrivilege` disabled.** Measured in fresh processes (no earlier calls): the kit executable
   and `job_explore` both get 1314 for all three request shapes (basic, extended, extended + KILL_ON_JOB_CLOSE), with
   no thread token. This matches Microsoft's "the calling process must enable" the privilege (and a Stack Overflow
-  report that fixed the same 1314 by enabling it). An earlier `job_explore` run appeared to succeed because calls it
-  made first changed the process state; `priority_flip` rows locate which. `r6_priority_applied_high` now enables the
-  privilege when the token holds it (and disables it afterwards) and expects success; a token that does not hold it
-  (the unelevated run) is expected to get 1314.
+  report that fixed the same 1314 by enabling it). An earlier `job_explore` run appeared to succeed because something it did
+  first changed the process state. It is **not** `SetPriorityClass(self, X)` for any of the six classes, REALTIME
+  included (measured: the HIGH request stays 1314 and the privilege stays disabled throughout); `priority_flip`
+  rows now replay the remaining candidates (creating a job with a lower class, a suspended child, assigning it,
+  resuming, terminating). `r6_priority_applied_high` enables the privilege when the token holds it, verifies the
+  state by reading the token, restores it afterwards, and expects success; a token that does not hold it (the
+  unelevated run) is expected to get 1314. Its details record `privilege_before`/`privilege_during`.
 * `handle_allowlist_blocks_unrelated_inheritable_event` passed elevated and failed unelevated with
   `wrongly_inherited: true`, but only because the check treated "some valid handle has this number in the child" as
   inheritance, and a filtered-token child owns different handles. The event is now created signaled and the child
