@@ -26,11 +26,11 @@
     # watch of its ProcessHandle::Kqueue exists before it can exit — registering on an exited process fails with ESRCH —
     # and then resumed with SIGCONT.
     module DarwinSpawn
-      private SPAWN_SETPGROUP        = 0x0002_i16
-      private SPAWN_SETSIGDEF        = 0x0004_i16
-      private SPAWN_SETSIGMASK       = 0x0008_i16
-      private SPAWN_START_SUSPENDED  = 0x0080_i16
-      private SPAWN_CLOEXEC_DEFAULT  = 0x4000_i16
+      private SPAWN_SETPGROUP       = 0x0002_i16
+      private SPAWN_SETSIGDEF       = 0x0004_i16
+      private SPAWN_SETSIGMASK      = 0x0008_i16
+      private SPAWN_START_SUSPENDED = 0x0080_i16
+      private SPAWN_CLOEXEC_DEFAULT = 0x4000_i16
 
       def self.launch(prepared : Spawn::Prepared, pgroup : Int32?) : {Int32, ::Process, ProcessHandle}
         pid = create_suspended(prepared, pgroup)

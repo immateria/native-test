@@ -669,3 +669,33 @@ end
     end
   end
 {% end %}
+
+{% if flag?(:unix) %}
+  describe "ProcessSupervision.spawn" do
+    it "uses the strongest mechanism this host allows, and shutdown ends the tree and releases the group" do
+      expected = ProcessSupervision.strongest_mechanism
+      {% if flag?(:linux) %}
+        delegated = !ProcessSupervision::Linux::CgroupV2.delegated_parent.nil?
+        expected.should eq(delegated ? ProcessSupervision::Mechanism::CgroupV2 : ProcessSupervision::Mechanism::ProcessGroup)
+      {% else %}
+        expected.should eq(ProcessSupervision::Mechanism::ProcessGroup)
+      {% end %}
+
+      child = ProcessSupervision.spawn("sh", ["-c", "sleep 30 & sleep 30 & wait"])
+      begin
+        child.group.mechanism.should eq(expected)
+        child.group.empty?.should be_false
+        result = child.group.shutdown(grace: 5.seconds, kill_after: 5.seconds)
+        result.drained?.should be_true
+        result.closed?.should be_true
+        child.wait(10.seconds).should_not be_nil
+      ensure
+        child.close
+      end
+    end
+
+    it "reports a missing command like the underlying spawn and leaves no group behind" do
+      expect_raises(File::NotFoundError) { ProcessSupervision.spawn("definitely-not-a-command-ps-spec") }
+    end
+  end
+{% end %}

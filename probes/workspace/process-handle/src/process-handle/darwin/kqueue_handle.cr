@@ -14,8 +14,8 @@
   # does not retain the process, so `kill` is only as safe as the exit watch is current. It never signals a process whose
   # exit has been observed, which closes the window in which the PID could have been recycled.
   class ProcessHandle::Kqueue < ProcessHandle
-    private EVFILT_PROC = -5_i16
-    private EV_RECEIPT  = 0x0040_u16
+    private EVFILT_PROC =         -5_i16
+    private EV_RECEIPT  =     0x0040_u16
     private NOTE_EXIT   = 0x80000000_u32
 
     @mutex = Thread::Mutex.new
