@@ -93,6 +93,14 @@ jobs:
             (cd "../probes/workspace/$s" && "$GITHUB_WORKSPACE/shard-out/spec-$s" --verbose) > "run-plain-$s.txt" 2>&1
             echo "== $s plain exit=$?"; tail -n 12 "run-plain-$s.txt"
           done
+          # Linux: the supervision suite again on each forced spawn engine (the plain run uses pidfd_spawn where glibc has it)
+          if [ "$(uname -s)" = Linux ] && [ -x spec-process-supervision ]; then
+            for engine in clone3 fork; do
+              (cd ../probes/workspace/process-supervision && PROCESS_SUPERVISION_SPEC_ENGINE=$engine "$GITHUB_WORKSPACE/shard-out/spec-process-supervision" --verbose) > "run-engine-$engine.txt" 2>&1
+              echo "== engine $engine exit=$?"; tail -n 6 "run-engine-$engine.txt"
+            done
+          fi
+          grep -ho '\[engine[^]]*\] .*' run-*.txt 2>/dev/null || true
           exit 0
 
       - name: Run the supervision specs in other Linux environments

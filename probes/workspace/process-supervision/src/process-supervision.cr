@@ -3,11 +3,13 @@ require "./process-supervision/version"
 require "./process-supervision/error"
 require "./process-supervision/mechanism"
 require "./process-supervision/execution_bridge"
+require "./process-supervision/stream_copies"
 require "./process-supervision/group"
 require "./process-supervision/child"
 
 {% if flag?(:unix) %}
   require "./process-supervision/posix/spawn"
+  require "./process-supervision/posix/marker_scan"
   require "./process-supervision/posix/process_group"
 {% end %}
 

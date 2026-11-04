@@ -20,10 +20,11 @@
       # and *error* is `Process::Redirect::Inherit` (the default: the parent's
       # standard handle, or the null device if it has none), `Close` (the null
       # device), `Pipe` (read or write it through `Child#input` / `#output` /
-      # `#error`, closed by `Child#close`) or an `IO::FileDescriptor` such as a
-      # `File`. Other `IO` objects are rejected, as is a file opened for
-      # overlapped I/O: pipe and copy instead. Batch files are rejected
-      # because direct CreateProcessW execution implicitly invokes cmd.exe.
+      # `#error`, closed by `Child#close`), an `IO::FileDescriptor` such as a
+      # `File`, or any other `IO`, which gets a pipe and a copy fiber (as does a
+      # file opened for overlapped I/O, which a child cannot use directly).
+      # Batch files are rejected because direct CreateProcessW execution
+      # implicitly invokes cmd.exe.
       def spawn(command : String, args : Enumerable(String) = [] of String, *,
                 env : Process::Env = nil, clear_env : Bool = false,
                 chdir : Path | String? = nil,
@@ -152,7 +153,7 @@
           system_process = Crystal::System::Process.new(process_info)
           process_transferred = true
           process = SpawnedProcess.wrap(system_process)
-          ProcessSupervision::Child.new(process, stable_handle, self, plumbing.input, plumbing.output, plumbing.error)
+          ProcessSupervision::Child.new(process, stable_handle, self, plumbing.input, plumbing.output, plumbing.error, plumbing.copies)
         rescue ex
           stable_handle.try do |handle|
             handle.close rescue nil
@@ -191,6 +192,7 @@
         getter input : IO::FileDescriptor? = nil
         getter output : IO::FileDescriptor? = nil
         getter error : IO::FileDescriptor? = nil
+        getter copies = ProcessSupervision::StreamCopies.new
 
         @child_ends = [] of IO::FileDescriptor
 
@@ -218,29 +220,50 @@
             when .close?
               @handles[target] = Native.null_device(input: reading)
             when .pipe?
-              if reading
-                reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
-                @child_ends << reader
-                @input = writer
-                @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(reader.fd), "DuplicateHandle(stdin pipe)")
-              else
-                reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
-                @child_ends << writer
-                target == 1 ? (@output = reader) : (@error = reader)
-                @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(writer.fd), "DuplicateHandle(#{target == 1 ? "stdout" : "stderr"} pipe)")
+              parent_end = pipe(target)
+              case target
+              when 0 then @input = parent_end
+              when 1 then @output = parent_end
+              else        @error = parent_end
               end
             end
           when IO::FileDescriptor
-            raise ArgumentError.new("standard stream #{target} is closed") if spec.closed?
             # An overlapped regular file cannot serve a child that does
-            # synchronous I/O on it; the stdlib reopens or pipes such files.
-            # Overlapped pipes (an IO.pipe end) are fine.
-            unless spec.system_blocking? || pipe?(spec)
-              raise ArgumentError.new("standard stream #{target}: a file opened for overlapped I/O cannot be handed to a child; open it blocking, or pipe and copy")
+            # synchronous I/O on it, so it is copied through a pipe like any
+            # other IO. Overlapped pipes (an IO.pipe end) are fine as they are.
+            if !spec.closed? && (spec.system_blocking? || pipe?(spec))
+              @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(spec.fd), "DuplicateHandle(standard stream #{target})")
+            else
+              copy_through_pipe(target, spec)
             end
-            @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(spec.fd), "DuplicateHandle(standard stream #{target})")
           else
-            raise ArgumentError.new("only Process::Redirect and IO::FileDescriptor are supported for standard streams")
+            copy_through_pipe(target, spec)
+          end
+        end
+
+        private def copy_through_pipe(target : Int32, io : IO) : Nil
+          if io.closed?
+            @handles[target] = Native.null_device(input: target == 0)
+          elsif target == 0
+            @copies.add_input(io, pipe(target))
+          else
+            @copies.add_output(pipe(target), io)
+          end
+        end
+
+        # A pipe for stream *target*: the child's end (synchronous) is
+        # duplicated into `handles`, the parent's end (overlapped) is returned.
+        private def pipe(target : Int32) : IO::FileDescriptor
+          if target == 0
+            reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
+            @child_ends << reader
+            @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(reader.fd), "DuplicateHandle(stdin pipe)")
+            writer
+          else
+            reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
+            @child_ends << writer
+            @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(writer.fd), "DuplicateHandle(#{target == 1 ? "stdout" : "stderr"} pipe)")
+            reader
           end
         end
 
@@ -254,6 +277,7 @@
         def abandon : Nil
           release_child_side
           {@input, @output, @error}.each { |io| io.try { |stream| stream.close rescue nil } }
+          @copies.close
         end
 
         private def pipe?(io : IO::FileDescriptor) : Bool

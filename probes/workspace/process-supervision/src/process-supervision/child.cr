@@ -20,12 +20,17 @@ module ProcessSupervision
     getter! output : IO::FileDescriptor
     getter! error : IO::FileDescriptor
 
+    # Copies between the child's pipes and caller-supplied IO objects that are not file descriptors.
+    @copies : StreamCopies?
+
     def initialize(@process : Process, @handle : ProcessHandle, @group : Group,
                    input : IO::FileDescriptor? = nil, output : IO::FileDescriptor? = nil,
-                   error : IO::FileDescriptor? = nil)
+                   error : IO::FileDescriptor? = nil, copies : StreamCopies? = nil)
       @input = input
       @output = output
       @error = error
+      @copies = copies.try { |pending| pending.empty? ? nil : pending }
+      @copies.try &.start
     end
 
     def pid : Int64
@@ -36,7 +41,9 @@ module ProcessSupervision
       @handle.identity
     end
 
-    # Waits for this direct child and caches the exact Process::Status object.
+    # Waits for this direct child and caches the exact Process::Status object. When a standard stream was given as an
+    # IO that is not a file descriptor, this also waits for its copy to finish (so an output IO is complete), and a copy
+    # that failed is raised instead (`#status` still has the exit status).
     # Concurrent unbounded callers share one Process#wait collector, matching
     # the PTY Session contract. A finite timeout first waits on the stable
     # ProcessHandle; timeout does not start a detached collector that would keep
@@ -65,6 +72,7 @@ module ProcessSupervision
             first_error ||= ex
           end
         end
+        @copies.try &.close
 
         begin
           @process.close
@@ -99,11 +107,11 @@ module ProcessSupervision
       waiter = nil.as(Channel(Nil)?)
 
       @wait_lock.synchronize do
-        if status = @status
-          return status
-        end
         if error = @wait_error
           raise error
+        end
+        if status = @status
+          return status
         end
 
         if @wait_in_progress
@@ -118,11 +126,11 @@ module ProcessSupervision
       unless collector
         waiter.not_nil!.receive
         @wait_lock.synchronize do
-          if status = @status
-            return status
-          end
           if error = @wait_error
             raise error
+          end
+          if status = @status
+            return status
           end
         end
         raise ProcessSupervision::Error::Native.new(
@@ -140,6 +148,10 @@ module ProcessSupervision
         finish_wait(error: ex)
         raise ex
       else
+        if failure = @copies.try(&.wait)
+          finish_wait(status: status, error: failure)
+          raise failure
+        end
         finish_wait(status: status)
         status
       end
@@ -147,8 +159,8 @@ module ProcessSupervision
 
     private def cached_wait_outcome : Process::Status?
       @wait_lock.synchronize do
-        return @status if @status
         raise @wait_error.not_nil! if @wait_error
+        return @status if @status
         nil
       end
     end

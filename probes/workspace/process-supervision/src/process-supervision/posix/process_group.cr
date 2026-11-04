@@ -3,13 +3,23 @@
     # Controller for an existing POSIX process group. A process group is not a
     # kernel lifetime container: descendants can call setsid/setpgid and escape,
     # and closing this object cannot kill the group after an abrupt owner death.
+    #
+    # Children spawned through this controller (by default) carry an environment
+    # marker unique to it, `PROCESS_SUPERVISION_GROUP=<token>`. A descendant that
+    # left the group but kept that environment is still found (`#escapees`):
+    # `terminate`, `kill` and `shutdown` signal it too, and `empty?` stays false
+    # while it lives. A descendant that clears or rewrites its environment
+    # before it execs is not found.
     class ProcessGroup < ProcessSupervision::Group
       getter pgid : Int64
 
       @mutex = Thread::Mutex.new
       @closed = false
+      @marker : String?
 
-      def initialize(@pgid : Int64)
+      # *marker* is the descendant-marker token of a group this process spawned into (see `#escapees`), if any.
+      def initialize(@pgid : Int64, marker : String? = nil)
+        @marker = marker
         raise ArgumentError.new("pgid must be positive") unless @pgid > 0
         raise ArgumentError.new("pgid exceeds native pid range") if @pgid > Int32::MAX
         # kill(-1, sig) is not "group 1": it signals every process the caller may signal. Found when the specs ran as
@@ -22,16 +32,19 @@
       # Spawns a direct executable/argv child into this process group, which must still have a live member in the
       # caller's session. The child starts with default signal dispositions and an empty signal mask, inherits stdio
       # 0-2 and nothing else, and its executable is resolved in the caller before `chdir` takes effect. A process
-      # group is not a kill-on-close container: a descendant can still leave it (setsid/setpgid).
+      # group is not a kill-on-close container: a descendant can still leave it (setsid/setpgid); with
+      # *track_descendants* (the default) it carries this controller's environment marker, so `#escapees` finds it.
       def spawn(command : String, args : Enumerable(String) = [] of String, *,
                 env : ::Process::Env = nil, clear_env : Bool = false,
                 chdir : Path | String? = nil,
                 input : ::Process::Stdio = ::Process::Redirect::Inherit,
                 output : ::Process::Stdio = ::Process::Redirect::Inherit,
-                error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
+                error : ::Process::Stdio = ::Process::Redirect::Inherit,
+                track_descendants : Bool = true) : ProcessSupervision::Child
+        marker = track_descendants ? MarkerScan.entry(@mutex.synchronize { @marker ||= MarkerScan.new_token }) : nil
         {% if flag?(:linux) %}
           run_on_execution_context("process-supervision-posix-spawn") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
             group = @pgid.to_i32
             pending = begin
@@ -47,13 +60,13 @@
           end
         {% elsif flag?(:darwin) %}
           run_on_execution_context("process-supervision-posix-spawn") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
             begin
               @mutex.synchronize do
                 check_open_locked
                 _, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, @pgid.to_i32, plumbing)
-                ProcessSupervision::Child.new(process, handle, self, plumbing.input, plumbing.output, plumbing.error)
+                ProcessSupervision::Child.new(process, handle, self, plumbing.input, plumbing.output, plumbing.error, plumbing.copies)
               end
             rescue ex
               plumbing.abandon
@@ -72,21 +85,24 @@
                             chdir : Path | String? = nil,
                             input : ::Process::Stdio = ::Process::Redirect::Inherit,
                             output : ::Process::Stdio = ::Process::Redirect::Inherit,
-                            error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
+                            error : ::Process::Stdio = ::Process::Redirect::Inherit,
+                            track_descendants : Bool = true) : ProcessSupervision::Child
+        token = track_descendants ? MarkerScan.new_token : nil
+        marker = token.try { |value| MarkerScan.entry(value) }
         {% if flag?(:linux) %}
           run_on_execution_context("process-supervision-posix-spawn-leader") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
             pending = ProcessSupervision::Linux::RawSpawn.create(prepared, plumbing, pgroup: 0)
             # the group object needs the pid, so build it from the pending child
-            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, new(pending.pid.to_i64), nil)
+            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, new(pending.pid.to_i64, token), nil)
           end
         {% elsif flag?(:darwin) %}
           run_on_execution_context("process-supervision-posix-spawn-leader") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
             pid, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, 0, plumbing)
-            ProcessSupervision::Child.new(process, handle, new(pid.to_i64), plumbing.input, plumbing.output, plumbing.error)
+            ProcessSupervision::Child.new(process, handle, new(pid.to_i64, token), plumbing.input, plumbing.output, plumbing.error, plumbing.copies)
           end
         {% else %}
           raise ProcessSupervision::Error::Unsupported.new("spawning is not implemented for this target yet")
@@ -105,10 +121,54 @@
         true
       end
 
+      # Whether the group has no live member and no marked descendant lives outside it (see `#escapees`).
       def empty? : Bool
-        @mutex.synchronize do
+        token = @mutex.synchronize do
           check_open_locked
-          group_empty_locked?
+          return false unless group_empty_locked?
+          @marker
+        end
+        token.nil? || escapees_for(token).empty?
+      end
+
+      # Whether children spawned through this controller carry its descendant marker.
+      def tracks_descendants? : Bool
+        @mutex.synchronize { !@marker.nil? }
+      end
+
+      # Live processes outside the process group that carry this controller's environment marker: descendants that
+      # called setsid or setpgid, or were reparented after a double fork. Empty when nothing was spawned with tracking.
+      def escapees : Array(Int64)
+        token = @mutex.synchronize do
+          check_open_locked
+          @marker
+        end
+        token ? escapees_for(token) : [] of Int64
+      end
+
+      private def escapees_for(token : String) : Array(Int64)
+        MarkerScan.scan(token).reject { |pid| LibC.getpgid(pid.to_i32) == @pgid.to_i32 }
+      end
+
+      # Signals one marked process through a handle that watches it first, then checks the marker again: whatever holds
+      # the PID at that point is either the marked process (its exit would now be seen, so a recycled PID is never
+      # signalled) or not marked and left alone. A process this user may not signal is left too; `empty?` stays false.
+      private def signal_escapee(pid : Int64, entry : String, signal : Signal) : Nil
+        handle = begin
+          {% if flag?(:darwin) %}
+            ProcessHandle::Kqueue.watch(pid)
+          {% else %}
+            ProcessHandle.open(pid)
+          {% end %}
+        rescue ProcessHandle::Error
+          return
+        end
+        begin
+          return unless MarkerScan.marked?(pid, entry) && handle.alive?
+          signal == Signal::KILL ? handle.kill : handle.terminate
+        rescue ProcessHandle::Error
+        ensure
+          handle.close rescue nil
         end
       end
 
@@ -152,15 +212,20 @@
       end
 
       private def signal(signal : Signal) : Nil
-        @mutex.synchronize do
+        token = @mutex.synchronize do
           check_open_locked
           rc = LibC.kill(-@pgid.to_i32, signal.value)
-          return if rc == 0
-          errno = Errno.value
-          return if errno == Errno::ESRCH
-          return if no_live_member?(errno)
-          raise ProcessSupervision::Error::Native.new("killpg(#{signal})", errno.message, errno.value.to_i64)
+          unless rc == 0
+            errno = Errno.value
+            unless errno == Errno::ESRCH || no_live_member?(errno)
+              raise ProcessSupervision::Error::Native.new("killpg(#{signal})", errno.message, errno.value.to_i64)
+            end
+          end
+          @marker
         end
+        return unless token
+        entry = MarkerScan.entry(token)
+        escapees_for(token).each { |pid| signal_escapee(pid, entry, signal) }
       end
 
       private def group_empty_locked? : Bool

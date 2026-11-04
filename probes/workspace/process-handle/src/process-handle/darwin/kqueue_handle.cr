@@ -24,6 +24,14 @@
     @closed = false
 
     def self.adopt_child(pid : Int64) : self
+      watch(pid)
+    end
+
+    # The same exit watch on a process that is not the caller's child (one found by a scan). The watch is registered
+    # first, so the caller can then confirm that the PID still names the process it found (its `identity.generation`, the
+    # start time, against the scan's) and know that a later exit is seen. A process that already exited reads as
+    # exited, and this handle never signals it.
+    def self.watch(pid : Int64) : self
       raise ArgumentError.new("pid must be positive") unless pid > 0
       raise ArgumentError.new("pid exceeds native pid range") if pid > Int32::MAX
 

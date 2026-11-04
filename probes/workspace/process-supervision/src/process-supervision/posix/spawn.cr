@@ -36,8 +36,9 @@
         end
       end
 
+      # *marker* is an extra `NAME=value` entry (a process group's descendant marker) that survives `clear_env`.
       def self.prepare(command : String, args : Enumerable(String), env : ::Process::Env,
-                       clear_env : Bool, chdir : Path | String?) : Prepared
+                       clear_env : Bool, chdir : Path | String?, marker : String? = nil) : Prepared
         validate_text!(command, "command")
         raise ArgumentError.new("command must not be empty") if command.empty?
         argv = [command]
@@ -47,7 +48,13 @@
         end
         directory = chdir.try(&.to_s)
         directory.try { |value| validate_text!(value, "chdir") }
-        Prepared.new(command, resolve(command), CStrings.new(argv), CStrings.new(environment(env, clear_env)), directory)
+        entries = environment(env, clear_env)
+        if marker
+          name = marker.split('=', 2).first
+          entries.reject!(&.starts_with?("#{name}="))
+          entries << marker
+        end
+        Prepared.new(command, resolve(command), CStrings.new(argv), CStrings.new(entries), directory)
       end
 
       # Resolves in the caller so that the result does not depend on the child's working directory.
@@ -81,7 +88,8 @@
       # `sources` onto 0-2 in the child; `release_child_side` must run right after the process exists (the parent must not
       # keep the child's ends open or the other side never sees EOF); `abandon` also closes the parent's ends.
       #
-      # Supported: Process::Redirect::Inherit / Close (the null device) / Pipe, and an IO::FileDescriptor (a File, STDOUT).
+      # Supported: Process::Redirect::Inherit / Close (the null device) / Pipe, an IO::FileDescriptor (a File, STDOUT), and
+      # any other IO, which gets a pipe and a copy fiber (`copies`, started by Child); a closed IO gets the null device.
       # Every source is copied to a descriptor >= 3 first, so that a source which is itself 0, 1 or 2 (a closed stdin makes
       # pipe() return 0) cannot be overwritten by an earlier dup2.
       class Plumbing
@@ -89,9 +97,10 @@
         getter input : IO::FileDescriptor? = nil
         getter output : IO::FileDescriptor? = nil
         getter error : IO::FileDescriptor? = nil
+        getter copies = ProcessSupervision::StreamCopies.new
 
         @child_ends = [] of IO::FileDescriptor
-        @copies = [] of Int32
+        @copies_fds = [] of Int32
 
         def self.build(input : ::Process::Stdio, output : ::Process::Stdio, error : ::Process::Stdio) : Plumbing
           plumbing = new
@@ -117,40 +126,62 @@
             when .inherit?
               # keep the parent's descriptor
             when .close?
-              fd = LibC.open("/dev/null", LibC::O_RDWR | LibC::O_CLOEXEC)
-              raise native_error("open(/dev/null)") if fd < 0
-              @copies << fd
-              @sources[target] = fd
+              null_device(target)
             when .pipe?
-              if target == 0
-                reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
-                @child_ends << reader
-                @input = writer
-                @sources[target] = movable(reader)
-              else
-                reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
-                @child_ends << writer
-                target == 1 ? (@output = reader) : (@error = reader)
-                @sources[target] = movable(writer)
+              parent_end = pipe(target)
+              case target
+              when 0 then @input = parent_end
+              when 1 then @output = parent_end
+              else        @error = parent_end
               end
             end
           when IO::FileDescriptor
             @sources[target] = duplicate_above_stdio(spec.fd)
           else
-            raise ArgumentError.new("only Process::Redirect and IO::FileDescriptor are supported for standard streams")
+            if spec.closed?
+              null_device(target)
+            elsif target == 0
+              @copies.add_input(spec, pipe(target))
+            else
+              @copies.add_output(pipe(target), spec)
+            end
+          end
+        end
+
+        private def null_device(target : Int32) : Nil
+          fd = LibC.open("/dev/null", LibC::O_RDWR | LibC::O_CLOEXEC)
+          raise native_error("open(/dev/null)") if fd < 0
+          @copies_fds << fd
+          @sources[target] = fd
+        end
+
+        # A pipe for stream *target*: the child's end (blocking) becomes its source, the parent's end (non-blocking) is
+        # returned.
+        private def pipe(target : Int32) : IO::FileDescriptor
+          if target == 0
+            reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
+            @child_ends << reader
+            @sources[target] = movable(reader)
+            writer
+          else
+            reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
+            @child_ends << writer
+            @sources[target] = movable(writer)
+            reader
           end
         end
 
         def release_child_side : Nil
           @child_ends.each { |io| io.close rescue nil }
           @child_ends.clear
-          @copies.each { |fd| LibC.close(fd) }
-          @copies.clear
+          @copies_fds.each { |fd| LibC.close(fd) }
+          @copies_fds.clear
         end
 
         def abandon : Nil
           release_child_side
           {@input, @output, @error}.each { |io| io.try { |stream| stream.close rescue nil } }
+          @copies.close
         end
 
         private def movable(io : IO::FileDescriptor) : Int32
@@ -160,7 +191,7 @@
         private def duplicate_above_stdio(fd : Int32) : Int32
           copy = LibC.fcntl(fd, F_DUPFD_CLOEXEC, 3)
           raise native_error("fcntl(F_DUPFD_CLOEXEC)") if copy < 0
-          @copies << copy
+          @copies_fds << copy
           copy
         end
 
