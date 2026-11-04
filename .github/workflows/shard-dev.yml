@@ -63,6 +63,8 @@ jobs:
           cd probes/workspace
           crystal tool format process-handle/src process-handle/spec process-supervision/src process-supervision/spec > "$GITHUB_WORKSPACE/shard-out/format.txt" 2>&1
           echo "format exit=$?"
+          crystal tool format --check process-handle/src process-handle/spec process-supervision/src process-supervision/spec > "$GITHUB_WORKSPACE/shard-out/format-check.txt" 2>&1
+          echo "format --check exit=$?"
           git diff > "$GITHUB_WORKSPACE/shard-out/shard-format.patch"
           git diff --stat | tail -5
           CP="$PWD/process-handle/src:$PWD/process-supervision/src:$(crystal env CRYSTAL_PATH)"
