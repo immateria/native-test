@@ -1107,7 +1107,7 @@ What building it found:
 * The kit pins its sources by hash, so `MANIFEST.sha256` was regenerated and the four new files added; the kit's case names
   and meaning are unchanged.
 
-The kit's own native qualification, run against the modified source (run `41926248879`): macOS arm64 386 Crystal + 45 C/SDK
+The kit's own native qualification, run against the modified source (runs `41926248879` and, after the stdio change, `41928529899`): macOS arm64 386 Crystal + 45 C/SDK
 cases, Windows x64 elevated 459 and unelevated 459, all `qualification_validation=pass`, manifest checks before and after pass.
 
 Standard stream redirection (`input:`/`output:`/`error:` with `Redirect::Inherit`/`Close`/`Pipe` or an `IO::FileDescriptor`;
