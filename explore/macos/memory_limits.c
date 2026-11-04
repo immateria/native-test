@@ -46,6 +46,13 @@ static int footprint(pid_t pid, unsigned long long *fp, unsigned long long *rss)
   return 0;
 }
 
+/* Remember every allocation in a volatile array: otherwise the compiler may delete a malloc whose contents are never read,
+ * together with the stores that fill it, and the process never uses the memory at all (the first CI run of this probe
+ * measured exactly that). */
+static char *volatile g_keep[512];
+static int g_keep_n;
+static void keep(char *p) { if (g_keep_n < 512) g_keep[g_keep_n++] = p; }
+
 /* Fill with data that neither the zero-page logic nor the compressor's same-value shortcut can collapse. */
 static void fill_random(char *p, size_t sz, uint64_t seed) {
   uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
@@ -64,6 +71,7 @@ static void allocate_forever(int fd, uint32_t total_mib, int gap_ms) {
     char *p = malloc(sz);
     if (!p) { have = 0xFFFFFFFF; break; }
     fill_random(p, sz, have + 1);
+    keep(p);
     have += 8;
     step_t s = {have, now_ms()};
     (void)!write(fd, &s, sizeof s);
@@ -94,7 +102,7 @@ static void rlimit_rss_enforced(void) {
     size_t sz = 256 * MIB;
     char *buf = malloc(sz);
     int ok = buf != NULL;
-    if (buf) fill_random(buf, sz, 7);
+    if (buf) { fill_random(buf, sz, 7); keep(buf); }
     unsigned long long fp = 0, rss = 0;
     int fprc = footprint(getpid(), &fp, &rss);
     _exit(!ok ? 3 : fprc != 0 ? 4 : rss >= 200 * MIB ? 0 : 5);
@@ -171,12 +179,14 @@ static void footprint_uniform_vs_random(void) {
     unsigned long long fp0 = fp;
     char *a = malloc(sz), *b = malloc(sz);
     memset(a, 0x5a, sz);
+    keep(a);
     int rc1 = footprint(getpid(), &fp, &rss);
     unsigned long long fp1 = fp, rss1 = rss;
     sleep_ms(1500);
     int rc2 = footprint(getpid(), &fp, &rss);
     unsigned long long fp2 = fp, rss2 = rss;
     fill_random(b, sz, 3);
+    keep(b);
     int rc3 = footprint(getpid(), &fp, &rss);
     unsigned long long fp3 = fp, rss3 = rss;
     sleep_ms(1500);

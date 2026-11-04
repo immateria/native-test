@@ -1942,8 +1942,24 @@ static int child_ac(const wchar_t *logpath, DWORD supervisor_pid, int port) {
   a.sin_family = AF_INET;
   a.sin_port = htons((u_short)port);
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  /* non-blocking with a 3 s limit: a filter that drops the packets would otherwise hold connect() for ~21 s */
+  u_long nb = 1;
+  ioctlsocket(s, FIONBIO, &nb);
+  double tc = abs_ms();
   int rc = connect(s, (struct sockaddr *)&a, sizeof a);
-  ADD(",\"connect_to_supervisors_loopback_listener\":\"%s\",\"wsa_error\":%d", rc == 0 ? "ok" : "refused", rc == 0 ? 0 : WSAGetLastError());
+  int werr = rc == 0 ? 0 : WSAGetLastError();
+  const char *verdict = rc == 0 ? "connected" : "?";
+  if (rc != 0 && werr == WSAEWOULDBLOCK) {
+    fd_set wf, ef;
+    FD_ZERO(&wf); FD_ZERO(&ef);
+    FD_SET(s, &wf); FD_SET(s, &ef);
+    struct timeval tv = {3, 0};
+    int sel = select(0, NULL, &wf, &ef, &tv);
+    if (sel == 0) { verdict = "no answer within 3 s (packets dropped)"; werr = 0; }
+    else if (FD_ISSET(s, &wf)) { verdict = "connected"; werr = 0; }
+    else { int soerr = 0, sl = sizeof soerr; getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl); verdict = "refused"; werr = soerr; }
+  } else if (rc != 0) verdict = "failed at once";
+  ADD(",\"connect_to_supervisors_loopback_listener\":\"%s\",\"wsa_error\":%d,\"connect_ms\":%.0f", verdict, werr, abs_ms() - tc);
   closesocket(s);
 
   /* a grandchild */
@@ -2037,12 +2053,16 @@ static void probe_appcontainer(void) {
     BOOL as = AssignProcessToJobObject(job, pi.hProcess);
     DWORD as_err = as ? 0 : GetLastError();
     ResumeThread(pi.hThread);
-    int ready = wait_ready(log, pi.hProcess, 10000);
+    int ready = wait_ready(log, pi.hProcess, 30000);
     int exited = WaitForSingleObject(pi.hProcess, 10000) == WAIT_OBJECT_0;
     DWORD ec = 0;
     GetExitCodeProcess(pi.hProcess, &ec);
     char b[4096];
     read_text(log, b, sizeof b);
+    if (!ready) {
+      /* what is it doing: CPU used and thread count tell a hang from a busy loop */
+      emit("app_container_child_not_ready", "\"cpu_ms\":%.0f,\"threads\":%d", proc_cpu_ms(pi.hProcess), thread_count_of(pi.dwProcessId));
+    }
     char *json = strchr(b, '{');
     if (json) { char *nl = strpbrk(json, "\r\n"); if (nl) *nl = 0; }
     emit("app_container_child", "\"spawned\":true,\"assigned_to_job\":%s,\"assign_error\":%lu,\"reported\":%s,\"exited\":%s,\"exit_code\":%lu,\"child_says\":%s",
