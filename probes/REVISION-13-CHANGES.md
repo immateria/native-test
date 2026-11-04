@@ -79,6 +79,18 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
 * `job_user_time_limit_enforced_and_event` (the one remaining short-window enforcement assertion) also spins and
   waits two periods.
 
+## Third pass: the 8-child kqueue failure explained
+
+* `kqueue_many_children_one_queue_all_exit_events` (8 successful registrations, 7 events, once in six runs):
+  **a `kevent` wait interrupted by `SIGCHLD`.** XNU never restarts `kevent` after a signal (`kevent_cleanup` in
+  `bsd/kern/kern_event.c` turns `ERESTART` into `EINTR`, "don't restart after signals"), regardless of
+  `SA_RESTART`, and Crystal's runtime handles `SIGCHLD` for every child that exits. `kevent_wait` returned the
+  `-1`/`EINTR` as "no event", and the case makes exactly eight single-event waits, so one interrupted wait cost one
+  event. `explore/macos/kqueue_zombie.c` reproduces it on every macOS runner (6-23 of 320 waits returned `EINTR`
+  with a Crystal-like `SA_RESTART` handler) and shows the kernel itself never lost an event (about 11 000
+  registrations per runner, with and without a concurrent reaper). `kevent_wait` now retries on `EINTR` with the
+  remaining time, which all kqueue cases share; the 8-child case records `eintr_retries`.
+
 ## Not changed on purpose
 
 * `r6_priority_applied_high` (`SetInformationJobObject` fails with 1314 in the kit but the identical request

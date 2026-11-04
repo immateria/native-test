@@ -165,14 +165,34 @@ module NativeProbe
     end
   end
 
+  # Number of kevent waits that returned EINTR and were retried (see kevent_wait).
+  @@kevent_eintr_retries = 0
+
+  def self.kevent_eintr_retries : Int32
+    @@kevent_eintr_retries
+  end
+
+  # XNU never restarts kevent after a signal, SA_RESTART or not (kevent_cleanup turns ERESTART into EINTR),
+  # and the runtime's own SIGCHLD handler fires whenever one of this program's children exits. A wait that
+  # returned EINTR used to be reported as "no event" (the 8-child case once saw 7 of 8 events that way;
+  # explore/macos/kqueue_zombie.c reproduces it in 6-23 of 320 calls). Retry with the remaining time.
   def self.kevent_wait(kq : Int32, timeout : Time::Span) : {Int32, LibC::Kevent, Int32}
     event = LibC::Kevent.new
-    seconds = timeout.total_seconds.to_i64
-    nanos = (timeout.total_nanoseconds - seconds * 1_000_000_000).to_i64
-    ts = LibC::Timespec.new(tv_sec: seconds, tv_nsec: nanos)
-    Errno.value = Errno::NONE
-    rc = LibC.kevent(kq, Pointer(LibC::Kevent).null, 0, pointerof(event), 1, pointerof(ts))
-    {rc, event, Errno.value.value}
+    deadline = Time.instant + timeout
+    loop do
+      left = deadline - Time.instant
+      left = Time::Span.zero if left < Time::Span.zero
+      seconds = left.total_seconds.to_i64
+      nanos = (left.total_nanoseconds - seconds * 1_000_000_000).to_i64
+      ts = LibC::Timespec.new(tv_sec: seconds, tv_nsec: nanos)
+      Errno.value = Errno::NONE
+      rc = LibC.kevent(kq, Pointer(LibC::Kevent).null, 0, pointerof(event), 1, pointerof(ts))
+      if rc < 0 && Errno.value == Errno::EINTR
+        @@kevent_eintr_retries += 1
+        next
+      end
+      return {rc, event, Errno.value.value}
+    end
   end
 
   def self.kevent_change(kq : Int32, pid : Int64, flags : UInt16, fflags : UInt32,
@@ -2348,9 +2368,9 @@ module NativeProbe
         result = with_kqueue do |kq|
           # Register each child immediately after it starts. A registration made after the child has exited
           # fails with ESRCH (measured 200/200: explore/macos/kqueue_zombie.c), which spawning eight Crystal
-          # children one after another can cause on a loaded runner. NOTE: that does not explain the one
-          # observed failure (8 successful registrations, 7 events); `missing_pids`/`event_rcs` below record
-          # more if it recurs.
+          # children one after another can cause on a loaded runner. The one observed failure with 8
+          # successful registrations and 7 events was a kevent wait interrupted by SIGCHLD (EINTR), which
+          # kevent_wait now retries; `eintr_retries` records how often that happened.
           registrations = 0
           8.times do |i|
             child = Process.new(self_exe, ["--child", "delayed-exit-code", (180 + i * 25).to_s, i.to_s])
@@ -2361,6 +2381,7 @@ module NativeProbe
           end
           seen = Set(UInt64).new
           event_rcs = [] of Int32
+          eintr_before = kevent_eintr_retries
           8.times do
             rc, event, _ = kevent_next(kq, 2.seconds)
             event_rcs << rc
@@ -2374,7 +2395,8 @@ module NativeProbe
           end
           {registrations == 8 && seen.size == 8 && statuses.all?(&.normal_exit?),
            details(registrations: registrations, unique_events: seen.size, exit_codes: statuses.map(&.exit_code?).join(","),
-             event_rcs: event_rcs.join(","), missing_pids: missing_pids.join(","))}
+             event_rcs: event_rcs.join(","), missing_pids: missing_pids.join(","),
+             eintr_retries: kevent_eintr_retries - eintr_before)}
         end
         result
       ensure
