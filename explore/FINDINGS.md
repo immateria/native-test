@@ -284,7 +284,9 @@ the same in all five configurations unless a difference is stated.
 ### Crashes and the debugger (verified)
 
 * An access violation exits `0xC0000005` in 5–13 ms, with or without `SEM_NOGPFAULTERRORBOX`; `WerFault.exe` was never
-  seen. On hosted runners a crash does not hang the supervisor behind an error-reporting dialog.
+  seen. On hosted runners a crash does not hang the supervisor behind an error-reporting dialog. (Explained later: the
+  step's processes already inherit `SEM_NOGPFAULTERRORBOX`, so "without" was never tested; with error mode 0, WER runs and
+  a crash takes ~0.3 s — see "Windows services, session 0 and crash reporting".)
 * A debugger sees `80000003/first` (the initial breakpoint), then `C0000005/first`, `C0000005/second`, then the exit.
 * Terminating a debugger kills its `DEBUG_ONLY_THIS_PROCESS` debuggee within 1–3 ms (exit `0xC0000354`,
   `STATUS_DEBUGGER_INACTIVE`): a "die with the supervisor" mechanism that needs no job.
@@ -837,9 +839,17 @@ between the fault and the process exit, and with a per-program `LocalDumps` key 
 dump (26–49 MiB) appears. Children of the service behave the same — 161–323 ms, with dumps — and **in a job with
 `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` they exit at once (0 ms) with no dump**; a job without that flag changes
 nothing (169–307 ms). But a child crashing in the runner's session 2 also exits at once (0 ms) and writes no dump even
-with `LocalDumps` set, and the runner's job does *not* have that flag (see the next section for the cause).
-A supervisor must not count on a crash dump, or on a fixed crash-to-exit time, without knowing which of these applies;
-its own job with `DIE_ON_UNHANDLED_EXCEPTION` makes crashes immediate and dump-free.
+with `LocalDumps` set, and the runner's job does *not* have that flag. **The cause is the inherited error mode**: the
+step's processes run with `GetErrorMode()` = `0x8003` (`SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+SEM_NOOPENFILEERRORBOX`), which children inherit, while the test service had `0x8001`. With `SEM_NOGPFAULTERRORBOX` the
+unhandled-exception path does not call WER at all. Measured in the runner's session (run `41894086301`, arm64): a child
+that crashed with the inherited `0x8003` — or with `SetErrorMode(SEM_NOGPFAULTERRORBOX)` alone — exited in 0 ms, no
+`WerFault`, no dump; the same child after `SetErrorMode(0)` took **298–303 ms**, `WerFault` ran (in sessions 0 and 2)
+and `LocalDumps` wrote a 0.9 MiB minidump. So "a crash does not wait for WER on the hosted runner" is a property of
+the runner's error mode, not of Windows: a supervisor whose children run with error mode 0 (any service, any process
+whose parent did not set the flag) waits ~0.2–0.9 s per crash, longer with full dumps. A supervisor can make crashes
+immediate and dump-free for its children with `SetErrorMode(SEM_NOGPFAULTERRORBOX)` before creating them (inherited) or
+with a job that has `DIE_ON_UNHANDLED_EXCEPTION`; it cannot count on a dump unless it clears both.
 
 ## A Mach exception handler holds a crashing thread (macOS, verified on all five runners)
 
