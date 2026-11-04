@@ -328,7 +328,7 @@ int main(int argc, char **argv) {
   t0 = now_ms();
   int avail = 1, raw = 0;
   n = walk_kernel(getpid(), found, 4096, &avail, &raw);
-  char extra[96];
+  char extra[256];
   snprintf(extra, sizeof extra, "\"interface_available\":%d,\"raw_return_of_last_call\":%d", avail, raw);
   report("kernel_child_lists", found, n, &t, now_ms() - t0, extra);
 
@@ -352,6 +352,7 @@ int main(int argc, char **argv) {
   char *buf = malloc(cap);
   n = 0;
   int errs = 0, eacces = 0, other_err = 0;
+  int hist_code[8] = {0}, hist_n[8] = {0}, hist_used = 0;
   char needle[160];
   snprintf(needle, sizeof needle, "%s=", g_tag_name);
   strncat(needle, getenv(g_tag_name), sizeof needle - strlen(needle) - 1);
@@ -359,9 +360,21 @@ int main(int argc, char **argv) {
     if (g_tab[i].pid == getpid()) continue;
     int err = 0;
     if (has_tag(g_tab[i].pid, needle, buf, cap, &err)) found[n++] = g_tab[i].pid;
-    else if (err) { errs++; if (err == EACCES || err == EPERM) eacces++; else other_err++; }
+    else if (err) {
+      errs++;
+      if (err == EACCES || err == EPERM) eacces++; else other_err++;
+      int k = 0;
+      while (k < hist_used && hist_code[k] != err) k++;
+      if (k == hist_used && hist_used < 8) { hist_code[hist_used] = err; hist_n[hist_used] = 0; hist_used++; }
+      if (k < hist_used) hist_n[k]++;
+    }
   }
-  snprintf(extra, sizeof extra, "\"unreadable_processes\":%d,\"of_which_permission_denied\":%d,\"of_which_other_errors\":%d", errs, eacces, other_err);
+  {
+    size_t el = (size_t)snprintf(extra, sizeof extra, "\"unreadable_processes\":%d,\"of_which_permission_denied\":%d,\"of_which_other_errors\":%d,\"errors\":{", errs, eacces, other_err);
+    for (int k = 0; k < hist_used && el < sizeof extra - 40; k++)
+      el += (size_t)snprintf(extra + el, sizeof extra - el, "%s\"%s(%d)\":%d", k ? "," : "", errno_name(hist_code[k]), hist_code[k], hist_n[k]);
+    snprintf(extra + el, sizeof extra - el, "}");
+  }
   report("environment_tag", found, n, &t, now_ms() - t0, extra);
   free(buf);
 

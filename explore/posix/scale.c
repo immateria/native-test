@@ -191,6 +191,7 @@ static void set_nproc_soft(rlim_t v) {
 }
 
 static rlim_t g_orig_nproc_soft;
+static long g_kernel_count_estimate = -1; /* what the kernel charges this uid, found by seeing how many children fit */
 
 static void restore_nproc(void) {
   struct rlimit rl;
@@ -219,6 +220,7 @@ static void concurrent_children(void) {
     if (n >= 200 && n < 300) last_ms += dt;
   }
   double fork_phase_ms = now_ms() - t_all0;
+  if (err == EAGAIN) g_kernel_count_estimate = (long)(base + budget) - n;
   long uid_after = count_uid_tasks();
   restore_nproc();
   double tk = now_ms();
@@ -227,8 +229,8 @@ static void concurrent_children(void) {
   for (int i = 0; i < n; i++) { int st; if (waitpid(pids[i], &st, 0) == pids[i]) reaped++; }
   double kill_reap_ms = now_ms() - tk;
   emit(PROBE, "concurrent_children_until_bounded_nproc",
-       "\"tasks_of_uid_before\":%ld,\"nproc_soft_set_to\":%ld,\"children_created\":%d,\"stopped_by\":\"%s\",\"tasks_of_uid_after\":%ld,\"first_100_forks_total_ms\":%.1f,\"forks_200_to_300_total_ms\":%.1f,\"fork_phase_ms\":%.0f,\"kill_and_reap_all_ms\":%.0f,\"reaped\":%d",
-       base, base + budget, n, n >= 1000 ? "limit_of_this_probe" : errno_name(err), uid_after, first_ms, last_ms, fork_phase_ms, kill_reap_ms, reaped);
+       "\"tasks_of_uid_listed_before\":%ld,\"nproc_soft_set_to\":%ld,\"children_created\":%d,\"kernel_count_before_estimate\":%ld,\"stopped_by\":\"%s\",\"tasks_of_uid_after\":%ld,\"first_100_forks_total_ms\":%.1f,\"forks_200_to_300_total_ms\":%.1f,\"fork_phase_ms\":%.0f,\"kill_and_reap_all_ms\":%.0f,\"reaped\":%d",
+       base, base + budget, n, g_kernel_count_estimate, n >= 1000 ? "limit_of_this_probe" : errno_name(err), uid_after, first_ms, last_ms, fork_phase_ms, kill_reap_ms, reaped);
   free(pids);
 }
 
@@ -257,7 +259,7 @@ static void zombies(void) {
        made, make_ms, before, during, after, reap_ms, reaped);
 
   /* 2. do unreaped zombies count against RLIMIT_NPROC? Allow 20 more tasks, then create 40 children that exit at once. */
-  long base = count_uid_tasks();
+  long base = g_kernel_count_estimate >= 0 ? g_kernel_count_estimate : count_uid_tasks();
   set_nproc_soft((rlim_t)(base + 20));
   int created = 0, err = 0;
   pid_t z[64];
@@ -281,7 +283,7 @@ static void zombies(void) {
   restore_nproc();
   for (int i = 1; i < created; i++) { int st; waitpid(z[i], &st, 0); }
   emit(PROBE, "zombies_count_against_RLIMIT_NPROC",
-       "\"tasks_before\":%ld,\"allowed_extra\":20,\"exited_children_created_before_refusal\":%d,\"refused_with\":\"%s\",\"fork_succeeds_after_reaping_one\":%d,\"errno_after_reaping_one\":\"%s\"",
+       "\"kernel_count_assumed\":%ld,\"allowed_extra\":20,\"exited_children_created_before_refusal\":%d,\"refused_with\":\"%s\",\"fork_succeeds_after_reaping_one\":%d,\"errno_after_reaping_one\":\"%s\"",
        base, created, errno_name(err), after_reap_ok, errno_name(after_reap_err));
   free(pids);
 }

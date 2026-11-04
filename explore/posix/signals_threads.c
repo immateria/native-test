@@ -109,14 +109,30 @@ static void run_selection(const char *kase, const int unblock[NT], int late_unbl
   int pending_visible_to_main = sigismember(&pend, SIGUSR1);
   int hits_before_late[NT];
   for (int i = 0; i < NT; i++) hits_before_late[i] = g_hits[i];
+  int after_50ms[NT] = {0}, after_1s[NT] = {0}, after_more[NT] = {0};
   if (late_unblock >= 0) {
     if (late_unblock == 0) unblock_usr1(); else g_unblock_now[late_unblock] = 1;
     sleep_ms(50);
+    for (int i = 0; i < NT; i++) after_50ms[i] = g_hits[i];
+    sleep_ms(950);
+    for (int i = 0; i < NT; i++) after_1s[i] = g_hits[i];
+    /* one more signal: the thread that unblocked can take it */
+    pid_t s2 = spawn_sender(1, 5, -1, 0);
+    while (waitpid(s2, &st, WNOHANG) == 0) sleep_ms(1);
+    sleep_ms(50);
+    for (int i = 0; i < NT; i++) after_more[i] = g_hits[i];
   }
-  emit(PROBE, kase,
-       "\"sent\":%d,\"hits\":[%d,%d,%d,%d],\"total\":%d,\"pending_after_sending\":%d,\"hits_before_late_unblock\":[%d,%d,%d,%d]",
-       sent, g_hits[0], g_hits[1], g_hits[2], g_hits[3], g_total, pending_visible_to_main,
-       hits_before_late[0], hits_before_late[1], hits_before_late[2], hits_before_late[3]);
+  if (late_unblock >= 0) {
+    emit(PROBE, kase,
+         "\"sent\":%d,\"pending_after_sending\":%d,\"hits_after_unblock_50ms\":[%d,%d,%d,%d],\"hits_after_unblock_1s\":[%d,%d,%d,%d],\"hits_after_one_more_signal\":[%d,%d,%d,%d]",
+         sent, pending_visible_to_main, after_50ms[0], after_50ms[1], after_50ms[2], after_50ms[3], after_1s[0], after_1s[1], after_1s[2], after_1s[3],
+         after_more[0], after_more[1], after_more[2], after_more[3]);
+  } else {
+    emit(PROBE, kase,
+         "\"sent\":%d,\"hits\":[%d,%d,%d,%d],\"total\":%d,\"pending_after_sending\":%d",
+         sent, g_hits[0], g_hits[1], g_hits[2], g_hits[3], g_total, pending_visible_to_main);
+  }
+  (void)hits_before_late;
   g_stop = 1;
   for (int i = 1; i < NT; i++) pthread_join(th[i], NULL);
   /* back to a clean single-threaded state: SIGUSR1 default-blocked off */

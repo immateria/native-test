@@ -46,6 +46,16 @@ static int footprint(pid_t pid, unsigned long long *fp, unsigned long long *rss)
   return 0;
 }
 
+/* Fill with data that neither the zero-page logic nor the compressor's same-value shortcut can collapse. */
+static void fill_random(char *p, size_t sz, uint64_t seed) {
+  uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
+  uint64_t *w = (uint64_t *)p;
+  for (size_t i = 0; i < sz / 8; i++) {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    w[i] = x;
+  }
+}
+
 /* Allocates `total_mib` in 8 MiB steps, `gap_ms` apart, reporting each step on fd. Never returns. */
 static void allocate_forever(int fd, uint32_t total_mib, int gap_ms) {
   uint32_t have = 0;
@@ -53,7 +63,7 @@ static void allocate_forever(int fd, uint32_t total_mib, int gap_ms) {
     size_t sz = 8 * MIB;
     char *p = malloc(sz);
     if (!p) { have = 0xFFFFFFFF; break; }
-    memset(p, 0x5a + (int)have, sz); /* touch and make non-zero so the pages cannot be elided */
+    fill_random(p, sz, have + 1);
     have += 8;
     step_t s = {have, now_ms()};
     (void)!write(fd, &s, sizeof s);
@@ -84,10 +94,10 @@ static void rlimit_rss_enforced(void) {
     size_t sz = 256 * MIB;
     char *buf = malloc(sz);
     int ok = buf != NULL;
-    if (buf) memset(buf, 0x7b, sz);
+    if (buf) fill_random(buf, sz, 7);
     unsigned long long fp = 0, rss = 0;
-    footprint(getpid(), &fp, &rss);
-    _exit(ok && rss >= 200 * MIB ? 0 : 3);
+    int fprc = footprint(getpid(), &fp, &rss);
+    _exit(!ok ? 3 : fprc != 0 ? 4 : rss >= 200 * MIB ? 0 : 5);
   }
   close(p[1]);
   char buf[512];
@@ -96,8 +106,7 @@ static void rlimit_rss_enforced(void) {
   close(p[0]);
   char st[64];
   reap_blocking(c, 20000, st, sizeof st);
-  emit(PROBE, "rlimit_rss_enforced", "\"setrlimit\":%s,\"child_touched_256MiB_and_stayed_resident\":\"%s\"", n ? buf : "null",
-       strcmp(st, "exited(0)") == 0 ? "yes (RLIMIT_RSS not enforced)" : st);
+  emit(PROBE, "rlimit_rss_enforced", "\"setrlimit\":%s,\"child_end\":\"%s\",\"meaning_of_exit_code\":\"0 = touched 256 MiB and stayed resident; 3 = malloc failed; 4 = proc_pid_rusage failed; 5 = resident < 200 MiB\"", n ? buf : "null", st);
 }
 
 static void footprint_poll_kill(void) {
@@ -112,16 +121,18 @@ static void footprint_poll_kill(void) {
     _exit(0);
   }
   close(p[1]);
-  long polls = 0;
+  long polls = 0, failures = 0;
+  int last_errno = 0;
   double poll_time = 0, t_detect = 0, t_first_poll = now_ms();
-  unsigned long long fp = 0, rss = 0, fp_detect = 0, rss_detect = 0;
+  unsigned long long fp = 0, rss = 0, fp_detect = 0, rss_detect = 0, fp_max = 0;
   int failed = 0;
   for (;;) {
     double a = now_ms();
     int rc = footprint(c, &fp, &rss);
     poll_time += now_ms() - a;
     polls++;
-    if (rc != 0) { if (++failed > 50) break; sleep_ms(1); continue; }
+    if (rc != 0) { last_errno = errno; failures++; if (++failed > 2000) break; sleep_ms(1); continue; }
+    if (fp > fp_max) fp_max = fp;
     if (fp >= threshold_mib * MIB) { t_detect = now_ms(); fp_detect = fp; rss_detect = rss; break; }
     if (now_ms() - t_first_poll > 20000) break;
     sleep_ms(1);
@@ -141,9 +152,50 @@ static void footprint_poll_kill(void) {
   }
   close(p[0]);
   emit(PROBE, "footprint_poll_kill",
-       "\"threshold_MiB\":%llu,\"polls\":%ld,\"avg_ms_per_proc_pid_rusage_call\":%.3f,\"footprint_at_detection_MiB\":%.1f,\"resident_at_detection_MiB\":%.1f,\"child_reported_MiB_when_killed\":%u,\"child_step_that_crossed_threshold_MiB\":%u,\"detection_after_crossing_ms\":%.1f,\"kill_to_reaped_ms\":%.1f,\"child_status\":\"%s\"",
-       threshold_mib, polls, polls ? poll_time / (double)polls : 0.0, (double)fp_detect / MIB, (double)rss_detect / MIB, last_mib, cross_mib,
+       "\"threshold_MiB\":%llu,\"detected\":%d,\"polls\":%ld,\"failed_polls\":%ld,\"last_error\":\"%s\",\"largest_footprint_seen_MiB\":%.1f,\"avg_ms_per_proc_pid_rusage_call\":%.3f,\"footprint_at_detection_MiB\":%.1f,\"resident_at_detection_MiB\":%.1f,\"child_reported_MiB_when_killed\":%u,\"child_step_that_crossed_threshold_MiB\":%u,\"detection_after_crossing_ms\":%.1f,\"kill_to_reaped_ms\":%.1f,\"child_status\":\"%s\"",
+       threshold_mib, t_detect != 0, polls, failures, errno_name(last_errno), (double)fp_max / MIB, polls ? poll_time / (double)polls : 0.0, (double)fp_detect / MIB, (double)rss_detect / MIB, last_mib, cross_mib,
        t_cross ? t_detect - t_cross : -1.0, t_dead - t_kill, WIFSIGNALED(st) ? sig_name(WTERMSIG(st)) : "exited");
+}
+
+/* Does the footprint count pages whose content is one repeated byte? Report from inside the child. */
+static void footprint_uniform_vs_random(void) {
+  int p[2];
+  if (pipe(p) != 0) return;
+  pid_t c = fork();
+  if (c == 0) {
+    close(p[0]);
+    unsigned long long fp, rss;
+    char line[600];
+    size_t sz = 128 * MIB;
+    int rc0 = footprint(getpid(), &fp, &rss);
+    unsigned long long fp0 = fp;
+    char *a = malloc(sz), *b = malloc(sz);
+    memset(a, 0x5a, sz);
+    int rc1 = footprint(getpid(), &fp, &rss);
+    unsigned long long fp1 = fp, rss1 = rss;
+    sleep_ms(1500);
+    int rc2 = footprint(getpid(), &fp, &rss);
+    unsigned long long fp2 = fp, rss2 = rss;
+    fill_random(b, sz, 3);
+    int rc3 = footprint(getpid(), &fp, &rss);
+    unsigned long long fp3 = fp, rss3 = rss;
+    sleep_ms(1500);
+    int rc4 = footprint(getpid(), &fp, &rss);
+    int n = snprintf(line, sizeof line,
+      "{\"rc\":[%d,%d,%d,%d,%d],\"footprint_MiB\":{\"start\":%.1f,\"after_128MiB_uniform_fill\":%.1f,\"1.5s_later\":%.1f,\"after_128MiB_random_fill_too\":%.1f,\"1.5s_later_again\":%.1f},\"resident_MiB\":{\"after_uniform\":%.1f,\"1.5s_later\":%.1f,\"after_random\":%.1f}}",
+      rc0, rc1, rc2, rc3, rc4, (double)fp0 / MIB, (double)fp1 / MIB, (double)fp2 / MIB, (double)fp3 / MIB, (double)fp / MIB,
+      (double)rss1 / MIB, (double)rss2 / MIB, (double)rss3 / MIB);
+    (void)!write(p[1], line, (size_t)n);
+    _exit(0);
+  }
+  close(p[1]);
+  char buf[700];
+  int eof;
+  drain_until(p[0], buf, sizeof buf, 15000, &eof);
+  close(p[0]);
+  char st[64];
+  reap_blocking(c, 5000, st, sizeof st);
+  emit(PROBE, "footprint_uniform_vs_random_pages", "\"child_measured\":%s,\"child_end\":\"%s\"", buf[0] ? buf : "null", st);
 }
 
 /* The child applies `cmd` to itself, reports the result, then allocates 8 MiB steps up to 512 MiB. */
@@ -228,6 +280,7 @@ int main(void) {
   emit(PROBE, "system", "\"hw_memsize_MiB\":%llu,\"memorystatus_vm_pressure_level\":%d,\"memorystatus_control_found\":%d",
        (unsigned long long)(memsize / MIB), mem_pressure_level, g_msc != NULL);
   rlimit_rss_enforced();
+  footprint_uniform_vs_random();
   footprint_poll_kill();
   memorystatus_case("memorystatus_set_memlimit_properties_64MB_fatal", MS_CMD_SET_MEMLIMIT_PROPERTIES);
   memorystatus_case("memorystatus_set_jetsam_task_limit_64MB", MS_CMD_SET_JETSAM_TASK_LIMIT);

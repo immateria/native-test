@@ -17,7 +17,10 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <shellapi.h>
+#include <sddl.h>
 #include <tlhelp32.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -29,6 +32,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ws2_32.lib")
 #endif
 
 #ifndef PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
@@ -1478,6 +1482,806 @@ static void probe_pidreuse(void) {
        (unsigned long)held_pid, reissued_while_held, reissued_after_close, after_index, N);
 }
 
+/* ------------------------------------------------------------------ round 2: suspend/freeze, WM_CLOSE, AppContainer, emulation, scale */
+
+static double proc_cpu_ms(HANDLE h) {
+  FILETIME c, x, k, u;
+  if (!GetProcessTimes(h, &c, &x, &k, &u)) return -1;
+  return ft_ms(k) + ft_ms(u);
+}
+
+static double cpu_over(HANDLE h, DWORD ms) {
+  double a = proc_cpu_ms(h);
+  Sleep(ms);
+  return proc_cpu_ms(h) - a;
+}
+
+static double job_cpu_ms(HANDLE job) {
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION b;
+  if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &b, sizeof b, NULL)) return -1;
+  return (double)(b.TotalUserTime.QuadPart + b.TotalKernelTime.QuadPart) / 10000.0;
+}
+
+static double job_cpu_over(HANDLE job, DWORD ms) {
+  double a = job_cpu_ms(job);
+  Sleep(ms);
+  return job_cpu_ms(job) - a;
+}
+
+static DWORD WINAPI spin_thread(LPVOID p) {
+  (void)p;
+  volatile unsigned long x = 0;
+  for (;;) x++;
+  return 0;
+}
+
+/* creates a new spinning thread about every millisecond: a process whose thread list keeps changing */
+static int child_thread_spawner(void) {
+  for (int i = 0; i < 400; i++) {
+    HANDLE t = CreateThread(NULL, 0, spin_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    double end = qpc_ms() + 1.0;
+    while (qpc_ms() < end) {}
+  }
+  Sleep(60000);
+  return 0;
+}
+
+typedef LONG(NTAPI *PFN_NtProc)(HANDLE);
+typedef struct { ULONG Flags; BOOLEAN Freeze; BOOLEAN Swap; UCHAR Reserved0[2]; ULONG HighEdgeFilter; ULONG LowEdgeFilter; } MY_FREEZE_INFO;
+
+/* suspends every thread of pid that Toolhelp lists; returns how many were suspended */
+static int suspend_threads_of(DWORD pid, HANDLE *kept, int cap) {
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snap == INVALID_HANDLE_VALUE) return 0;
+  THREADENTRY32 te;
+  te.dwSize = sizeof te;
+  int n = 0;
+  if (Thread32First(snap, &te)) {
+    do {
+      if (te.th32OwnerProcessID != pid) continue;
+      HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+      if (!t) continue;
+      if (SuspendThread(t) != (DWORD)-1 && n < cap) kept[n++] = t; else CloseHandle(t);
+    } while (Thread32Next(snap, &te));
+  }
+  CloseHandle(snap);
+  return n;
+}
+
+static int thread_count_of(DWORD pid) {
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snap == INVALID_HANDLE_VALUE) return -1;
+  THREADENTRY32 te;
+  te.dwSize = sizeof te;
+  int n = 0;
+  if (Thread32First(snap, &te)) { do { if (te.th32OwnerProcessID == pid) n++; } while (Thread32Next(snap, &te)); }
+  CloseHandle(snap);
+  return n;
+}
+
+static void suspend_race(const char *name, int method) { /* 0 NtSuspendProcess, 1 one Toolhelp pass, 2 Toolhelp passes until the list is stable */
+  PFN_NtProc nts = (PFN_NtProc)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSuspendProcess");
+  const int trials = 8;
+  int leaked = 0;
+  double worst = 0, sum_threads_after = 0;
+  for (int i = 0; i < trials; i++) {
+    PROCESS_INFORMATION pi;
+    DWORD err;
+    if (!spawn_self(L"--child-thread-spawner", 0, NULL, &pi, &err)) { emit(name, "\"spawn_error\":%lu", (unsigned long)err); return; }
+    Sleep(60 + 10 * i);
+    HANDLE ths[1024];
+    int suspended = 0;
+    if (method == 0) nts(pi.hProcess);
+    else if (method == 1) suspended = suspend_threads_of(pi.dwProcessId, ths, 1024);
+    else {
+      int rounds = 0, got;
+      HANDLE tmp[1024];
+      do { got = suspend_threads_of(pi.dwProcessId, tmp, 1024); suspended += got; rounds++; } while (got > 0 && rounds < 6);
+      /* the second pass suspends the already suspended threads again (count 2); that only matters for the later resume */
+    }
+    (void)suspended;
+    Sleep(30);
+    double d = cpu_over(pi.hProcess, 200);
+    sum_threads_after += thread_count_of(pi.dwProcessId);
+    if (d > 30) leaked++;
+    if (d > worst) worst = d;
+    kill_close(&pi);
+  }
+  emit(name, "\"trials\":%d,\"trials_where_a_thread_kept_running\":%d,\"worst_cpu_ms_in_200ms_after_suspend\":%.0f,\"avg_threads_after\":%.0f", trials, leaked, worst, sum_threads_after / trials);
+}
+
+static void job_freeze_case(void) {
+  HANDLE job = CreateJobObjectW(NULL, NULL);
+  PROCESS_INFORMATION pi, pi2;
+  DWORD err;
+  if (!spawn_self(L"--child-spin", CREATE_SUSPENDED, NULL, &pi, &err)) { emit("job_freeze", "\"spawn_error\":%lu", (unsigned long)err); return; }
+  AssignProcessToJobObject(job, pi.hProcess);
+  ResumeThread(pi.hThread);
+  Sleep(200);
+  double running = job_cpu_over(job, 300);
+  MY_FREEZE_INFO fi;
+  memset(&fi, 0, sizeof fi);
+  fi.Flags = 1;
+  fi.Freeze = TRUE;
+  SetLastError(0);
+  BOOL ok = SetInformationJobObject(job, (JOBOBJECTINFOCLASS)18, &fi, sizeof fi);
+  DWORD e16 = ok ? 0 : GetLastError();
+  DWORD e8 = 0;
+  if (!ok) {
+    ok = SetInformationJobObject(job, (JOBOBJECTINFOCLASS)18, &fi, 8);
+    e8 = ok ? 0 : GetLastError();
+  }
+  if (!ok) {
+    emit("job_freeze", "\"set_ok\":false,\"error_with_16_byte_struct\":%lu,\"error_with_8_byte_struct\":%lu,\"cpu_ms_in_300ms_before\":%.0f", (unsigned long)e16, (unsigned long)e8, running);
+    TerminateJobObject(job, 1);
+    kill_close(&pi);
+    CloseHandle(job);
+    return;
+  }
+  Sleep(50);
+  double frozen = job_cpu_over(job, 300);
+  /* a process that joins a frozen job */
+  double joined_cpu = -1;
+  if (spawn_self(L"--child-spin", CREATE_SUSPENDED, NULL, &pi2, &err)) {
+    BOOL as = AssignProcessToJobObject(job, pi2.hProcess);
+    ResumeThread(pi2.hThread);
+    Sleep(100);
+    joined_cpu = as ? cpu_over(pi2.hProcess, 300) : -2;
+  }
+  fi.Freeze = FALSE;
+  BOOL th = SetInformationJobObject(job, (JOBOBJECTINFOCLASS)18, &fi, sizeof fi);
+  Sleep(50);
+  double thawed = job_cpu_over(job, 300);
+  fi.Freeze = TRUE;
+  SetInformationJobObject(job, (JOBOBJECTINFOCLASS)18, &fi, sizeof fi);
+  Sleep(50);
+  double t0 = abs_ms();
+  TerminateJobObject(job, 9);
+  int died = WaitForSingleObject(pi.hProcess, 5000) == WAIT_OBJECT_0;
+  double ms = abs_ms() - t0;
+  DWORD code = 0;
+  GetExitCodeProcess(pi.hProcess, &code);
+  emit("job_freeze",
+       "\"set_ok\":true,\"cpu_ms_in_300ms_running\":%.0f,\"cpu_ms_in_300ms_frozen\":%.0f,\"cpu_ms_in_300ms_of_a_process_added_to_the_frozen_job\":%.0f,\"unfreeze_ok\":%s,\"cpu_ms_in_300ms_after_unfreeze\":%.0f,"
+       "\"terminate_job_while_frozen_killed_it\":%s,\"ms_to_exit\":%.0f,\"exit_code\":%lu",
+       running, frozen, joined_cpu, bstr(th), thawed, bstr(died), ms, (unsigned long)code);
+  kill_close(&pi);
+  if (pi2.hProcess) kill_close(&pi2);
+  CloseHandle(job);
+}
+
+static void probe_suspend(void) {
+  HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+  PFN_NtProc nts = (PFN_NtProc)(void *)GetProcAddress(nt, "NtSuspendProcess");
+  PFN_NtProc ntr = (PFN_NtProc)(void *)GetProcAddress(nt, "NtResumeProcess");
+  PROCESS_INFORMATION pi;
+  DWORD err;
+  if (!nts || !ntr) { emit("nt_suspend_process", "\"error\":\"NtSuspendProcess/NtResumeProcess not found\""); }
+  else if (!spawn_self(L"--child-spin", 0, NULL, &pi, &err)) { emit("nt_suspend_process", "\"spawn_error\":%lu", (unsigned long)err); }
+  else {
+    Sleep(200);
+    double running = cpu_over(pi.hProcess, 300);
+    LONG s1 = nts(pi.hProcess);
+    Sleep(50);
+    double suspended = cpu_over(pi.hProcess, 300);
+    LONG s2 = nts(pi.hProcess);
+    LONG r1 = ntr(pi.hProcess);
+    Sleep(50);
+    double after_one_resume = cpu_over(pi.hProcess, 300);
+    LONG r2 = ntr(pi.hProcess);
+    Sleep(50);
+    double after_two_resumes = cpu_over(pi.hProcess, 300);
+    LONG r3 = ntr(pi.hProcess); /* resume without a matching suspend */
+    emit("nt_suspend_process",
+         "\"cpu_ms_in_300ms_running\":%.0f,\"cpu_ms_in_300ms_suspended\":%.0f,\"cpu_ms_in_300ms_after_2_suspends_1_resume\":%.0f,\"cpu_ms_in_300ms_after_2_suspends_2_resumes\":%.0f,"
+         "\"status_suspend\":\"0x%08lX\",\"status_second_suspend\":\"0x%08lX\",\"status_resume\":\"0x%08lX\",\"status_second_resume\":\"0x%08lX\",\"status_extra_resume\":\"0x%08lX\"",
+         running, suspended, after_one_resume, after_two_resumes, (unsigned long)s1, (unsigned long)s2, (unsigned long)r1, (unsigned long)r2, (unsigned long)r3);
+    nts(pi.hProcess);
+    Sleep(50);
+    double t0 = abs_ms();
+    TerminateProcess(pi.hProcess, 7);
+    int died = WaitForSingleObject(pi.hProcess, 5000) == WAIT_OBJECT_0;
+    double ms = abs_ms() - t0;
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    emit("terminate_a_suspended_process", "\"exited\":%s,\"ms\":%.0f,\"exit_code\":%lu", bstr(died), ms, (unsigned long)code);
+    kill_close(&pi);
+  }
+
+  /* a suspended-at-creation process: how many ResumeThread calls it takes */
+  if (spawn_self(L"--child-spin", CREATE_SUSPENDED, NULL, &pi, &err)) {
+    DWORD a = SuspendThread(pi.hThread); /* returns the previous count: 1 (CREATE_SUSPENDED) */
+    DWORD b = ResumeThread(pi.hThread);  /* previous count 2 */
+    DWORD c = ResumeThread(pi.hThread);  /* previous count 1 -> running */
+    Sleep(100);
+    double cpu = cpu_over(pi.hProcess, 200);
+    emit("create_suspended_then_extra_suspend", "\"suspend_returned_previous_count\":%lu,\"resume_returned_previous_count\":[%lu,%lu],\"cpu_ms_in_200ms_after\":%.0f",
+         (unsigned long)a, (unsigned long)b, (unsigned long)c, cpu);
+    kill_close(&pi);
+  }
+
+  suspend_race("suspend_race_NtSuspendProcess", 0);
+  suspend_race("suspend_race_one_Toolhelp_pass", 1);
+  suspend_race("suspend_race_Toolhelp_passes_until_stable", 2);
+  job_freeze_case();
+}
+
+/* ------------------------------------------------------------------ WM_CLOSE and taskkill */
+static int g_wnd_mode;
+static HANDLE g_wnd_log;
+static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (m == WM_CLOSE) {
+    log_to(g_wnd_log, "got WM_CLOSE\n");
+    if (g_wnd_mode == 0) DestroyWindow(h);
+    return 0;
+  }
+  if (m == WM_QUERYENDSESSION) { log_to(g_wnd_log, "got WM_QUERYENDSESSION\n"); return TRUE; }
+  if (m == WM_ENDSESSION) { log_to(g_wnd_log, "got WM_ENDSESSION\n"); return 0; }
+  if (m == WM_DESTROY) { PostQuitMessage(77); return 0; }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static int child_window(const wchar_t *mode, const wchar_t *logpath) {
+  g_wnd_log = open_log(logpath);
+  g_wnd_mode = wcscmp(mode, L"ignores") == 0;
+  WNDCLASSW wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = wnd_proc;
+  wc.hInstance = GetModuleHandleW(NULL);
+  wc.lpszClassName = L"ProcExploreWindow";
+  RegisterClassW(&wc);
+  HWND h = CreateWindowExW(0, wc.lpszClassName, L"probe", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, wc.hInstance, NULL);
+  if (!h) {
+    log_to(g_wnd_log, "window_error=%lu\nready\n", (unsigned long)GetLastError());
+    Sleep(60000);
+    return 3;
+  }
+  log_to(g_wnd_log, "ready window_created\n");
+  if (wcscmp(mode, L"hung") == 0) { Sleep(60000); return 0; } /* never pumps messages */
+  MSG msg;
+  while (GetMessageW(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+  return (int)msg.wParam;
+}
+
+typedef struct { DWORD pid; HWND found[8]; int n; } enum_t;
+static BOOL CALLBACK enum_cb(HWND h, LPARAM p) {
+  enum_t *e = (enum_t *)p;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(h, &pid);
+  if (pid == e->pid && e->n < 8) e->found[e->n++] = h;
+  return TRUE;
+}
+
+static int run_cmdline(const wchar_t *cmdline, DWORD ms, DWORD *code) {
+  wchar_t cmd[2048];
+  swprintf(cmd, sizeof cmd / sizeof cmd[0], L"%ls", cmdline);
+  STARTUPINFOW si;
+  PROCESS_INFORMATION pi;
+  memset(&si, 0, sizeof si);
+  si.cb = sizeof si;
+  if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) { *code = GetLastError(); return 0; }
+  int ok = WaitForSingleObject(pi.hProcess, ms) == WAIT_OBJECT_0;
+  GetExitCodeProcess(pi.hProcess, code);
+  if (!ok) TerminateProcess(pi.hProcess, 1);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  return ok;
+}
+
+static void wm_case(const char *name, const wchar_t *mode, int do_hung_timing) {
+  wchar_t log[MAX_PATH * 2], args[1024];
+  swprintf(log, MAX_PATH * 2, L"%ls\\wm-%ls.log", g_tmp, mode);
+  DeleteFileW(log);
+  swprintf(args, 1024, L"--child-window %ls \"%ls\"", mode, log);
+  PROCESS_INFORMATION pi;
+  DWORD err;
+  if (!spawn_self(args, 0, NULL, &pi, &err)) { emit(name, "\"spawn_error\":%lu", (unsigned long)err); return; }
+  int ready = wait_ready(log, pi.hProcess, 6000);
+  char b[512];
+  read_text(log, b, sizeof b);
+  enum_t e;
+  memset(&e, 0, sizeof e);
+  e.pid = pi.dwProcessId;
+  EnumWindows(enum_cb, (LPARAM)&e);
+  char wnd_err[48] = "";
+  char *we = strstr(b, "window_error=");
+  if (we) snprintf(wnd_err, sizeof wnd_err, "%.20s", we + 13), wnd_err[strcspn(wnd_err, "\r\n")] = 0;
+  if (do_hung_timing && e.n > 0) {
+    /* a thread that does not pump messages: SendMessageTimeout waits for its timeout until Windows calls the window hung (5 s) */
+    DWORD_PTR res;
+    int hung0 = IsHungAppWindow(e.found[0]);
+    double a = abs_ms();
+    LRESULT r0 = SendMessageTimeoutW(e.found[0], WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 1000, &res);
+    double t_first = abs_ms() - a;
+    DWORD e0 = r0 ? 0 : GetLastError();
+    Sleep(6000);
+    int hung1 = IsHungAppWindow(e.found[0]);
+    a = abs_ms();
+    LRESULT r1 = SendMessageTimeoutW(e.found[0], WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 1000, &res);
+    double t_second = abs_ms() - a;
+    DWORD e1 = r1 ? 0 : GetLastError();
+    emit(name, "\"windows_found\":%d,\"IsHungAppWindow_at_start\":%s,\"SendMessageTimeout_WM_NULL_returned\":%s,\"first_call_ms\":%.0f,\"first_error\":%lu,\"IsHungAppWindow_after_6s\":%s,\"second_call_returned\":%s,\"second_call_ms\":%.0f,\"second_error\":%lu",
+         e.n, bstr(hung0), bstr(r0 != 0), t_first, (unsigned long)e0, bstr(hung1), bstr(r1 != 0), t_second, (unsigned long)e1);
+    kill_close(&pi);
+    return;
+  }
+  double t0 = abs_ms();
+  if (e.n > 0) PostMessageW(e.found[0], WM_CLOSE, 0, 0);
+  int exited = WaitForSingleObject(pi.hProcess, 1500) == WAIT_OBJECT_0;
+  double ms = abs_ms() - t0;
+  DWORD code = 0;
+  GetExitCodeProcess(pi.hProcess, &code);
+  read_text(log, b, sizeof b);
+  for (char *c = b; *c; c++) if (*c == '\r' || *c == '\n') *c = ';';
+  emit(name, "\"ready\":%s,\"top_level_windows_of_the_process\":%d,\"window_create_error\":\"%s\",\"WM_CLOSE_posted\":%s,\"exited_within_1500ms\":%s,\"ms\":%.0f,\"exit_code\":%lu,\"child_log\":\"%.100s\"",
+       bstr(ready), e.n, wnd_err, bstr(e.n > 0), bstr(exited), ms, (unsigned long)code, b);
+  kill_close(&pi);
+}
+
+static void taskkill_case(const char *name, const wchar_t *child_args) {
+  PROCESS_INFORMATION pi;
+  DWORD err;
+  if (!spawn_self(child_args, 0, NULL, &pi, &err)) { emit(name, "\"spawn_error\":%lu", (unsigned long)err); return; }
+  Sleep(1000);
+  wchar_t out[MAX_PATH * 2], cmd[2048];
+  swprintf(out, MAX_PATH * 2, L"%ls\\taskkill.txt", g_tmp);
+  swprintf(cmd, 2048, L"cmd.exe /c taskkill /PID %lu > \"%ls\" 2>&1", (unsigned long)pi.dwProcessId, out);
+  DWORD code = 0;
+  double t0 = abs_ms();
+  int finished = run_cmdline(cmd, 15000, &code);
+  int exited = WaitForSingleObject(pi.hProcess, 1500) == WAIT_OBJECT_0;
+  double ms = abs_ms() - t0;
+  char b[512];
+  read_text(out, b, sizeof b);
+  for (char *c = b; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';
+  emit(name, "\"taskkill_finished\":%s,\"taskkill_exit_code\":%lu,\"child_exited\":%s,\"ms\":%.0f,\"taskkill_said\":\"%.160s\"", bstr(finished), (unsigned long)code, bstr(exited), ms, b);
+  kill_close(&pi);
+}
+
+static void probe_wmclose(void) {
+  HWINSTA ws = GetProcessWindowStation();
+  char wsn[64] = "?", dn[64] = "?";
+  DWORD n;
+  if (ws) GetUserObjectInformationA(ws, UOI_NAME, wsn, sizeof wsn, &n);
+  HDESK d = GetThreadDesktop(GetCurrentThreadId());
+  if (d) GetUserObjectInformationA(d, UOI_NAME, dn, sizeof dn, &n);
+  DWORD sid = 0;
+  ProcessIdToSessionId(GetCurrentProcessId(), &sid);
+  emit("desktop", "\"session_id\":%lu,\"window_station\":\"%s\",\"desktop\":\"%s\"", (unsigned long)sid, wsn, dn);
+  wm_case("window_child_closes_on_WM_CLOSE", L"closes", 0);
+  wm_case("window_child_ignores_WM_CLOSE", L"ignores", 0);
+  wm_case("window_child_that_never_pumps_messages", L"hung", 1);
+  taskkill_case("taskkill_without_F_on_a_console_child", L"--child-sleep 30000");
+  /* a window child for taskkill: reuse the closing mode */
+  {
+    wchar_t log[MAX_PATH * 2], args[1024];
+    swprintf(log, MAX_PATH * 2, L"%ls\\wm-tk.log", g_tmp);
+    DeleteFileW(log);
+    swprintf(args, 1024, L"--child-window closes \"%ls\"", log);
+    taskkill_case("taskkill_without_F_on_a_window_child", args);
+  }
+}
+
+/* ------------------------------------------------------------------ AppContainer */
+typedef HRESULT(WINAPI *PFN_CreateAppContainerProfile)(PCWSTR, PCWSTR, PCWSTR, PSID_AND_ATTRIBUTES, DWORD, PSID *);
+typedef HRESULT(WINAPI *PFN_DeriveAppContainerSid)(PCWSTR, PSID *);
+typedef HRESULT(WINAPI *PFN_DeleteAppContainerProfile)(PCWSTR);
+typedef struct { PSID AppContainerSid; PSID_AND_ATTRIBUTES Capabilities; DWORD CapabilityCount; DWORD Reserved; } MY_SECCAP;
+#define MY_ATTR_SECURITY_CAPABILITIES 0x00020009
+
+static int try_write(const wchar_t *dir, const wchar_t *name, DWORD *err) {
+  wchar_t p[MAX_PATH * 2];
+  swprintf(p, MAX_PATH * 2, L"%ls\\%ls", dir, name);
+  HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+  if (h == INVALID_HANDLE_VALUE) { *err = GetLastError(); return 0; }
+  CloseHandle(h);
+  *err = 0;
+  return 1;
+}
+
+static int child_ac(const wchar_t *logpath, DWORD supervisor_pid, int port) {
+  HANDLE log = open_log(logpath);
+  char o[3000];
+  size_t l = 0;
+#define ADD(...) l += (size_t)snprintf(o + l, sizeof o - l, __VA_ARGS__)
+  ADD("{");
+  HANDLE tok = NULL;
+  OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok);
+  DWORD isac = 0, n = 0;
+  if (tok) GetTokenInformation(tok, (TOKEN_INFORMATION_CLASS)29, &isac, sizeof isac, &n); /* TokenIsAppContainer */
+  ADD("\"token_is_app_container\":%lu", (unsigned long)isac);
+  if (tok) {
+    BYTE buf[256];
+    if (GetTokenInformation(tok, TokenIntegrityLevel, buf, sizeof buf, &n)) {
+      PSID s = ((TOKEN_MANDATORY_LABEL *)buf)->Label.Sid;
+      ADD(",\"integrity_rid\":\"0x%lX\"", (unsigned long)*GetSidSubAuthority(s, *GetSidSubAuthorityCount(s) - 1));
+    }
+    CloseHandle(tok);
+  }
+  BOOL injob = FALSE;
+  IsProcessInJob(GetCurrentProcess(), NULL, &injob);
+  ADD(",\"in_a_job\":%s", bstr(injob));
+
+  wchar_t scratch[MAX_PATH * 2];
+  wcscpy(scratch, logpath);
+  wchar_t *bs = wcsrchr(scratch, L'\\');
+  if (bs) *bs = 0;
+  DWORD e;
+  int ok = try_write(scratch, L"ac-write-test.tmp", &e);
+  ADD(",\"write_to_granted_scratch_dir\":\"%s\"", ok ? "ok" : "denied");
+  if (!ok) ADD(",\"scratch_error\":%lu", (unsigned long)e);
+  ok = try_write(L"C:\\Users\\Public", L"ac-write-test.tmp", &e);
+  ADD(",\"write_to_C_Users_Public\":\"%s\",\"public_error\":%lu", ok ? "ok" : "denied", (unsigned long)e);
+  ok = try_write(L"C:\\Windows\\Temp", L"ac-write-test.tmp", &e);
+  ADD(",\"write_to_C_Windows_Temp\":\"%s\",\"windows_temp_error\":%lu", ok ? "ok" : "denied", (unsigned long)e);
+  wchar_t tmp[MAX_PATH * 2];
+  GetTempPathW(MAX_PATH * 2, tmp);
+  size_t tl = wcslen(tmp);
+  if (tl > 0 && tmp[tl - 1] == L'\\') tmp[tl - 1] = 0;
+  ok = try_write(tmp, L"ac-write-test.tmp", &e);
+  ADD(",\"write_to_own_GetTempPath\":\"%s\",\"temp_error\":%lu", ok ? "ok" : "denied", (unsigned long)e);
+
+  /* the supervisor */
+  HANDLE sp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, supervisor_pid);
+  ADD(",\"open_supervisor_query_limited\":\"%s\",\"error1\":%lu", sp ? "ok" : "denied", (unsigned long)(sp ? 0 : GetLastError()));
+  if (sp) CloseHandle(sp);
+  sp = OpenProcess(SYNCHRONIZE, FALSE, supervisor_pid);
+  ADD(",\"open_supervisor_synchronize\":\"%s\",\"error2\":%lu", sp ? "ok" : "denied", (unsigned long)(sp ? 0 : GetLastError()));
+  if (sp) CloseHandle(sp);
+  sp = OpenProcess(PROCESS_TERMINATE, FALSE, supervisor_pid);
+  ADD(",\"open_supervisor_terminate\":\"%s\",\"error3\":%lu", sp ? "ok" : "denied", (unsigned long)(sp ? 0 : GetLastError()));
+  if (sp) CloseHandle(sp);
+
+  /* network */
+  WSADATA wd;
+  WSAStartup(MAKEWORD(2, 2), &wd);
+  SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons((u_short)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int rc = connect(s, (struct sockaddr *)&a, sizeof a);
+  ADD(",\"connect_to_supervisors_loopback_listener\":\"%s\",\"wsa_error\":%d", rc == 0 ? "ok" : "refused", rc == 0 ? 0 : WSAGetLastError());
+  closesocket(s);
+
+  /* a grandchild */
+  PROCESS_INFORMATION gp;
+  DWORD ge;
+  int gok = spawn_self(L"--child-sleep 300", 0, NULL, &gp, &ge);
+  BOOL gjob = FALSE;
+  if (gok) { IsProcessInJob(gp.hProcess, NULL, &gjob); WaitForSingleObject(gp.hProcess, 3000); CloseHandle(gp.hProcess); CloseHandle(gp.hThread); }
+  ADD(",\"create_grandchild\":\"%s\",\"grandchild_error\":%lu,\"grandchild_in_a_job\":%s", gok ? "ok" : "failed", (unsigned long)(gok ? 0 : ge), bstr(gjob));
+
+  /* its own job */
+  HANDLE job = CreateJobObjectW(NULL, NULL);
+  BOOL as = job ? AssignProcessToJobObject(job, GetCurrentProcess()) : FALSE;
+  ADD(",\"create_job_object\":%s,\"assign_self_to_a_nested_job\":%s,\"assign_error\":%lu}", bstr(job != NULL), bstr(as), (unsigned long)(as ? 0 : GetLastError()));
+#undef ADD
+  log_to(log, "ready\n%s\n", o);
+  return 0;
+}
+
+static void probe_appcontainer(void) {
+  HMODULE ue = LoadLibraryW(L"userenv.dll");
+  PFN_CreateAppContainerProfile create = ue ? (PFN_CreateAppContainerProfile)(void *)GetProcAddress(ue, "CreateAppContainerProfile") : NULL;
+  PFN_DeriveAppContainerSid derive = ue ? (PFN_DeriveAppContainerSid)(void *)GetProcAddress(ue, "DeriveAppContainerSidFromAppContainerName") : NULL;
+  PFN_DeleteAppContainerProfile del = ue ? (PFN_DeleteAppContainerProfile)(void *)GetProcAddress(ue, "DeleteAppContainerProfile") : NULL;
+  if (!create || !derive) { emit("app_container_profile", "\"error\":\"userenv.dll functions not found\""); return; }
+  PSID sid = NULL;
+  HRESULT hr = create(L"proc.explore.probe", L"proc explore", L"probe", NULL, 0, &sid);
+  if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) hr = derive(L"proc.explore.probe", &sid);
+  if (FAILED(hr) || !sid) { emit("app_container_profile", "\"error\":\"CreateAppContainerProfile failed\",\"hresult\":\"0x%08lX\"", (unsigned long)hr); return; }
+  LPWSTR sidstr = NULL;
+  ConvertSidToStringSidW(sid, &sidstr);
+  emit("app_container_profile", "\"created\":true,\"sid\":\"%ls\"", sidstr ? sidstr : L"?");
+
+  /* the container may read the program and write the scratch directory only if their ACLs say so */
+  wchar_t exedir[MAX_PATH * 2], cmd[2048];
+  wcscpy(exedir, g_self);
+  wchar_t *bs = wcsrchr(exedir, L'\\');
+  if (bs) *bs = 0;
+  DWORD code = 0;
+  swprintf(cmd, 2048, L"icacls.exe \"%ls\" /grant *%ls:(OI)(CI)(RX)", exedir, sidstr);
+  run_cmdline(cmd, 20000, &code);
+  DWORD code2 = 0;
+  swprintf(cmd, 2048, L"icacls.exe \"%ls\" /grant *%ls:(OI)(CI)(F)", g_tmp, sidstr);
+  run_cmdline(cmd, 20000, &code2);
+  emit("app_container_acl", "\"icacls_exe_dir_exit\":%lu,\"icacls_scratch_dir_exit\":%lu", (unsigned long)code, (unsigned long)code2);
+
+  /* listener on loopback: can the container connect to it */
+  WSADATA wd;
+  WSAStartup(MAKEWORD(2, 2), &wd);
+  SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bind(ls, (struct sockaddr *)&a, sizeof a);
+  listen(ls, 4);
+  int alen = sizeof a;
+  getsockname(ls, (struct sockaddr *)&a, &alen);
+  int port = ntohs(a.sin_port);
+
+  wchar_t log[MAX_PATH * 2], args[1024], full[4096];
+  swprintf(log, MAX_PATH * 2, L"%ls\\ac.log", g_tmp);
+  DeleteFileW(log);
+  swprintf(args, 1024, L"--child-ac \"%ls\" %lu %d", log, (unsigned long)GetCurrentProcessId(), port);
+  swprintf(full, 4096, L"\"%ls\" %ls", g_self, args);
+
+  SIZE_T asz = 0;
+  InitializeProcThreadAttributeList(NULL, 1, 0, &asz);
+  LPPROC_THREAD_ATTRIBUTE_LIST al = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, asz);
+  InitializeProcThreadAttributeList(al, 1, 0, &asz);
+  MY_SECCAP sc;
+  memset(&sc, 0, sizeof sc);
+  sc.AppContainerSid = sid;
+  UpdateProcThreadAttribute(al, 0, MY_ATTR_SECURITY_CAPABILITIES, &sc, sizeof sc, NULL, NULL);
+  STARTUPINFOEXW si;
+  memset(&si, 0, sizeof si);
+  si.StartupInfo.cb = sizeof si;
+  si.lpAttributeList = al;
+  PROCESS_INFORMATION pi;
+  memset(&pi, 0, sizeof pi);
+  HANDLE job = CreateJobObjectW(NULL, NULL);
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION xl;
+  memset(&xl, 0, sizeof xl);
+  xl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  SetInformationJobObject(job, JobObjectExtendedLimitInformation, &xl, sizeof xl);
+  BOOL ok = CreateProcessW(NULL, full, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, g_tmp, &si.StartupInfo, &pi);
+  DWORD err = ok ? 0 : GetLastError();
+  if (!ok) {
+    emit("app_container_child", "\"spawned\":false,\"error\":%lu", (unsigned long)err);
+  } else {
+    BOOL as = AssignProcessToJobObject(job, pi.hProcess);
+    DWORD as_err = as ? 0 : GetLastError();
+    ResumeThread(pi.hThread);
+    int ready = wait_ready(log, pi.hProcess, 10000);
+    int exited = WaitForSingleObject(pi.hProcess, 10000) == WAIT_OBJECT_0;
+    DWORD ec = 0;
+    GetExitCodeProcess(pi.hProcess, &ec);
+    char b[4096];
+    read_text(log, b, sizeof b);
+    char *json = strchr(b, '{');
+    if (json) { char *nl = strpbrk(json, "\r\n"); if (nl) *nl = 0; }
+    emit("app_container_child", "\"spawned\":true,\"assigned_to_job\":%s,\"assign_error\":%lu,\"reported\":%s,\"exited\":%s,\"exit_code\":%lu,\"child_says\":%s",
+         bstr(as), (unsigned long)as_err, bstr(ready), bstr(exited), (unsigned long)ec, json ? json : "null");
+    /* the job still controls it */
+    kill_close(&pi);
+  }
+  CloseHandle(job);
+  closesocket(ls);
+  DeleteProcThreadAttributeList(al);
+  if (del) del(L"proc.explore.probe");
+  LocalFree(sidstr);
+}
+
+/* ------------------------------------------------------------------ x64 and x86 children on arm64 */
+static BOOL spawn_exe(const wchar_t *exe, const wchar_t *args, DWORD flags, PROCESS_INFORMATION *pi, DWORD *err) {
+  wchar_t cmd[4096];
+  swprintf(cmd, sizeof cmd / sizeof cmd[0], L"\"%ls\" %ls", exe, args);
+  STARTUPINFOW si;
+  memset(&si, 0, sizeof si);
+  si.cb = sizeof si;
+  memset(pi, 0, sizeof *pi);
+  BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, FALSE, flags, NULL, NULL, &si, pi);
+  *err = ok ? 0 : GetLastError();
+  return ok;
+}
+
+static int child_arch(const wchar_t *logpath) {
+  HANDLE log = open_log(logpath);
+  typedef BOOL(WINAPI * PFN_IsWow64Process2)(HANDLE, USHORT *, USHORT *);
+  PFN_IsWow64Process2 f = (PFN_IsWow64Process2)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2");
+  USHORT pm = 0, nm = 0;
+  if (f) f(GetCurrentProcess(), &pm, &nm);
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  wchar_t env[32] = L"";
+  GetEnvironmentVariableW(L"PROCESSOR_ARCHITECTURE", env, 32);
+  log_to(log, "ready {\"process_machine\":\"0x%04X\",\"native_machine\":\"0x%04X\",\"pointer_bits\":%d,\"GetSystemInfo_architecture\":%u,\"PROCESSOR_ARCHITECTURE\":\"%ls\"}\n",
+         pm, nm, (int)sizeof(void *) * 8, si.wProcessorArchitecture, env);
+  return 0;
+}
+
+static int child_alloc(int mb) {
+  char *p = (char *)VirtualAlloc(NULL, (SIZE_T)mb << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!p) return (int)(0x10000u | GetLastError());
+  for (SIZE_T i = 0; i < ((SIZE_T)mb << 20); i += 4096) p[i] = 1;
+  return 0;
+}
+
+static void emulation_one(const char *label, const wchar_t *exe) {
+  wchar_t log[MAX_PATH * 2], args[1024];
+  swprintf(log, MAX_PATH * 2, L"%ls\\arch-%hs.log", g_tmp, label);
+  DeleteFileW(log);
+  swprintf(args, 1024, L"--child-arch \"%ls\"", log);
+  PROCESS_INFORMATION pi;
+  DWORD err;
+  char name[96];
+  snprintf(name, sizeof name, "%s_architecture", label);
+  if (!spawn_exe(exe, args, 0, &pi, &err)) { emit(name, "\"spawn_error\":%lu", (unsigned long)err); return; }
+  wait_ready(log, pi.hProcess, 10000);
+  WaitForSingleObject(pi.hProcess, 5000);
+  char b[512];
+  read_text(log, b, sizeof b);
+  char *json = strchr(b, '{');
+  if (json) { char *nl = strpbrk(json, "\r\n"); if (nl) *nl = 0; }
+  emit(name, "\"child_says\":%s", json ? json : "null");
+  kill_close(&pi);
+
+  /* job accounting and process-time limit with this child */
+  HANDLE job = CreateJobObjectW(NULL, NULL);
+  if (!spawn_exe(exe, L"--child-spin", CREATE_SUSPENDED, &pi, &err)) { emit(name, "\"spawn_error_spin\":%lu", (unsigned long)err); return; }
+  AssignProcessToJobObject(job, pi.hProcess);
+  ResumeThread(pi.hThread);
+  Sleep(500);
+  double job_cpu = job_cpu_ms(job);
+  double proc_cpu = proc_cpu_ms(pi.hProcess);
+  snprintf(name, sizeof name, "%s_job_accounting", label);
+  emit(name, "\"cpu_ms_in_500ms_wall_by_job\":%.0f,\"by_process\":%.0f", job_cpu, proc_cpu);
+  TerminateJobObject(job, 1);
+  kill_close(&pi);
+  CloseHandle(job);
+
+  job = CreateJobObjectW(NULL, NULL);
+  JOBOBJECT_BASIC_LIMIT_INFORMATION bl;
+  memset(&bl, 0, sizeof bl);
+  bl.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_TIME;
+  bl.PerProcessUserTimeLimit.QuadPart = 100 * 10000LL;
+  SetInformationJobObject(job, JobObjectBasicLimitInformation, &bl, sizeof bl);
+  if (spawn_exe(exe, L"--child-spin", CREATE_SUSPENDED, &pi, &err)) {
+    AssignProcessToJobObject(job, pi.hProcess);
+    double t0 = abs_ms();
+    ResumeThread(pi.hThread);
+    int died = WaitForSingleObject(pi.hProcess, 20000) == WAIT_OBJECT_0;
+    double ms = abs_ms() - t0;
+    DWORD ec = 0;
+    GetExitCodeProcess(pi.hProcess, &ec);
+    snprintf(name, sizeof name, "%s_process_time_limit_100ms", label);
+    emit(name, "\"killed\":%s,\"ms_until_killed\":%.0f,\"exit_code\":\"0x%08lX\"", bstr(died), ms, (unsigned long)ec);
+    kill_close(&pi);
+  }
+  CloseHandle(job);
+
+  /* per-process memory limit: 200 MiB; allocate 80 MiB (should fit) and 300 MiB (should not) */
+  int mbs[2] = {80, 300};
+  for (int i = 0; i < 2; i++) {
+    job = CreateJobObjectW(NULL, NULL);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION xl;
+    memset(&xl, 0, sizeof xl);
+    xl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+    xl.ProcessMemoryLimit = (SIZE_T)200 << 20;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &xl, sizeof xl);
+    wchar_t aa[64];
+    swprintf(aa, 64, L"--child-alloc %d", mbs[i]);
+    if (spawn_exe(exe, aa, CREATE_SUSPENDED, &pi, &err)) {
+      AssignProcessToJobObject(job, pi.hProcess);
+      ResumeThread(pi.hThread);
+      int done = WaitForSingleObject(pi.hProcess, 20000) == WAIT_OBJECT_0;
+      DWORD ec = 0;
+      GetExitCodeProcess(pi.hProcess, &ec);
+      snprintf(name, sizeof name, "%s_process_memory_limit_200MiB_alloc_%dMiB", label, mbs[i]);
+      emit(name, "\"finished\":%s,\"exit_code\":\"0x%08lX\"", bstr(done), (unsigned long)ec);
+      kill_close(&pi);
+    } else {
+      snprintf(name, sizeof name, "%s_process_memory_limit_200MiB_alloc_%dMiB", label, mbs[i]);
+      emit(name, "\"spawn_error\":%lu", (unsigned long)err);
+    }
+    CloseHandle(job);
+  }
+}
+
+static void probe_emulation(void) {
+  wchar_t x64[MAX_PATH * 2] = L"", x86[MAX_PATH * 2] = L"";
+  GetEnvironmentVariableW(L"PROC_EXPLORE_X64", x64, MAX_PATH * 2);
+  GetEnvironmentVariableW(L"PROC_EXPLORE_X86", x86, MAX_PATH * 2);
+  USHORT pm = 0, nm = 0;
+  typedef BOOL(WINAPI * PFN_IsWow64Process2)(HANDLE, USHORT *, USHORT *);
+  PFN_IsWow64Process2 f = (PFN_IsWow64Process2)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2");
+  if (f) f(GetCurrentProcess(), &pm, &nm);
+  emit("emulation_environment", "\"this_process_machine\":\"0x%04X\",\"native_machine\":\"0x%04X\",\"x64_build_given\":%s,\"x86_build_given\":%s", pm, nm, bstr(x64[0]), bstr(x86[0]));
+  emulation_one("native", g_self);
+  if (x64[0]) emulation_one("x64", x64);
+  if (x86[0]) emulation_one("x86", x86);
+}
+
+/* ------------------------------------------------------------------ scale */
+static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
+
+static void latency_series(const char *name, int with_job, const wchar_t *exe, int n) {
+  double *call = (double *)calloc((size_t)n, sizeof(double)), *total = (double *)calloc((size_t)n, sizeof(double));
+  int ok = 0;
+  HANDLE job = NULL;
+  if (with_job) job = CreateJobObjectW(NULL, NULL);
+  for (int i = 0; i < n; i++) {
+    PROCESS_INFORMATION pi;
+    DWORD err;
+    double t0 = abs_ms();
+    if (!spawn_exe(exe, L"--child-sleep 0", with_job ? CREATE_SUSPENDED : 0, &pi, &err)) continue;
+    if (with_job) { AssignProcessToJobObject(job, pi.hProcess); ResumeThread(pi.hThread); }
+    double c = abs_ms() - t0;
+    WaitForSingleObject(pi.hProcess, 10000);
+    double t = abs_ms() - t0;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    call[ok] = c;
+    total[ok] = t;
+    ok++;
+  }
+  if (job) CloseHandle(job);
+  if (ok > 0) {
+    qsort(call, (size_t)ok, sizeof(double), cmp_d);
+    qsort(total, (size_t)ok, sizeof(double), cmp_d);
+    emit(name, "\"n\":%d,\"create_ms\":{\"min\":%.1f,\"median\":%.1f,\"p90\":%.1f,\"max\":%.1f},\"until_exit_ms\":{\"min\":%.1f,\"median\":%.1f,\"p90\":%.1f,\"max\":%.1f}",
+         ok, call[0], call[ok / 2], call[(ok * 9) / 10 >= ok ? ok - 1 : (ok * 9) / 10], call[ok - 1], total[0], total[ok / 2], total[(ok * 9) / 10 >= ok ? ok - 1 : (ok * 9) / 10], total[ok - 1]);
+  } else {
+    emit(name, "\"n\":0");
+  }
+  free(call);
+  free(total);
+}
+
+static void probe_scale(void) {
+  /* a copy of the program that has never run: the first start of a new file (Defender / SmartScreen-style assessment) */
+  wchar_t fresh[MAX_PATH * 2];
+  swprintf(fresh, MAX_PATH * 2, L"%ls\\fresh-copy.exe", g_tmp);
+  if (CopyFileW(g_self, fresh, FALSE)) {
+    double t[3];
+    for (int i = 0; i < 3; i++) {
+      PROCESS_INFORMATION pi;
+      DWORD err;
+      double t0 = abs_ms();
+      if (spawn_exe(fresh, L"--child-sleep 0", 0, &pi, &err)) { WaitForSingleObject(pi.hProcess, 20000); t[i] = abs_ms() - t0; CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
+      else t[i] = -1;
+    }
+    emit("first_start_of_a_new_executable", "\"first_ms\":%.1f,\"second_ms\":%.1f,\"third_ms\":%.1f", t[0], t[1], t[2]);
+  }
+  latency_series("spawn_latency_plain", 0, g_self, 100);
+  latency_series("spawn_latency_suspended_assigned_to_job_resumed", 1, g_self, 100);
+  size_t big = (size_t)512 << 20;
+  char *mem = (char *)VirtualAlloc(NULL, big, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (mem) {
+    for (size_t i = 0; i < big; i += 4096) mem[i] = 1;
+    latency_series("spawn_latency_plain_512MiB_parent", 0, g_self, 50);
+    VirtualFree(mem, 0, MEM_RELEASE);
+  }
+
+  /* many children alive at once */
+  HANDLE job = CreateJobObjectW(NULL, NULL);
+  const int cap = 400;
+  HANDLE *hs = (HANDLE *)calloc((size_t)cap, sizeof(HANDLE));
+  int n = 0;
+  DWORD err = 0;
+  double first = 0, mid = 0, t_all = abs_ms();
+  for (; n < cap; n++) {
+    PROCESS_INFORMATION pi;
+    double t0 = abs_ms();
+    if (!spawn_self(L"--child-sleep 60000", CREATE_SUSPENDED, NULL, &pi, &err)) break;
+    AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    double dt = abs_ms() - t0;
+    if (n < 50) first += dt;
+    if (n >= 200 && n < 250) mid += dt;
+    hs[n] = pi.hProcess;
+    CloseHandle(pi.hThread);
+  }
+  double spawn_phase = abs_ms() - t_all;
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION ba;
+  QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &ba, sizeof ba, NULL);
+  double tk = abs_ms();
+  TerminateJobObject(job, 1);
+  int gone = 0;
+  for (int i = 0; i < n; i++) if (WaitForSingleObject(hs[i], 20000) == WAIT_OBJECT_0) gone++;
+  double kill_ms = abs_ms() - tk;
+  for (int i = 0; i < n; i++) CloseHandle(hs[i]);
+  free(hs);
+  CloseHandle(job);
+  emit("concurrent_children", "\"created\":%d,\"stopped_by\":\"%s\",\"error\":%lu,\"active_processes_in_job\":%lu,\"first_50_total_ms\":%.1f,\"processes_200_to_250_total_ms\":%.1f,\"spawn_phase_ms\":%.0f,\"terminate_job_until_all_exited_ms\":%.0f,\"exited\":%d",
+       n, n >= cap ? "limit_of_this_probe" : "error", (unsigned long)err, (unsigned long)ba.ActiveProcesses, first, mid, spawn_phase, kill_ms, gone);
+}
+
 /* ------------------------------------------------------------------ header and main */
 static DWORD WINAPI watchdog_thread(LPVOID p) {
   (void)p;
@@ -1504,9 +2308,11 @@ static void header(void) {
   }
   BOOL in_job = FALSE;
   IsProcessInJob(GetCurrentProcess(), NULL, &in_job);
-  emit("_platform", "\"windows\":\"%lu.%lu.%lu\",\"elevated\":%s,\"in_job\":%s,\"console_window\":%s,\"has_console\":%s",
+  DWORD session = 0;
+  ProcessIdToSessionId(GetCurrentProcessId(), &session);
+  emit("_platform", "\"windows\":\"%lu.%lu.%lu\",\"elevated\":%s,\"in_job\":%s,\"console_window\":%s,\"has_console\":%s,\"session_id\":%lu",
        (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion, (unsigned long)v.dwBuildNumber, bstr(elevated), bstr(in_job),
-       bstr(GetConsoleWindow() != NULL), bstr(parent_has_console()));
+       bstr(GetConsoleWindow() != NULL), bstr(parent_has_console()), (unsigned long)session);
 }
 
 int main(void) {
@@ -1525,6 +2331,11 @@ int main(void) {
   if (argc >= 3 && wcscmp(argv[1], L"--child-spawn-try") == 0) return child_spawn_try(argv[2]);
   if (argc >= 5 && wcscmp(argv[1], L"--sender") == 0) return child_sender(argv[2], (DWORD)_wtoi(argv[3]), argv[4]);
   if (argc >= 4 && wcscmp(argv[1], L"--child-debugger") == 0) return child_debugger(argv[2], _wtoi(argv[3]));
+  if (argc >= 2 && wcscmp(argv[1], L"--child-thread-spawner") == 0) return child_thread_spawner();
+  if (argc >= 4 && wcscmp(argv[1], L"--child-window") == 0) return child_window(argv[2], argv[3]);
+  if (argc >= 5 && wcscmp(argv[1], L"--child-ac") == 0) return child_ac(argv[2], (DWORD)_wtoi(argv[3]), _wtoi(argv[4]));
+  if (argc >= 3 && wcscmp(argv[1], L"--child-arch") == 0) return child_arch(argv[2]);
+  if (argc >= 3 && wcscmp(argv[1], L"--child-alloc") == 0) return child_alloc(_wtoi(argv[2]));
 
   CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
   const wchar_t *which = argc >= 2 ? argv[1] : L"all";
@@ -1542,5 +2353,10 @@ int main(void) {
   if (all || wcscmp(which, L"iorate") == 0) probe_iorate();
   if (all || wcscmp(which, L"pipes") == 0) probe_pipes();
   if (all || wcscmp(which, L"pidreuse") == 0) probe_pidreuse();
+  if (all || wcscmp(which, L"suspend") == 0) probe_suspend();
+  if (all || wcscmp(which, L"wmclose") == 0) probe_wmclose();
+  if (all || wcscmp(which, L"appcontainer") == 0) probe_appcontainer();
+  if (wcscmp(which, L"emulation") == 0) probe_emulation();
+  if (all || wcscmp(which, L"scale") == 0) probe_scale();
   return 0;
 }
