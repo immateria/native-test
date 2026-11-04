@@ -6,7 +6,8 @@
  * timing with and without a debugger, the debugger as a "die with my parent" mechanism, and silo creation.
  *
  * Build (from a VS developer prompt):  cl /nologo /O1 /Fe:proc_explore.exe proc_explore.c user32.lib advapi32.lib
- * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|all]
+ * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|period|all]
+ *       (each group runs well inside the 300 s watchdog; "all" may not, so CI runs groups one by one)
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
@@ -23,6 +24,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
+#endif
 
 #ifndef PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
 #define PROC_THREAD_ATTRIBUTE_PARENT_PROCESS 0x00020000
@@ -857,6 +864,83 @@ static void probe_silo(void) {
   CloseHandle(job);
 }
 
+/* ------------------------------------------------------------------ job CPU-time enforcement period */
+/* On windows-2025, job and notification limits were enforced by a system-wide pass every 7.000 s
+ * (explore/FINDINGS.md). This repeats that measurement without Crystal so other Windows builds and
+ * arm64 can be compared, and adds the per-process limit, which job_explore measured only indirectly. */
+static int start_limited_spinner(int per_process, HANDLE *job, PROCESS_INFORMATION *pi, DWORD *err) {
+  *job = CreateJobObjectW(NULL, NULL);
+  JOBOBJECT_BASIC_LIMIT_INFORMATION bl;
+  memset(&bl, 0, sizeof bl);
+  if (per_process) { bl.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_TIME; bl.PerProcessUserTimeLimit.QuadPart = 100 * 10000LL; }
+  else { bl.LimitFlags = JOB_OBJECT_LIMIT_JOB_TIME; bl.PerJobUserTimeLimit.QuadPart = 100 * 10000LL; }
+  if (!SetInformationJobObject(*job, JobObjectBasicLimitInformation, &bl, sizeof bl)) { *err = GetLastError(); return 0; }
+  if (!spawn_self(L"--child-spin", CREATE_SUSPENDED, NULL, pi, err)) return 0;
+  if (!AssignProcessToJobObject(*job, pi->hProcess)) { *err = GetLastError(); kill_close(pi); return 0; }
+  ResumeThread(pi->hThread);
+  return 1;
+}
+
+static void probe_period(void) {
+  SYSTEM_INFO si;
+  GetNativeSystemInfo(&si);
+  DWORD adj = 0, inc = 0;
+  BOOL dis = FALSE;
+  GetSystemTimeAdjustment(&adj, &inc, &dis);
+  emit("period_environment", "\"logical_processors\":%lu,\"clock_increment_100ns\":%lu", (unsigned long)si.dwNumberOfProcessors, (unsigned long)inc);
+  double t_prog = abs_ms();
+  for (int kind = 0; kind < 2; kind++) {
+    const char *kname = kind ? "per_process_user_time_100ms" : "per_job_user_time_100ms";
+    double prev_end = -1;
+    char gaps[256] = "";
+    size_t gl = 0;
+    for (int trial = 0; trial < 6; trial++) {
+      HANDLE job;
+      PROCESS_INFORMATION pi;
+      DWORD err = 0;
+      if (!start_limited_spinner(kind, &job, &pi, &err)) { emit("period_sequential", "\"limit\":\"%s\",\"trial\":%d,\"error\":%lu", kname, trial, (unsigned long)err); CloseHandle(job); continue; }
+      double t_start = abs_ms();
+      int exited = WaitForSingleObject(pi.hProcess, 25000) == WAIT_OBJECT_0;
+      double t_end = abs_ms();
+      DWORD code = 0;
+      GetExitCodeProcess(pi.hProcess, &code);
+      FILETIME c, x, k, u;
+      GetProcessTimes(pi.hProcess, &c, &x, &k, &u);
+      ULARGE_INTEGER uu;
+      uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+      emit("period_sequential", "\"limit\":\"%s\",\"trial\":%d,\"started_at_ms\":%.1f,\"ended_at_ms\":%.1f,\"lived_ms\":%.1f,\"killed\":%s,\"exit_code\":\"0x%08lX\",\"user_ms\":%.1f",
+           kname, trial, t_start - t_prog, t_end - t_prog, t_end - t_start, bstr(exited), (unsigned long)code, (double)uu.QuadPart / 10000.0);
+      if (exited && prev_end >= 0) gl += (size_t)snprintf(gaps + gl, sizeof gaps - gl, "%s%.1f", gl ? "," : "", t_end - prev_end);
+      prev_end = exited ? t_end : -1;
+      kill_close(&pi);
+      CloseHandle(job);
+    }
+    emit("period_sequential_summary", "\"limit\":\"%s\",\"ms_between_successive_kills\":\"%s\"", kname, gaps);
+  }
+  /* two jobs 2.5 s apart (one job limit, one per-process limit): one pass kills both at once, a per-job timer would not */
+  HANDLE ja, jb;
+  PROCESS_INFORMATION pa, pb;
+  DWORD ea = 0, eb = 0;
+  int oka = start_limited_spinner(0, &ja, &pa, &ea);
+  double ta = abs_ms();
+  Sleep(2500);
+  int okb = start_limited_spinner(1, &jb, &pb, &eb);
+  double tb = abs_ms();
+  double enda = -1, endb = -1;
+  while (abs_ms() - ta < 25000 && ((oka && enda < 0) || (okb && endb < 0))) {
+    if (oka && enda < 0 && WaitForSingleObject(pa.hProcess, 0) == WAIT_OBJECT_0) enda = abs_ms();
+    if (okb && endb < 0 && WaitForSingleObject(pb.hProcess, 0) == WAIT_OBJECT_0) endb = abs_ms();
+    Sleep(2);
+  }
+  emit("period_concurrent_job_limit_and_process_limit",
+       "\"a_job_limit_started_ms\":%.1f,\"b_process_limit_started_ms\":%.1f,\"a_ended_ms\":%.1f,\"b_ended_ms\":%.1f,\"ends_ms_apart\":%.1f,\"setup_errors\":\"%lu/%lu\"",
+       0.0, tb - ta, enda >= 0 ? enda - ta : -1.0, endb >= 0 ? endb - ta : -1.0, (enda >= 0 && endb >= 0) ? endb - enda : -1.0, (unsigned long)ea, (unsigned long)eb);
+  if (oka) kill_close(&pa);
+  if (okb) kill_close(&pb);
+  CloseHandle(ja);
+  CloseHandle(jb);
+}
+
 /* ------------------------------------------------------------------ header and main */
 static DWORD WINAPI watchdog_thread(LPVOID p) {
   (void)p;
@@ -912,5 +996,6 @@ int main(void) {
   if (all || wcscmp(which, L"mitigation") == 0) probe_mitigation();
   if (all || wcscmp(which, L"debug") == 0) probe_debug();
   if (all || wcscmp(which, L"silo") == 0) probe_silo();
+  if (all || wcscmp(which, L"period") == 0) probe_period();
   return 0;
 }

@@ -10,7 +10,9 @@ on:
   push:
     paths:
       - "probes/**"
-      - "explore/**"
+      # only the exploration programs this workflow runs; the rest are in explore-matrix.yml
+      - "explore/windows/job_explore.cr"
+      - "explore/macos/**"
       - ".github/workflows/native-probes.yml"
       - ".github/actions/**"
 
