@@ -4,7 +4,8 @@ Measured on GitHub-hosted runners. The kit and `job_explore` ran on **Windows Se
 Crystal 1.21.1 MSVC) and **macOS 15 arm64** (`macos-15`, Crystal 1.21.1 universal) (`native-probes.yml`). The C
 exploration probes and `crystal_spawn` ran on Windows Server 2025 and 2022 x64 and Windows 11 arm64, macOS 14/15/26
 arm64 and 15/26 Intel, and Ubuntu 22.04/24.04 x64 and 24.04 arm64 (`explore-matrix.yml`). Every number below comes
-from a CI run on branch `native-probes-ci`; run ids are given so the artifacts can be re-read. "Verified" means
+from a CI run on branch `native-probes-ci`; run ids are given so the artifacts can be re-read. The Linux-only probes and
+the kit's Linux shards ran on Ubuntu 22.04/24.04 x64 and 24.04 arm64 in a delegated cgroup. "Verified" means
 observed directly; "inferred" means it fits the data but was not isolated.
 
 Final state: kit r13 qualifies on **macOS** (386 Crystal + 45 C/SDK cases), on **Windows as the runner provides it
@@ -403,6 +404,83 @@ runners).
   `POSIX_SPAWN_SETSIGMASK`/`SETSIGDEF`, `SETPGROUP` and `SETSID` do what they say on both. macOS also has
   `POSIX_SPAWN_CLOEXEC_DEFAULT` (only file-action descriptors survive) and `POSIX_SPAWN_START_SUSPENDED` (the child is
   reported stopped with signal 0 and runs after `SIGCONT`); glibc has neither.
+
+---
+
+## Linux: cgroup v2, subreaper, pidfd, namespaces (`explore/linux/`)
+
+Measured on Ubuntu 22.04 (kernel 6.8) and 24.04 (kernel 7.0) x64 and 24.04 arm64 (runs `41797796450`,
+`41798083044`). The CI step creates a cgroup with `sudo`, chowns it to the runner user, enables `cpu memory pids` in
+it and moves the step's shell into `<it>/supervisor` — the shape of a subtree a service manager delegates. Everything
+below then runs **unprivileged** inside that subtree, and was identical on all three runners unless stated.
+
+### The kit's Linux shards
+
+* Their own specs pass on all three runners (process-handle 22 examples, process-supervision 18). The specs only
+  cover discovery and the process-group fallback; `explore/linux/kit_linux.cr` drives the rest on real cgroups.
+* `CgroupV2` does what its comments say: `create` refuses a name with `/` and an undelegated parent
+  (`Error::Unavailable`, from `EACCES`); `open` refuses the hierarchy root; `kill` reached a descendant that had moved
+  to its own session (`killpg` would have missed it); `close` of a populated cgroup raises `Error::Busy` and of an empty
+  owned one removes the directory; an opened (not owned) cgroup is never removed; `shutdown` skips straight to kill
+  (`soft_termination?` false, `terminate` raises `Unsupported`).
+* `ProcessHandle::Linux` (pidfd) behaves on live, exited, reaped and foreign processes: `alive?` false after exit,
+  `kill`/`terminate` after the runtime reaped the child are silent no-ops (no stray signal to a recycled pid), `open`
+  of a reaped pid raises `NoSuchProcess`, `open(1)` works, 8 concurrent `wait`s all see the exit.
+* Observations for the kit (nothing changed): `wait_empty` polls every 10 ms (10.1–10.6 ms to notice), while
+  `cgroup.events` notifies through `poll(POLLPRI)` within 0.1–0.3 ms; `attach` of a nonexistent pid surfaces a raw
+  `IO::Error` (`ESRCH` is not a `File::Error`), outside the kit's error types; `Child#close` closes the process and the
+  handle but not the group.
+
+### cgroup v2 (verified)
+
+* **`cgroup.kill` reaches everything in the cgroup**, including a daemonized descendant in another process group and
+  session that `killpg` left running; `populated 0` 0.1–0.3 ms later, and `poll(POLLPRI)` on `cgroup.events`
+  reported the change at the same moment.
+* **Zombies do not count**: a child killed but not yet reaped (state `Z`) is already gone from `cgroup.procs`, the
+  cgroup reads `populated 0`, and `rmdir` succeeds before the parent reaps.
+* **`CLONE_INTO_CGROUP`** (`clone3` with a cgroup directory fd) works unprivileged in the delegated subtree: the child
+  starts in the target cgroup, so there is no window in which it can fork outside it. (Crystal's `Process.new` cannot
+  do this; the kit's `attach` after spawn has that window, as its own comment says.)
+* **Freezer**: `cgroup.freeze 1` reached `frozen 1` within 0.1–1.2 ms; frozen tasks show state `S`, gain no CPU, and
+  `waitpid(WUNTRACED)` reports nothing. `SIGKILL` and a default-action `SIGTERM` still kill a frozen task; a `SIGTERM`
+  handler runs only after thaw (0.1–1.2 ms after); `SIGCONT` does not thaw. `cgroup.kill` on a frozen cgroup empties
+  it in 10–11 ms.
+* **`memory.max` 64 MiB** (swap max 0): the hog was OOM-killed (`SIGKILL`) after touching 63 MiB, 17–41 ms in;
+  `memory.events` `oom 1 oom_kill 1`, `memory.peak` exactly 64 MiB; a bystander in the same cgroup survived. With
+  `memory.oom.group 1` the bystander was killed too (`oom_group_kill 1`, `oom_kill 3` for two processes — inferred: the
+  victim is counted twice).
+* **`pids.max` 5** (the forker itself counts): 4 forks succeeded, the fifth failed `EAGAIN`; `pids.events max 1`.
+* **`cpu.max` "20000 100000"**: a 2 s spin got 420 ms of CPU (21 throttling periods, 1.63–1.65 s throttled); without
+  the limit 2000 ms.
+* **Accounting**: an orphaned grandchild's 400 ms of CPU appears in the cgroup's `cpu.stat usage_usec` (400.4–400.7
+  ms) and not in the supervisor's `RUSAGE_CHILDREN` (0.3–0.6 ms) — the gap `wait4` leaves (see Resource accounting).
+* **The delegation boundary is the delegated subtree, not the leaf**: a child moved itself from its leaf into the
+  supervisor's sibling cgroup (allowed: same owner, common ancestor writable), but not to the hierarchy root or the
+  parent of the delegation (`EACCES`), and could not `mkdir` at the root (`EACCES`). A supervisor that runs children
+  under its own uid cannot stop them from leaving their leaf.
+* The "no internal processes" rule, observed: in a populated leaf, enabling `+pids` and `+cpu` succeeded and
+  `+memory` then failed with `EOPNOTSUPP`. The hierarchy root has no `cgroup.kill` file at all.
+
+### Without cgroups (verified)
+
+* **`PR_SET_CHILD_SUBREAPER`**: an orphaned grandchild is reparented to the subreaper (not pid 1), `waitpid(-1)`
+  collects its status, and its CPU then shows in the subreaper's `RUSAGE_CHILDREN` (300 ms). The flag is not inherited
+  by forked children.
+* **pidfd**: `pidfd_send_signal` to a zombie succeeds, after reaping fails `ESRCH`; `waitid(P_PIDFD)` reaps
+  (`CLD_KILLED`, status 9) and a second call gives `ECHILD`; `pidfd_open` after reaping fails `ESRCH`; a
+  `PIDFD_NONBLOCK` pidfd makes `waitid` without `WNOHANG` fail `EAGAIN` while the child lives. A grandchild's pidfd
+  polls readable at its exit, but only its parent can `waitid` it (`ECHILD`). `clone3(CLONE_PIDFD)` returns a pidfd
+  together with the child. After reaping, `poll` reports `POLLIN` on kernel 6.8 and `POLLIN|POLLHUP` on 7.0.
+* **`PR_SET_PDEATHSIG`**: fires when the **thread** that forked the child exits, although the parent process lives
+  on; armed after the parent already died it never fires (the child saw `getppid() == 1` — check it after `prctl`);
+  it survives `exec` (an exec'd shell got its `SIGTERM` when the parent died).
+* **PID namespace** (`unshare(CLONE_NEWUSER | CLONE_NEWPID)`, unprivileged): killing the namespace's init killed all
+  members, including a `setsid` daemon (4 alive before, 0 after 300 ms). On Ubuntu 24.04
+  (`kernel.apparmor_restrict_unprivileged_userns = 1`) the `unshare` still succeeds but writing `uid_map` fails
+  `EPERM`; the PID-namespace kill-all works either way.
+* **`signalfd`**: 12 simultaneous child exits gave **one** `SIGCHLD` record; one `waitpid(WNOHANG)` loop found all 12.
+* **`oom_score_adj`**: runner processes start at 500; an unprivileged parent can raise its child's value to 1000 and
+  lower it to 0, but not to a negative value (`-500`: `EACCES`).
 
 ---
 
