@@ -6,7 +6,7 @@
  * timing with and without a debugger, the debugger as a "die with my parent" mechanism, and silo creation.
  *
  * Build (from a VS developer prompt):  cl /nologo /O1 /Fe:proc_explore.exe proc_explore.c user32.lib advapi32.lib
- * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|period|iorate|pipes|pidreuse|all]
+ * Run:  proc_explore.exe [ctrl|conpty|parent|wait|rate|mitigation|debug|silo|period|iorate|iobw|pipes|pidreuse|all]
  *       (each group runs well inside the 300 s watchdog; "all" may not, so CI runs groups one by one)
  */
 #ifndef _WIN32_WINNT
@@ -1045,6 +1045,190 @@ static void probe_iorate(void) {
   }
   DeleteFileW(fpre);
   DeleteFileW(fapp);
+}
+
+/* ------------------------------------------------------------------ bandwidth limit: what the error-87 writes did */
+/* MaxBandwidth makes about one write per second fail with ERROR_INVALID_PARAMETER (runs 41788061976..41793150011).
+ * Does the failed write land anyway? Does retrying the same offset with the same payload succeed? Does a limit that
+ * is an exact multiple of the write size avoid it? The child overwrites blocks in order, each with a unique header
+ * (generation, block number), at explicit offsets; on a failure it either moves on or retries the same write up to
+ * 5 times. Its records go to the parent through a pipe (pipes are not rate-controlled; files in the job are), and
+ * the parent, outside the job, reads the file back. */
+typedef struct { unsigned blk, gen; DWORD err, n; double t; } iobw_fail_t;
+typedef struct { unsigned long ok, fail, retry_ok, retry_fail, hist[6]; int nblocks, nfail; } iobw_sum_t;
+
+static int child_io_verify(const wchar_t *path, int size, int seconds, int retry) {
+  HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 2;
+  LARGE_INTEGER fsz;
+  GetFileSizeEx(h, &fsz);
+  int nblocks = (int)(fsz.QuadPart / size);
+  if (nblocks > 4096) nblocks = 4096;
+  if (nblocks < 1) return 5;
+  unsigned *expect = (unsigned *)calloc((size_t)nblocks, sizeof(unsigned));
+  static iobw_fail_t fails[256];
+  iobw_sum_t sum;
+  memset(&sum, 0, sizeof sum);
+  sum.nblocks = nblocks;
+  unsigned char *buf = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!buf || !expect) return 4;
+  unsigned gen = 0;
+  int blk = 0;
+  double t0 = abs_ms(), end = t0 + seconds * 1000.0;
+  while (abs_ms() < end) {
+    gen++;
+    memset(buf, (int)(gen & 0xff), (size_t)size);
+    ((unsigned *)buf)[0] = gen;
+    ((unsigned *)buf)[1] = (unsigned)blk;
+    LONGLONG off = (LONGLONG)blk * size;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    ov.Offset = (DWORD)off;
+    ov.OffsetHigh = (DWORD)(off >> 32);
+    DWORD n = 0;
+    BOOL r = WriteFile(h, buf, (DWORD)size, &n, &ov);
+    DWORD e = r ? 0 : GetLastError();
+    if (r && n == (DWORD)size) { sum.ok++; expect[blk] = gen; }
+    else {
+      sum.fail++;
+      if (sum.nfail < 256) { iobw_fail_t *f = &fails[sum.nfail++]; f->blk = (unsigned)blk; f->gen = gen; f->err = e; f->n = n; f->t = abs_ms() - t0; }
+      if (retry) {
+        int k;
+        for (k = 1; k <= 5; k++) {
+          memset(&ov, 0, sizeof ov);
+          ov.Offset = (DWORD)off;
+          ov.OffsetHigh = (DWORD)(off >> 32);
+          n = 0;
+          r = WriteFile(h, buf, (DWORD)size, &n, &ov);
+          if (r && n == (DWORD)size) break;
+        }
+        if (k <= 5) { sum.retry_ok++; sum.hist[k]++; expect[blk] = gen; }
+        else { sum.retry_fail++; expect[blk] = 0xFFFFFFFFu; }
+      }
+    }
+    blk = (blk + 1) % nblocks;
+  }
+  CloseHandle(h);
+  DWORD w;
+  WriteFile(out, &sum, sizeof sum, &w, NULL);
+  WriteFile(out, expect, (DWORD)(nblocks * sizeof(unsigned)), &w, NULL);
+  WriteFile(out, fails, (DWORD)(sum.nfail * sizeof(iobw_fail_t)), &w, NULL);
+  return 0;
+}
+
+static int read_all(HANDLE r, void *dst, DWORD want, DWORD ms) {
+  DWORD got = 0;
+  double end = abs_ms() + ms;
+  while (got < want && abs_ms() < end) {
+    DWORD avail = 0;
+    if (!PeekNamedPipe(r, NULL, 0, NULL, &avail, NULL)) break; /* broken pipe: the child is gone */
+    if (!avail) { Sleep(10); continue; }
+    DWORD k = 0;
+    if (!ReadFile(r, (char *)dst + got, want - got < avail ? want - got : avail, &k, NULL) || !k) break;
+    got += k;
+  }
+  return got == want;
+}
+
+static void iobw_case(const char *name, int size, LONG64 bw, int nblocks, int retry, PFN_SetIoRate setio) {
+  wchar_t path[MAX_PATH * 2], fname[64];
+  swprintf(fname, 64, L"iobw-%d-%d.bin", size, nblocks);
+  tmp_file(path, MAX_PATH * 2, fname);
+  prefill(path, (LONGLONG)size * nblocks); /* every byte 'p': header 0x70707070 = never written */
+  HANDLE job = CreateJobObjectW(NULL, NULL);
+  MY_IO_RATE rc;
+  memset(&rc, 0, sizeof rc);
+  rc.MaxBandwidth = bw;
+  rc.ControlFlags = 1;
+  DWORD sret = setio(job, &rc);
+  SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
+  HANDLE rd = NULL, wr = NULL;
+  CreatePipe(&rd, &wr, &sa, 1 << 16);
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  wchar_t cmd[4096];
+  swprintf(cmd, 4096, L"\"%ls\" --child-io-verify \"%ls\" %d 6 %d", g_self, path, size, retry);
+  STARTUPINFOW si;
+  memset(&si, 0, sizeof si);
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  si.hStdOutput = wr;
+  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  PROCESS_INFORMATION pi;
+  memset(&pi, 0, sizeof pi);
+  if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+    emit(name, "\"spawn_error\":%lu", (unsigned long)GetLastError());
+    CloseHandle(rd); CloseHandle(wr); CloseHandle(job); DeleteFileW(path);
+    return;
+  }
+  CloseHandle(wr);
+  AssignProcessToJobObject(job, pi.hProcess);
+  ResumeThread(pi.hThread);
+  iobw_sum_t sum;
+  memset(&sum, 0, sizeof sum);
+  static unsigned expect[4096];
+  static iobw_fail_t fails[256];
+  int got = read_all(rd, &sum, sizeof sum, 20000) && sum.nblocks > 0 && sum.nblocks <= 4096 && sum.nfail <= 256 &&
+            read_all(rd, expect, (DWORD)(sum.nblocks * sizeof(unsigned)), 5000) && read_all(rd, fails, (DWORD)(sum.nfail * sizeof(iobw_fail_t)), 5000);
+  WaitForSingleObject(pi.hProcess, 10000);
+  DWORD code = 0;
+  GetExitCodeProcess(pi.hProcess, &code);
+  kill_close(&pi);
+  CloseHandle(rd);
+  CloseHandle(job);
+  if (!got) { emit(name, "\"error\":\"no records from the child\",\"child_exit\":\"0x%08lx\"", (unsigned long)code); DeleteFileW(path); return; }
+  /* read back every block header, outside the job */
+  HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  static unsigned disk[4096];
+  for (int i = 0; i < sum.nblocks; i++) {
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)i * size;
+    SetFilePointerEx(f, li, NULL, FILE_BEGIN);
+    unsigned hdr[2] = {0, 0};
+    DWORD k = 0;
+    ReadFile(f, hdr, sizeof hdr, &k, NULL);
+    disk[i] = hdr[0];
+  }
+  CloseHandle(f);
+  DeleteFileW(path);
+  int matched = 0, mismatched = 0, unknown = 0;
+  for (int i = 0; i < sum.nblocks; i++) {
+    unsigned want = expect[i] == 0 ? 0x70707070u : expect[i];
+    if (expect[i] == 0xFFFFFFFFu) unknown++;
+    else if (disk[i] == want) matched++;
+    else mismatched++;
+  }
+  int landed = 0, not_written = 0, other = 0;
+  char times[700] = "";
+  size_t tl = 0;
+  for (int i = 0; i < sum.nfail; i++) {
+    unsigned d = disk[fails[i].blk];
+    unsigned prev = expect[fails[i].blk];
+    if (d == fails[i].gen) landed++;
+    else if (d == (prev == 0 ? 0x70707070u : prev) || (retry && d == prev)) not_written++;
+    else other++;
+    if (i < 12) tl += (size_t)snprintf(times + tl, sizeof times - tl, "%s%.0fms:err%lu:n%lu", i ? "," : "", fails[i].t, (unsigned long)fails[i].err, (unsigned long)fails[i].n);
+  }
+  if (retry) landed = not_written = other = -1; /* a retry rewrote the block: the first attempt cannot be told apart */
+  emit(name,
+       "\"io_size\":%d,\"max_bandwidth\":%lld,\"writes_per_s_allowed\":%.2f,\"retry_same_offset\":%s,\"set_return\":%lu,\"child_exit\":\"0x%08lx\",\"writes_ok\":%lu,\"writes_failed\":%lu,"
+       "\"first_failures\":\"%s\",\"retry_succeeded\":%lu,\"retry_attempt_histogram_1_to_5\":[%lu,%lu,%lu,%lu,%lu],\"retry_gave_up\":%lu,"
+       "\"verify\":{\"blocks\":%d,\"matched\":%d,\"mismatched\":%d,\"unknown\":%d},\"failed_attempts_on_disk\":{\"landed_despite_error\":%d,\"not_written\":%d,\"other\":%d}",
+       size, (long long)bw, (double)bw / size, bstr(retry), (unsigned long)sret, (unsigned long)code, sum.ok, sum.fail, times, sum.retry_ok,
+       sum.hist[1], sum.hist[2], sum.hist[3], sum.hist[4], sum.hist[5], sum.retry_fail, sum.nblocks, matched, mismatched, unknown, landed, not_written, other);
+}
+
+static void probe_iobw(void) {
+  PFN_SetIoRate setio = (PFN_SetIoRate)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetIoRateControlInformationJobObject");
+  if (!setio) { emit("iobw", "\"unsupported\":\"not exported\""); return; }
+  iobw_case("iobw_64k_1048576_exactly_16_writes_per_s", 65536, 1048576, 256, 0, setio);
+  iobw_case("iobw_64k_1015808_15.5_writes_per_s", 65536, 1015808, 256, 0, setio);
+  iobw_case("iobw_64k_1000000", 65536, 1000000, 256, 0, setio);
+  iobw_case("iobw_64k_1000000_retry", 65536, 1000000, 256, 1, setio);
+  iobw_case("iobw_4k_1048576_exactly_256_writes_per_s", 4096, 1048576, 2048, 0, setio);
+  iobw_case("iobw_4k_1000000_retry", 4096, 1000000, 2048, 1, setio);
+  iobw_case("iobw_64k_10485760_exactly_160_writes_per_s", 65536, 10485760, 1024, 0, setio);
 }
 
 /* ------------------------------------------------------------------ child-process policy */
@@ -2351,6 +2535,7 @@ int main(void) {
   if (argc >= 2 && wcscmp(argv[1], L"--child-read-stdin") == 0) return child_read_stdin();
   if (argc >= 6 && wcscmp(argv[1], L"--child-io") == 0) return child_io(argv[2], argv[3], _wtoi(argv[4]), _wtoi(argv[5]));
   if (argc >= 5 && wcscmp(argv[1], L"--child-io-log") == 0) return child_io_log(argv[2], _wtoi(argv[3]), argv[4]);
+  if (argc >= 6 && wcscmp(argv[1], L"--child-io-verify") == 0) return child_io_verify(argv[2], _wtoi(argv[3]), _wtoi(argv[4]), _wtoi(argv[5]));
   if (argc >= 3 && wcscmp(argv[1], L"--child-spawn-try") == 0) return child_spawn_try(argv[2]);
   if (argc >= 5 && wcscmp(argv[1], L"--sender") == 0) return child_sender(argv[2], (DWORD)_wtoi(argv[3]), argv[4]);
   if (argc >= 4 && wcscmp(argv[1], L"--child-debugger") == 0) return child_debugger(argv[2], _wtoi(argv[3]));
@@ -2374,6 +2559,7 @@ int main(void) {
   if (all || wcscmp(which, L"silo") == 0) probe_silo();
   if (all || wcscmp(which, L"period") == 0) probe_period();
   if (all || wcscmp(which, L"iorate") == 0) probe_iorate();
+  if (all || wcscmp(which, L"iobw") == 0) probe_iobw();
   if (all || wcscmp(which, L"pipes") == 0) probe_pipes();
   if (all || wcscmp(which, L"pidreuse") == 0) probe_pidreuse();
   if (all || wcscmp(which, L"suspend") == 0) probe_suspend();

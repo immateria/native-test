@@ -394,16 +394,19 @@ module Explore
           job = new_job
           process = nil.as(LibC::HANDLE?)
           begin
+            # Two differently named locals on purpose. One variable assigned both struct types becomes a Crystal
+            # union, and pointerof then points at the union's 8-byte type tag, not at the struct: Windows read the
+            # limit flags as 0 and "accepted" every class (the earlier in-loop HIGH success).
             if info_class == CLASS_BASIC_LIMIT
-              info = LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION.new
-              info.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | extra
-              info.priorityClass = value
-              ok, err = set_job_info(job, info_class, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION))
+              basic_info = LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION.new
+              basic_info.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | extra
+              basic_info.priorityClass = value
+              ok, err = set_job_info(job, info_class, pointerof(basic_info).as(Void*), sizeof(LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION))
             else
-              info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
-              info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | extra
-              info.basicLimitInformation.priorityClass = value
-              ok, err = set_job_info(job, info_class, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
+              extended_info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
+              extended_info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | extra
+              extended_info.basicLimitInformation.priorityClass = value
+              ok, err = set_job_info(job, info_class, pointerof(extended_info).as(Void*), sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
             end
             before = -1_i64
             after_assign = -1_i64

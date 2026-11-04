@@ -9,12 +9,16 @@
 #include "common.h"
 #include <dirent.h>
 #include <limits.h>
+#include <sys/mman.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #define PROBE "crash_latency"
 
-enum { M_SEGV, M_ABORT, M_TRAP, M_KILL_SEGV, M_KILL_KILL, M_EXIT };
+enum { M_SEGV, M_ABORT, M_TRAP, M_KILL_SEGV, M_KILL_KILL, M_EXIT, M_QUIT, M_FPE, M_BUS, M_XCPU, M_SYS };
 
 static const char *mode_name(int m) {
   switch (m) {
@@ -23,6 +27,15 @@ static const char *mode_name(int m) {
     case M_TRAP: return "builtin_trap";
     case M_KILL_SEGV: return "kill_SIGSEGV_from_outside";
     case M_KILL_KILL: return "kill_SIGKILL_from_outside_baseline";
+    case M_QUIT: return "raise_SIGQUIT";
+#if defined(__x86_64__) || defined(__i386__)
+    case M_FPE: return "integer_divide_by_zero_SIGFPE";
+#else
+    case M_FPE: return "raise_SIGFPE"; /* integer division by zero does not trap on arm64 */
+#endif
+    case M_BUS: return "access_beyond_truncated_mapping_SIGBUS";
+    case M_XCPU: return "RLIMIT_CPU_1s_SIGXCPU";
+    case M_SYS: return "raise_SIGSYS";
     default: return "exit_baseline";
   }
 }
@@ -42,20 +55,64 @@ static int count_reports(const char *dir, const char *prefix) {
   return n;
 }
 
-static int g_core_variant; /* 0 = RLIMIT_CORE 0, 1 = raised to at most 256 MiB */
+/* 0 = RLIMIT_CORE 0, 1 = raised to at most 256 MiB, 2 = exactly 1 byte (Linux skips a piped core_pattern helper for
+ * that value: fs/coredump.c treats 1 as its recursion guard), 3 = RLIMIT_CORE 0 and PR_SET_DUMPABLE 0 (Linux) */
+static int g_core_variant;
+static int g_big_heap;           /* dirty 384 MiB before faulting, so the core takes a while to write (Linux) */
+static int g_kill_during_dump_ms = -1; /* parent sends SIGKILL this long after the fault timestamp */
+static const char *variant_name(int v) {
+  switch (v) {
+    case 1: return "_core_enabled";
+    case 2: return "_RLIMIT_CORE_1_byte";
+    case 3: return "_not_dumpable";
+    default: return "_core_disabled";
+  }
+}
 
 static void child_body(int mode, int wfd, const char *cwd) {
   struct rlimit rl;
   getrlimit(RLIMIT_CORE, &rl);
-  if (g_core_variant) {
+  if (g_core_variant == 1) {
     rlim_t cap = (rlim_t)256 << 20;
     rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > cap) ? cap : rl.rlim_max;
+  } else if (g_core_variant == 2) {
+    rl.rlim_cur = rl.rlim_max >= 1 ? 1 : 0;
   } else {
     rl.rlim_cur = 0;
   }
   setrlimit(RLIMIT_CORE, &rl);
+#ifdef __linux__
+  if (g_core_variant == 3) prctl(PR_SET_DUMPABLE, 0L, 0L, 0L, 0L);
+#endif
   if (cwd && chdir(cwd) != 0) _exit(120);
   signal(SIGSEGV, SIG_DFL); signal(SIGABRT, SIG_DFL); signal(SIGILL, SIG_DFL); signal(SIGTRAP, SIG_DFL);
+  signal(SIGQUIT, SIG_DFL); signal(SIGFPE, SIG_DFL); signal(SIGBUS, SIG_DFL); signal(SIGXCPU, SIG_DFL); signal(SIGSYS, SIG_DFL);
+  if (g_big_heap) {
+    size_t sz = (size_t)384 << 20;
+    volatile char *h = malloc(sz);
+    if (h) for (size_t i = 0; i < sz; i += 4096) h[i] = (char)(i >> 12);
+  }
+  volatile char *bus_map = NULL;
+  if (mode == M_BUS) {
+    int fd = open("bus-probe.bin", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || ftruncate(fd, 8192) != 0) _exit(123);
+    void *m = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) _exit(124);
+    if (ftruncate(fd, 0) != 0) _exit(125);
+    bus_map = (volatile char *)m;
+  }
+  if (mode == M_XCPU) {
+    struct rlimit cpu = {1, 4};
+    setrlimit(RLIMIT_CPU, &cpu);
+    /* write the timestamp just before the 1 s CPU limit is reached */
+    for (;;) {
+      struct rusage ru;
+      getrusage(RUSAGE_SELF, &ru);
+      double cpu_ms = ru.ru_utime.tv_sec * 1000.0 + ru.ru_utime.tv_usec / 1000.0 + ru.ru_stime.tv_sec * 1000.0 + ru.ru_stime.tv_usec / 1000.0;
+      if (cpu_ms >= 990) break;
+      for (volatile int i = 0; i < 100000; i++) {}
+    }
+  }
   double t = now_ms();
   (void)!write(wfd, &t, sizeof t);
   switch (mode) {
@@ -63,6 +120,15 @@ static void child_body(int mode, int wfd, const char *cwd) {
     case M_ABORT: abort();
     case M_TRAP: __builtin_trap();
     case M_EXIT: _exit(0);
+    case M_QUIT: raise(SIGQUIT); break;
+#if defined(__x86_64__) || defined(__i386__)
+    case M_FPE: { volatile int n = 7, z = 0; volatile int x = n / z; (void)x; break; } /* not 1 / z: GCC turns that into a compare */
+#else
+    case M_FPE: raise(SIGFPE); break;
+#endif
+    case M_BUS: bus_map[0] = 1; break;
+    case M_XCPU: for (;;) { for (volatile int i = 0; i < 100000; i++) {} }
+    case M_SYS: raise(SIGSYS); break;
     default: for (;;) pause();
   }
   _exit(121);
@@ -82,6 +148,11 @@ static int run_trial(int mode, const char *cwd, trial_t *out) {
     sleep_ms(30);
     tfault = now_ms();
     kill(c, mode == M_KILL_SEGV ? SIGSEGV : SIGKILL);
+  }
+  if (g_kill_during_dump_ms >= 0) {
+    double at = tfault + g_kill_during_dump_ms;
+    while (now_ms() < at) sleep_ms(1);
+    kill(c, SIGKILL);
   }
   /* EOF on the pipe (the child's write end closes when the process dies) */
   char buf[16];
@@ -116,8 +187,9 @@ static void series(int mode, int core_variant, int n, const char *cwd) {
     snprintf(status, sizeof status, "%s", t.status);
     eof[k] = t.to_eof; wait[k] = t.to_wait; k++;
   }
-  char kase[128];
-  snprintf(kase, sizeof kase, "%s%s", mode_name(mode), core_variant ? "_core_enabled" : "_core_disabled");
+  char kase[192];
+  snprintf(kase, sizeof kase, "%s%s%s%s", mode_name(mode), variant_name(core_variant), g_big_heap ? "_384MiB_dirty" : "",
+           g_kill_during_dump_ms >= 0 ? "_SIGKILL_20ms_after_fault" : "");
   if (k == 0) { emit(PROBE, kase, "\"n\":0"); return; }
   qsort(eof, (size_t)k, sizeof(double), cmp_d);
   qsort(wait, (size_t)k, sizeof(double), cmp_d);
@@ -144,13 +216,16 @@ static void describe_system(void) {
   size_t n = strlen(pattern);
   while (n > 0 && (pattern[n - 1] == '\n')) pattern[--n] = 0;
   /* JSON-escape: the pattern may contain | and %, but no quotes or backslashes in practice */
-  emit(PROBE, "system", "\"RLIMIT_CORE_soft\":%lld,\"RLIMIT_CORE_hard\":%lld,\"core_pattern\":\"%s\"",
-       (long long)rl.rlim_cur, (long long)rl.rlim_max, pattern);
+  long pipe_limit = -1;
+  FILE *pl = fopen("/proc/sys/kernel/core_pipe_limit", "r");
+  if (pl) { if (fscanf(pl, "%ld", &pipe_limit) != 1) pipe_limit = -1; fclose(pl); }
+  emit(PROBE, "system", "\"RLIMIT_CORE_soft\":%lld,\"RLIMIT_CORE_hard\":%lld,\"core_pattern\":\"%s\",\"core_pipe_limit\":%ld",
+       (long long)rl.rlim_cur, (long long)rl.rlim_max, pattern, pipe_limit);
 #endif
 }
 
 int main(void) {
-  watchdog(220);
+  watchdog(400);
   emit_header(PROBE);
   describe_system();
 
@@ -173,6 +248,25 @@ int main(void) {
   series(M_TRAP, 0, 5, dir);
   series(M_SEGV, 1, 5, dir);
   series(M_ABORT, 1, 3, dir);
+  /* the other signals whose default action dumps core */
+  series(M_QUIT, 0, 5, dir);
+  series(M_FPE, 0, 5, dir);
+  series(M_BUS, 0, 5, dir);
+  series(M_XCPU, 0, 3, dir);
+  series(M_SYS, 0, 5, dir);
+  /* opting one child out of the crash handler */
+  series(M_SEGV, 2, 5, dir);
+  series(M_ABORT, 2, 3, dir);
+#ifdef __linux__
+  series(M_SEGV, 3, 5, dir);
+  /* a large core, and SIGKILL while it is being written */
+  g_big_heap = 1;
+  series(M_SEGV, 1, 3, dir);
+  g_kill_during_dump_ms = 20;
+  series(M_SEGV, 1, 3, dir);
+  g_kill_during_dump_ms = -1;
+  g_big_heap = 0;
+#endif
 
   /* core files left behind (Linux: in the working directory; macOS: /cores/core.<pid> is handled below) */
   DIR *d = opendir(dir);

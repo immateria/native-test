@@ -119,6 +119,7 @@ static const char *sig_name(int s) {
     case SIGTTIN: return "SIGTTIN";
     case SIGTTOU: return "SIGTTOU";
     case SIGXCPU: return "SIGXCPU";
+    case SIGSYS: return "SIGSYS";
     case SIGXFSZ: return "SIGXFSZ";
     case SIGWINCH: return "SIGWINCH";
     default: return "other";

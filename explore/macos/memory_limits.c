@@ -8,6 +8,11 @@
  *   memorystatus_*           the kernel's per-process footprint limit (jetsam) through memorystatus_control, set on
  *                            the child itself, as this user (and as root when the probe runs under sudo): does the
  *                            call succeed, and is the child killed when it exceeds the limit
+ *   jetsam_spawn_*           the same limit installed at creation through posix_spawnattr_setjetsam_ext (private SPI,
+ *                            looked up with dlsym). XNU's exec path applies it with memorystatus_set_memlimits and no
+ *                            privilege check that we could find, unlike memorystatus_control (root or entitlement)
+ *   rlimit_as_*              RLIMIT_RSS is only an alias of RLIMIT_AS on Darwin (bsd/sys/resource.h), a limit on the
+ *                            address space; set it below and above the current virtual size and see what it refuses
  *
  * memorystatus_control is private API (no public header); it is looked up with dlsym.
  *
@@ -16,8 +21,14 @@
 #include "../posix/common.h"
 #include <dlfcn.h>
 #include <libproc.h>
+#include <limits.h>
+#include <spawn.h>
+#include <sys/mman.h>
 #include <sys/sysctl.h>
 #define PROBE "memory_limits"
+
+extern char **environ;
+static char g_self[PATH_MAX];
 
 #define MS_CMD_SET_JETSAM_TASK_LIMIT 6
 #define MS_CMD_SET_MEMLIMIT_PROPERTIES 7
@@ -277,8 +288,117 @@ static void memorystatus_case(const char *kase, int cmd) {
        line[0] ? line : "null", last, status, t_last - t0);
 }
 
-int main(void) {
-  watchdog(150);
+/* RLIMIT_AS (= RLIMIT_RSS) relative to the child's current virtual size: below it, and 256 MiB above it. */
+static void rlimit_as_vs_vsize(void) {
+  int p[2];
+  if (pipe(p) != 0) return;
+  pid_t c = fork();
+  if (c == 0) {
+    close(p[0]);
+    struct proc_taskinfo ti;
+    memset(&ti, 0, sizeof ti);
+    int tr = proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &ti, sizeof ti);
+    unsigned long long vs = ti.pti_virtual_size;
+    struct rlimit rl;
+    getrlimit(RLIMIT_AS, &rl);
+    struct rlimit below = rl, above = rl;
+    below.rlim_cur = (rlim_t)(vs / 2);
+    errno = 0;
+    int rb = setrlimit(RLIMIT_AS, &below);
+    int eb = errno;
+    above.rlim_cur = (rlim_t)(vs + 256 * MIB);
+    errno = 0;
+    int ra = setrlimit(RLIMIT_AS, &above);
+    int ea = errno;
+    struct rlimit now;
+    getrlimit(RLIMIT_AS, &now);
+    /* within the headroom, then beyond it */
+    char *a = malloc(128 * MIB);
+    if (a) { fill_random(a, 128 * MIB, 11); keep(a); }
+    errno = 0;
+    char *b = malloc(512 * MIB);
+    int eb2 = errno;
+    if (b) keep(b);
+    errno = 0;
+    void *m = mmap(NULL, 512 * MIB, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    int em = errno;
+    unsigned long long fp = 0, rss = 0;
+    footprint(getpid(), &fp, &rss);
+    char line[700];
+    int n = snprintf(line, sizeof line,
+      "{\"taskinfo_rc\":%d,\"virtual_size_MiB\":%.0f,\"as_soft_before\":%lld,\"as_hard\":%lld,\"set_below_vsize_rc\":%d,\"set_below_errno\":\"%s\",\"set_vsize_plus_256MiB_rc\":%d,\"set_above_errno\":\"%s\",\"as_soft_after_MiB\":%.0f,"
+      "\"malloc_128MiB_ok\":%d,\"malloc_512MiB_ok\":%d,\"malloc_512MiB_errno\":\"%s\",\"mmap_reserve_512MiB_ok\":%d,\"mmap_errno\":\"%s\",\"footprint_MiB\":%.0f}",
+      tr, (double)vs / MIB, (long long)rl.rlim_cur, (long long)rl.rlim_max, rb, errno_name(rb == 0 ? 0 : eb), ra, errno_name(ra == 0 ? 0 : ea),
+      now.rlim_cur == RLIM_INFINITY ? -1.0 : (double)now.rlim_cur / MIB, a != NULL, b != NULL, errno_name(b ? 0 : eb2), m != MAP_FAILED, errno_name(m != MAP_FAILED ? 0 : em), (double)fp / MIB);
+    (void)!write(p[1], line, (size_t)n);
+    _exit(0);
+  }
+  close(p[1]);
+  char buf[800];
+  int eof;
+  drain_until(p[0], buf, sizeof buf, 10000, &eof);
+  close(p[0]);
+  char st[64];
+  reap_blocking(c, 5000, st, sizeof st);
+  emit(PROBE, "rlimit_as_vs_virtual_size", "\"child_measured\":%s,\"child_end\":\"%s\"", buf[0] ? buf : "null", st);
+}
+
+/* posix_spawnattr_setjetsam_ext(attr, flags, priority, active_MB, inactive_MB): flags 0x04 active-fatal, 0x08
+ * inactive-fatal (bsd/sys/spawn_internal.h); priority -1 = the default band. The child allocates 8 MiB steps up to
+ * 512 MiB on fd 3. limit_mb 0 = control without the attribute. */
+typedef int (*setjetsam_ext_fn)(posix_spawnattr_t *, short, int, int, int);
+static void jetsam_spawn_case(const char *kase, int limit_mb, short flags) {
+  setjetsam_ext_fn fn = (setjetsam_ext_fn)dlsym(RTLD_DEFAULT, "posix_spawnattr_setjetsam_ext");
+  if (!fn && limit_mb) { emit(PROBE, kase, "\"error\":\"posix_spawnattr_setjetsam_ext not found with dlsym\""); return; }
+  int p[2];
+  if (pipe(p) != 0) return;
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa, p[1], 3);
+  posix_spawn_file_actions_addclose(&fa, p[0]);
+  posix_spawnattr_t at;
+  posix_spawnattr_init(&at);
+  int set_rc = limit_mb ? fn(&at, flags, -1, limit_mb, limit_mb) : 0;
+  char *args[] = {g_self, "--alloc-child", NULL};
+  pid_t c = -1;
+  double t0 = now_ms();
+  int sp = posix_spawn(&c, g_self, &fa, &at, args, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  posix_spawnattr_destroy(&at);
+  close(p[1]);
+  if (sp != 0) { emit(PROBE, kase, "\"limit_MB\":%d,\"flags\":%d,\"setter_rc\":%d,\"posix_spawn_errno\":\"%s\"", limit_mb, flags, set_rc, errno_name(sp)); close(p[0]); return; }
+  /* what the kernel installed (readable only as root) */
+  ms_props_t got;
+  memset(&got, 0xff, sizeof got);
+  errno = 0;
+  int grc = g_msc ? g_msc(MS_CMD_GET_MEMLIMIT_PROPERTIES, c, 0, &got, sizeof got) : -2;
+  int ge = errno;
+  uint32_t last = 0;
+  double t_last = t0;
+  int dead = 0, st = 0;
+  double end = now_ms() + 8000;
+  while (now_ms() < end) {
+    step_t s;
+    ssize_t k = read_timeout(p[0], &s, sizeof s, 200);
+    if (k == (ssize_t)sizeof s) { last = s.mib; t_last = s.t_ms; if (last >= 512) break; continue; }
+    if (waitpid(c, &st, WNOHANG) == c) { dead = 1; break; }
+    if (k == 0) break;
+  }
+  if (!dead && waitpid_timeout(c, &st, 0, 300) == c) dead = 1;
+  char status[64];
+  if (dead) status_text(st, status, sizeof status);
+  else { snprintf(status, sizeof status, "still_running"); kill(c, SIGKILL); waitpid(c, &st, 0); }
+  close(p[0]);
+  emit(PROBE, kase, "\"euid\":%d,\"limit_MB\":%d,\"flags\":%d,\"setter_rc\":%d,\"posix_spawn_rc\":0,\"kernel_readback\":{\"rc\":%d,\"errno\":\"%s\",\"active_MB\":%d,\"active_attr\":%u,\"inactive_MB\":%d,\"inactive_attr\":%u},"
+       "\"child_last_reported_MiB\":%u,\"child_end\":\"%s\",\"ms_from_spawn_to_last_step\":%.0f",
+       (int)geteuid(), limit_mb, flags, set_rc, grc, errno_name(grc == 0 ? 0 : ge), got.memlimit_active, got.memlimit_active_attr, got.memlimit_inactive, got.memlimit_inactive_attr,
+       last, status, t_last - t0);
+}
+
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "--alloc-child") == 0) { allocate_forever(3, 512, 2); return 0; }
+  if (!realpath(argv[0], g_self)) snprintf(g_self, sizeof g_self, "%s", argv[0]);
+  watchdog(200);
   emit_header(PROBE);
   g_msc = (memorystatus_control_fn)dlsym(RTLD_DEFAULT, "memorystatus_control");
   int mem_pressure_level = -1;
@@ -294,5 +414,10 @@ int main(void) {
   footprint_poll_kill();
   memorystatus_case("memorystatus_set_memlimit_properties_64MB_fatal", MS_CMD_SET_MEMLIMIT_PROPERTIES);
   memorystatus_case("memorystatus_set_jetsam_task_limit_64MB", MS_CMD_SET_JETSAM_TASK_LIMIT);
+  rlimit_as_vs_vsize();
+  jetsam_spawn_case("jetsam_spawn_control_no_limit", 0, 0);
+  jetsam_spawn_case("jetsam_spawn_64MB_fatal", 64, 0x04 | 0x08);
+  jetsam_spawn_case("jetsam_spawn_128MB_fatal", 128, 0x04 | 0x08);
+  jetsam_spawn_case("jetsam_spawn_64MB_not_fatal", 64, 0);
   return 0;
 }

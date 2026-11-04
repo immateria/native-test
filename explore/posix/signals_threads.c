@@ -8,6 +8,10 @@
  *   read_interrupted_*   a thread blocked in read(): does a process-directed signal give it EINTR
  *   pending_*            a blocked, pending signal across fork and across exec
  *   handler_in_fork_window  a signal sent to a forked child before it execs: whose handler runs
+ *   parked_signal_*      a process-directed signal while every thread blocks it: which thread's sigpending() shows
+ *                        it, and does a worker's sigwait() collect it without a second signal. XNU parks such a
+ *                        signal on the first thread's own pending set (get_signalact) and sigwait scans every
+ *                        thread's set (__sigwait_nocancel); Linux keeps it in the process-wide shared set
  *
  * Build: cc -O1 -Wall -Wextra -pthread -o signals_threads signals_threads.c
  */
@@ -306,6 +310,81 @@ static void run_fork_window(void) {
   signal(SIGUSR1, SIG_DFL);
 }
 
+static volatile int g_pk_go, g_pk_done;
+static struct { int pending_seen_by_worker, sigwait_rc, sig; double wait_ms; } g_pk;
+static void *parked_worker(void *a) {
+  (void)a;
+  sigset_t s, cur;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  while (!g_pk_go) sleep_ms(1);
+  sigemptyset(&cur);
+  sigpending(&cur);
+  g_pk.pending_seen_by_worker = sigismember(&cur, SIGUSR1);
+  double t = now_ms();
+  int got = 0;
+  g_pk.sigwait_rc = sigwait(&s, &got);
+  g_pk.sig = got;
+  g_pk.wait_ms = now_ms() - t;
+  g_pk_done = 1;
+  return NULL;
+}
+
+static void run_parked(void) {
+  int p[2];
+  if (pipe(p) != 0) return;
+  pid_t c = fork();
+  if (c == 0) {
+    close(p[0]);
+    g_total = 0; /* counted by on_usr1; the parent's earlier cases left it nonzero */
+    install_handler(1);
+    block_usr1(); /* the worker inherits the mask */
+    pthread_t t;
+    pthread_create(&t, NULL, parked_worker, NULL);
+    sleep_ms(20);
+    kill(getpid(), SIGUSR1);
+    sleep_ms(20);
+    sigset_t cur;
+    sigemptyset(&cur);
+    sigpending(&cur);
+    int main_before = sigismember(&cur, SIGUSR1);
+    g_pk_go = 1;
+    double end = now_ms() + 1000;
+    while (!g_pk_done && now_ms() < end) sleep_ms(1);
+    int needed_thread_signal = 0;
+    if (!g_pk_done) {
+      needed_thread_signal = 1;
+      pthread_kill(t, SIGUSR1);
+      end = now_ms() + 1000;
+      while (!g_pk_done && now_ms() < end) sleep_ms(1);
+    }
+    sigemptyset(&cur);
+    sigpending(&cur);
+    int main_after = sigismember(&cur, SIGUSR1);
+    int handler_before = g_total;
+    unblock_usr1();
+    sleep_ms(30);
+    int handler_after_main_unblocks = g_total;
+    char line[600];
+    int n = snprintf(line, sizeof line,
+      "\"main_sigpending_shows_it\":%d,\"worker_sigpending_shows_it\":%d,\"worker_sigwait_returned\":%d,\"sigwait_rc\":%d,\"sigwait_signal\":\"%s\",\"sigwait_ms\":%.1f,"
+      "\"needed_a_thread_directed_signal\":%d,\"main_sigpending_after_sigwait\":%d,\"handler_runs_while_blocked\":%d,\"handler_runs_after_main_unblocks\":%d",
+      main_before, g_pk.pending_seen_by_worker, g_pk_done, g_pk.sigwait_rc, sig_name(g_pk.sig), g_pk.wait_ms, needed_thread_signal, main_after,
+      handler_before, handler_after_main_unblocks);
+    (void)!write(p[1], line, (size_t)n);
+    _exit(0);
+  }
+  close(p[1]);
+  char buf[700];
+  int eof;
+  drain_until(p[0], buf, sizeof buf, 5000, &eof);
+  close(p[0]);
+  char st[64];
+  reap_blocking(c, 3000, st, sizeof st);
+  if (buf[0]) emit(PROBE, "parked_signal_collected_by_worker_sigwait", "%s,\"child_end\":\"%s\"", buf, st);
+  else emit(PROBE, "parked_signal_collected_by_worker_sigwait", "\"error\":\"no report\",\"child_end\":\"%s\"", st);
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--noop") == 0) return 0;
   if (argc > 1 && strcmp(argv[1], "--report-pending") == 0) return exec_report_pending(argc > 2 ? argv[2] : "?");
@@ -328,5 +407,6 @@ int main(int argc, char **argv) {
 
   run_pending();
   run_fork_window();
+  run_parked();
   return 0;
 }

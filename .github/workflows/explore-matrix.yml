@@ -11,8 +11,7 @@ on:
       - "explore/posix/**"
       - "explore/linux/**"
       - "explore/macos/**"
-      - "explore/windows/proc_explore.c"
-      - "explore/windows/crystal_spawn_win.cr"
+      - "explore/windows/**"
       - ".github/workflows/explore-matrix.yml"
 
 permissions:
@@ -73,6 +72,30 @@ jobs:
 
       - name: POSIX probes
         run: sh explore/posix/run.sh explore-out
+
+      # Which crash handler a crashing child waits for, and whether RLIMIT_CORE=1 made the kernel skip it (the kernel
+      # logs "has RLIMIT_CORE set to 1 / Aborting core" for every such crash).
+      - name: Linux crash handler details
+        if: runner.os == 'Linux'
+        run: |
+          {
+            echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+            echo "core_pipe_limit: $(cat /proc/sys/kernel/core_pipe_limit)"
+            echo "== coredump.conf"; systemd-analyze cat-config systemd/coredump.conf 2>/dev/null | grep -v '^#' | grep . || cat /etc/systemd/coredump.conf 2>/dev/null
+            echo "== systemd-coredump: $(systemd-coredump --version 2>/dev/null | head -1 || /usr/lib/systemd/systemd-coredump --version 2>/dev/null | head -1)"
+            echo "== kernel log lines about RLIMIT_CORE=1: $(sudo dmesg | grep -c 'has RLIMIT_CORE set to 1')"
+            sudo dmesg | grep -E 'RLIMIT_CORE set to 1|Aborting core|over core_pipe_limit' | tail -6
+            echo "== coredumpctl (last 8)"; coredumpctl list --no-pager 2>/dev/null | tail -8
+          } > explore-out/linux-crash-handler-details.txt 2>&1
+          cat explore-out/linux-crash-handler-details.txt
+
+      - name: macOS Mach exception ports holding a faulting thread
+        if: runner.os == 'macOS'
+        run: |
+          tag="posix-$(uname -s)-$(uname -m)"
+          cc -O1 -Wall -Wextra -pthread -o explore-out/build/mach_exc explore/macos/mach_exc.c
+          ./explore-out/build/mach_exc > "explore-out/$tag-mach_exc.jsonl" 2> "explore-out/$tag-mach_exc.err" || true
+          cat "explore-out/$tag-mach_exc.jsonl"
 
       - name: Process-group signalling matrix and kqueue zombie registration
         run: |
@@ -182,6 +205,7 @@ jobs:
           mkdir -p explore-out/build
           cc -O1 -Wall -Wextra -o explore-out/build/cgroup_explore explore/linux/cgroup_explore.c
           cc -O1 -Wall -Wextra -pthread -o explore-out/build/linux_proc explore/linux/linux_proc.c
+          cc -O1 -Wall -Wextra -pthread -o explore-out/build/linux_extras explore/linux/linux_extras.c
           CRYSTAL_PATH="$PWD/probes/workspace/process-supervision/src:$PWD/probes/workspace/process-handle/src:$(crystal env CRYSTAL_PATH)" \
             crystal build --no-color explore/linux/kit_linux.cr -o explore-out/build/kit_linux
 
@@ -202,6 +226,7 @@ jobs:
           ./explore-out/build/cgroup_explore "$D" > "explore-out/$tag-cgroup_explore.jsonl" 2> "explore-out/$tag-cgroup_explore.err"; echo "cgroup_explore exit=$?"
           ./explore-out/build/linux_proc > "explore-out/$tag-linux_proc.jsonl" 2> "explore-out/$tag-linux_proc.err"; echo "linux_proc exit=$?"
           ./explore-out/build/kit_linux "$D" > "explore-out/$tag-kit_linux.jsonl" 2> "explore-out/$tag-kit_linux.err"; echo "kit_linux exit=$?"
+          ./explore-out/build/linux_extras > "explore-out/$tag-linux_extras.jsonl" 2> "explore-out/$tag-linux_extras.err"; echo "linux_extras exit=$?"
           echo "left in $D: $(ls $D | grep -v '\.' | tr '\n' ' ')"
 
       - name: Show results
@@ -226,7 +251,7 @@ jobs:
   windows:
     name: Windows ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -255,6 +280,9 @@ jobs:
           $vcvars = Join-Path $vs "VC\Auxiliary\Build\${{ matrix.vcvars }}"
           cmd /c "`"$vcvars`" >nul && cl /nologo /O1 /W3 /Fe:explore-out\proc_explore.exe explore\windows\proc_explore.c"
           if (-not (Test-Path explore-out\proc_explore.exe)) { throw "build failed" }
+          cmd /c "`"$vcvars`" >nul && cl /nologo /O1 /W3 /Fe:explore-out\win_more.exe /Fo:explore-out\win_more.obj explore\windows\win_more.c"
+          cmd /c "`"$vcvars`" >nul && cl /nologo /O1 /W3 /LD /Fe:explore-out\detach_dll.dll /Fo:explore-out\detach_dll.obj explore\windows\detach_dll.c"
+          if (-not (Test-Path explore-out\win_more.exe) -or -not (Test-Path explore-out\detach_dll.dll)) { throw "win_more / detach_dll build failed" }
           $id = [Security.Principal.WindowsIdentity]::GetCurrent()
           "user=$($id.Name) arch=$env:PROCESSOR_ARCHITECTURE"
           [Environment]::OSVersion.VersionString
@@ -264,11 +292,52 @@ jobs:
         run: |
           $exe = (Resolve-Path explore-out\proc_explore.exe).Path
           $tag = "windows-${{ matrix.runner }}-elevated"
-          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate", "pipes", "pidreuse", "suspend", "wmclose", "appcontainer", "scale") {
+          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate", "iobw", "pipes", "pidreuse", "suspend", "wmclose", "appcontainer", "scale") {
             $t = [Diagnostics.Stopwatch]::StartNew()
             & $exe $g > "explore-out\$tag-$g.jsonl" 2> "explore-out\$tag-$g.err"
             "$g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-$g.jsonl").Count)"
           }
+
+      # Job priority/affinity semantics, the session's token / window station / desktop, a test service in session 0,
+      # and ExitProcess deadlocks in DLL detach (win_more.c; services need the elevated runner).
+      - name: Run win_more groups (elevated)
+        timeout-minutes: 25
+        run: |
+          $exe = (Resolve-Path explore-out\win_more.exe).Path
+          $tag = "windows-${{ matrix.runner }}-elevated"
+          foreach ($g in "priority", "desktop", "exitproc", "services") {
+            $t = [Diagnostics.Stopwatch]::StartNew()
+            & $exe $g > "explore-out\$tag-win_more-$g.jsonl" 2> "explore-out\$tag-win_more-$g.err"
+            "$g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-win_more-$g.jsonl").Count)"
+          }
+          pwsh -NoProfile -NonInteractive -File explore\windows\pwsh_native.ps1 -Probe $exe > "explore-out\$tag-pwsh_native.jsonl" 2> "explore-out\$tag-pwsh_native.err"
+          "pwsh_native exit=$LASTEXITCODE"
+
+      - name: Session, runner service and crash-reporting settings
+        run: |
+          $out = "explore-out\windows-${{ matrix.runner }}-environment.txt"
+          & {
+            "== process chain from this step"
+            $chain = @()
+            $p = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
+            for ($i = 0; $p -and $i -lt 12; $i++) {
+              "{0,6} {1,-28} session={2} parent={3} created={4}" -f $p.ProcessId, $p.Name, $p.SessionId, $p.ParentProcessId, $p.CreationDate
+              $chain += $p.ProcessId
+              $pp = $p.ParentProcessId
+              if ($chain -contains $pp) { break }
+              $p = Get-CimInstance Win32_Process -Filter "ProcessId=$pp" -ErrorAction SilentlyContinue
+            }
+            "== services hosting a process of that chain, or named like the runner"
+            Get-CimInstance Win32_Service | Where-Object { $chain -contains $_.ProcessId -or $_.Name -match "runner|actions|provision" } |
+              Format-Table Name, State, StartMode, StartName, ProcessId -AutoSize | Out-String -Width 200
+            "== explorer.exe"; Get-Process explorer -ErrorAction SilentlyContinue | Format-Table Id, SessionId -AutoSize | Out-String
+            "== sessions"; query session 2>&1 | Out-String
+            "== autologon"; Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" | Select-Object AutoAdminLogon, DefaultUserName | Format-List | Out-String
+            "== Windows Error Reporting"; Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -ErrorAction SilentlyContinue | Format-List | Out-String
+            "== LocalDumps"; Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps" -ErrorAction SilentlyContinue | Out-String
+            "== service timeouts"; Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" | Select-Object WaitToKillServiceTimeout, ServicesPipeTimeout | Format-List | Out-String
+          } *> $out
+          Get-Content $out
 
       # Windows on Arm runs x64 and x86 programs under emulation: build the same probe for both and compare
       # how jobs, limits and accounting treat an emulated child.
@@ -302,6 +371,30 @@ jobs:
           $t = Get-Content explore-out\launcher-token.jsonl | Select-Object -First 1 | ConvertFrom-Json
           if ($t.token_is_elevated -ne 0) { throw "launcher produced an elevated token" }
 
+      # The Crystal exploration tool's priority experiment, after the union-pointer fix, elevated and de-elevated.
+      - name: job_explore priority (elevated and unelevated)
+        if: matrix.unelevated && steps.launcher.outcome == 'success'
+        timeout-minutes: 10
+        run: |
+          $je = (Resolve-Path explore-out\job_explore.exe).Path
+          & $je priority > "explore-out\windows-${{ matrix.runner }}-elevated-job_explore_priority.jsonl" 2> "explore-out\windows-${{ matrix.runner }}-elevated-job_explore_priority.err"
+          "elevated exit=$LASTEXITCODE"
+          & $je launch-unelevated -- $je priority > "explore-out\windows-${{ matrix.runner }}-unelevated-job_explore_priority.jsonl" 2> "explore-out\windows-${{ matrix.runner }}-unelevated-job_explore_priority.err"
+          "unelevated exit=$LASTEXITCODE"
+
+      # pwsh under the fixed de-elevated token (the first attempts predate the token owner/default-DACL fix).
+      - name: pwsh native commands under the de-elevated token
+        if: matrix.unelevated && steps.launcher.outcome == 'success'
+        timeout-minutes: 5
+        run: |
+          $je = (Resolve-Path explore-out\job_explore.exe).Path
+          $script = (Resolve-Path explore\windows\pwsh_native.ps1).Path
+          $probe = (Resolve-Path explore-out\win_more.exe).Path
+          $pwsh = (Get-Command pwsh).Source
+          & $je launch-unelevated -- $pwsh -NoProfile -NonInteractive -File $script -Probe $probe > "explore-out\windows-${{ matrix.runner }}-unelevated-pwsh_native.jsonl" 2> "explore-out\windows-${{ matrix.runner }}-unelevated-pwsh_native.err"
+          "pwsh_native unelevated exit=$LASTEXITCODE"
+          Get-Content "explore-out\windows-${{ matrix.runner }}-unelevated-pwsh_native.jsonl"
+
       - name: Crystal Process on Windows (crystal_spawn_win)
         if: matrix.unelevated
         run: |
@@ -317,10 +410,16 @@ jobs:
           $exe = (Resolve-Path explore-out\proc_explore.exe).Path
           $je = (Resolve-Path explore-out\job_explore.exe).Path
           $tag = "windows-${{ matrix.runner }}-unelevated"
-          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate", "pipes", "pidreuse", "suspend", "wmclose", "appcontainer", "scale") {
+          foreach ($g in "ctrl", "conpty", "parent", "wait", "rate", "mitigation", "debug", "silo", "period", "iorate", "iobw", "pipes", "pidreuse", "suspend", "wmclose", "appcontainer", "scale") {
             $t = [Diagnostics.Stopwatch]::StartNew()
             & $je launch-unelevated -- $exe $g > "explore-out\$tag-$g.jsonl" 2> "explore-out\$tag-$g.err"
             "$g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-$g.jsonl").Count)"
+          }
+          $wm = (Resolve-Path explore-out\win_more.exe).Path
+          foreach ($g in "priority", "desktop", "exitproc", "services") {
+            $t = [Diagnostics.Stopwatch]::StartNew()
+            & $je launch-unelevated -- $wm $g > "explore-out\$tag-win_more-$g.jsonl" 2> "explore-out\$tag-win_more-$g.err"
+            "win_more $g exit=$LASTEXITCODE seconds=$([int]$t.Elapsed.TotalSeconds) lines=$((Get-Content "explore-out\$tag-win_more-$g.jsonl").Count)"
           }
 
       - name: Show results
@@ -337,5 +436,6 @@ jobs:
           path: |
             explore-out/*.jsonl
             explore-out/*.err
+            explore-out/*.txt
           if-no-files-found: warn
           retention-days: 30

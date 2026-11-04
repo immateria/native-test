@@ -135,12 +135,34 @@ static long read_long_file(const char *path) {
 
 /* Number of tasks owned by this uid as the kernel counts them for RLIMIT_NPROC: processes on macOS; threads
  * (tasks) including zombies on Linux. */
+#ifdef __APPLE__
+/* Entries of a kern.proc listing. Asking for the size with a NULL buffer is NOT a count: XNU's sysdoproc_callback
+ * applies the uid/ruid filter only when there is a buffer, so the estimate covers every process on the machine (plus
+ * KERN_PROCSLOP, 5 entries). An earlier version of this probe used the estimate and concluded that the kernel's
+ * RLIMIT_NPROC count was "half" the listing. With a buffer, the returned length is the real count. */
+static long kinfo_count(int op, int arg, int with_buffer) {
+  int mib[4] = {CTL_KERN, KERN_PROC, op, arg};
+  u_int miblen = op == KERN_PROC_ALL ? 3 : 4;
+  size_t len = 0;
+  if (sysctl(mib, miblen, NULL, &len, NULL, 0) != 0) return -1;
+  if (!with_buffer) return (long)(len / sizeof(struct kinfo_proc));
+  for (int attempt = 0; attempt < 4; attempt++) {
+    len += 64 * sizeof(struct kinfo_proc);
+    struct kinfo_proc *b = malloc(len);
+    if (!b) return -1;
+    size_t got = len;
+    int rc = sysctl(mib, miblen, b, &got, NULL, 0);
+    free(b);
+    if (rc == 0) return (long)(got / sizeof(struct kinfo_proc));
+    if (errno != ENOMEM) return -1;
+  }
+  return -1;
+}
+#endif
+
 static long count_uid_tasks(void) {
 #ifdef __APPLE__
-  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_UID, (int)getuid()};
-  size_t len = 0;
-  if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0) return -1;
-  return (long)(len / sizeof(struct kinfo_proc));
+  return kinfo_count(KERN_PROC_UID, (int)getuid(), 1);
 #else
   DIR *d = opendir("/proc");
   if (!d) return -1;
@@ -161,6 +183,15 @@ static long count_uid_tasks(void) {
   }
   closedir(d);
   return total;
+#endif
+}
+
+static void listing_methods(void) {
+#ifdef __APPLE__
+  emit(PROBE, "process_listing_methods",
+       "\"uid_size_estimate_without_buffer\":%ld,\"uid_entries_with_buffer\":%ld,\"ruid_entries_with_buffer\":%ld,\"all_size_estimate_without_buffer\":%ld,\"all_entries_with_buffer\":%ld,\"note\":\"the size estimate ignores the uid filter (XNU sysdoproc_callback filters only when a buffer is supplied)\"",
+       kinfo_count(KERN_PROC_UID, (int)getuid(), 0), kinfo_count(KERN_PROC_UID, (int)getuid(), 1), kinfo_count(KERN_PROC_RUID, (int)getuid(), 1),
+       kinfo_count(KERN_PROC_ALL, 0, 0), kinfo_count(KERN_PROC_ALL, 0, 1));
 #endif
 }
 
@@ -297,6 +328,7 @@ int main(int argc, char **argv) {
   getrlimit(RLIMIT_NPROC, &rl);
   g_orig_nproc_soft = rl.rlim_cur;
   report_limits();
+  listing_methods();
   concurrent_children();
   zombies();
   spawn_latency();
