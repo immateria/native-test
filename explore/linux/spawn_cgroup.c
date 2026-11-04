@@ -54,7 +54,7 @@ struct clone_args_v2 {
 
 static char g_root[512];   /* the delegated subtree D */
 static char g_self[PATH_MAX];
-static char g_prefix[] = "/sys/fs/cgroup";
+static char g_prefix[512] = "/sys/fs/cgroup";   /* where cgroup2 is mounted; read from mountinfo in main */
 
 typedef struct { double t; int pid; int pad; } rec_t;
 
@@ -115,6 +115,27 @@ static int cgroup_of(pid_t pid, char *out, size_t cap) {
     if (l) l++;
   }
   return -1;
+}
+
+
+/* the cgroup2 mount point (hybrid hosts and containers do not always have it at /sys/fs/cgroup) */
+static void detect_prefix(void) {
+  static char mi[65536];
+  int fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  ssize_t n = read(fd, mi, sizeof mi - 1);
+  close(fd);
+  if (n <= 0) return;
+  mi[n] = 0;
+  for (char *l = strtok(mi, "\n"); l; l = strtok(NULL, "\n")) {
+    char *dash = strstr(l, " - cgroup2 ");
+    if (!dash) continue;
+    char copy[2048], *save = NULL;
+    snprintf(copy, sizeof copy, "%.*s", (int)(dash - l), l);
+    int f = 0;
+    for (char *t = strtok_r(copy, " ", &save); t; t = strtok_r(NULL, " ", &save), f++)
+      if (f == 4) { snprintf(g_prefix, sizeof g_prefix, "%s", t); return; }
+  }
 }
 
 static const char *rel_of(const char *abs) {
@@ -921,6 +942,7 @@ int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: spawn_cgroup <delegated cgroup dir>\n"); return 2; }
   if (!realpath(argv[0], g_self)) snprintf(g_self, sizeof g_self, "%s", argv[0]);
   snprintf(g_root, sizeof g_root, "%s", argv[1]);
+  detect_prefix();
   watchdog(280);
   emit_header(PROBE);
   case_clone3_errors();

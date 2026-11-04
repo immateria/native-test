@@ -10,7 +10,7 @@ on:
       only:
         description: "which jobs to run"
         type: choice
-        options: [all, unix, posix, linux, windows]
+        options: [all, unix, posix, linux, environments, windows]
         default: all
   push:
     paths:
@@ -289,6 +289,165 @@ jobs:
             explore-out/*.jsonl
             explore-out/*.err
             explore-out/*.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The same cgroup and spawn probes inside the environments a library really runs in: no delegation, root, systemd
+  # units with and without Delegate=, a systemd user manager, containers (default / non-root / privileged / other
+  # seccomp), Alpine (musl, busybox sh) and a cgroup v1 hierarchy. Standard hosted runners only; Docker and systemd are
+  # already on the images, nothing here needs a larger runner.
+  environments:
+    name: Environments ${{ matrix.runner }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'environments'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Crystal ${{ env.CRYSTAL_VERSION }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/crystal-lang/crystal/releases/download/${CRYSTAL_VERSION}"
+          case "$(uname -m)" in
+            x86_64)  asset="crystal-${CRYSTAL_VERSION}-1-linux-x86_64.tar.gz";  sum=08b5779df8cf280c4a799599862bbe4d42103ba082aa73429562713c8a9f3b43 ;;
+            aarch64) asset="crystal-${CRYSTAL_VERSION}-1-linux-aarch64.tar.gz"; sum=a37365b79f58d4cd32b6113bbb9983e21eb41d233667e003c019520e3c245e49 ;;
+          esac
+          curl -fsSL -o crystal.tar.gz "$base/$asset"
+          echo "$sum  crystal.tar.gz" | sha256sum -c -
+          tar -xzf crystal.tar.gz -C "$HOME"
+          echo "$HOME/crystal-${CRYSTAL_VERSION}-1/bin" >> "$GITHUB_PATH"
+
+      - name: Platform and build
+        run: |
+          set +e
+          mkdir -p explore-out/build
+          {
+            uname -a; id; cat /etc/os-release | head -2
+            echo "== systemd: $(systemctl --version | head -1)  state: $(systemctl is-system-running)"
+            echo "== self: $(cat /proc/self/cgroup)"
+            echo "== mounts:"; grep cgroup /proc/self/mountinfo
+            echo "== docker:"; docker version --format '{{.Server.Version}}' ; docker info --format 'cgroup {{.CgroupVersion}} driver {{.CgroupDriver}} security {{.SecurityOptions}} runtimes {{.Runtimes}}'
+            echo "== loginctl:"; loginctl list-users --no-legend; loginctl show-user "$(id -un)" 2>&1 | head -5
+            echo "== user@: $(systemctl is-active "user@$(id -u).service" 2>&1)"
+          } > explore-out/env-platform.txt 2>&1
+          cat explore-out/env-platform.txt
+          cc -O1 -Wall -Wextra -o explore-out/build/cgroup_env explore/linux/cgroup_env.c
+          cc -O1 -Wall -Wextra -o explore-out/build/spawn_attrs explore/posix/spawn_attrs.c
+          cc -O1 -Wall -Wextra -o explore-out/build/spawn_cgroup explore/linux/spawn_cgroup.c
+          CRYSTAL_PATH="$PWD/probes/workspace/process-supervision/src:$PWD/probes/workspace/process-handle/src:$(crystal env CRYSTAL_PATH)" \
+            crystal build --no-color explore/linux/kit_linux.cr -o explore-out/build/kit_linux
+          ldd explore-out/build/kit_linux > explore-out/env-kit_linux-ldd.txt 2>&1
+          cat explore-out/env-kit_linux-ldd.txt
+          exit 0
+
+      - name: Host, unprivileged, nothing delegated (the step's own cgroup)
+        run: |
+          set +e
+          sh explore/linux/env_run.sh host-user 2>&1 | tee explore-out/env-host-user.log
+          exit 0
+
+      - name: Host, root
+        run: |
+          set +e
+          sudo -E sh explore/linux/env_run.sh host-root 2>&1 | tee explore-out/env-host-root.log
+          sudo chown -R "$(id -u):$(id -g)" explore-out
+          exit 0
+
+      # transient system services: without Delegate= (the usual User= service), with Delegate=yes, and with a subgroup
+      # for the main process (DelegateSubgroup= needs systemd 254)
+      - name: systemd services as the runner user (no Delegate, Delegate=yes, Delegate=yes + DelegateSubgroup)
+        run: |
+          set +e
+          uid="$(id -u)"; gid="$(id -g)"
+          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p WorkingDirectory="$PWD" -- \
+            sh explore/linux/env_run.sh systemd-service-no-delegate 2>&1 | tee explore-out/env-systemd-service-no-delegate.log
+          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p Delegate=yes -p WorkingDirectory="$PWD" -- \
+            sh explore/linux/env_run.sh systemd-service-delegate-yes 2>&1 | tee explore-out/env-systemd-service-delegate-yes.log
+          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p Delegate=yes -p DelegateSubgroup=supervisor -p WorkingDirectory="$PWD" -- \
+            sh explore/linux/env_run.sh systemd-service-delegate-subgroup 2>&1 | tee explore-out/env-systemd-service-delegate-subgroup.log
+          sudo chown -R "$uid:$gid" explore-out
+          exit 0
+
+      - name: systemd user manager (what a desktop or a lingering user gets)
+        run: |
+          set +e
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$(id -un)"
+          for i in $(seq 1 30); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
+          echo "user manager: $(systemctl is-active "user@$uid.service")  bus socket: $(ls -l /run/user/$uid/bus 2>&1)"
+          export XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus"
+          systemd-run --user --quiet --pipe --wait --collect -p WorkingDirectory="$PWD" -- \
+            sh explore/linux/env_run.sh systemd-user-manager 2>&1 | tee explore-out/env-systemd-user-manager.log
+          exit 0
+
+      - name: Containers (Ubuntu userland of the host's release)
+        run: |
+          set +e
+          REL=$(. /etc/os-release; echo "$VERSION_ID")
+          cat > "$RUNNER_TEMP/Dockerfile" <<EOF
+          FROM ubuntu:$REL
+          RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends libpcre2-8-0 bash ca-certificates > /dev/null && (apt-get install -y -qq --no-install-recommends libgc1 > /dev/null || true) && (apt-get install -y -qq --no-install-recommends libevent-2.1-7 > /dev/null 2>&1 || apt-get install -y -qq --no-install-recommends libevent-2.1-7t64 > /dev/null 2>&1 || true) && rm -rf /var/lib/apt/lists/*
+          EOF
+          sed -i 's/^          //' "$RUNNER_TEMP/Dockerfile"
+          docker build -q -t envprobe -f "$RUNNER_TEMP/Dockerfile" "$RUNNER_TEMP" > /dev/null || echo "docker build failed"
+          run() { name=$1; shift; docker run --rm "$@" -v "$PWD":/w -w /w envprobe sh explore/linux/env_run.sh "$name" 2>&1 | tee "explore-out/env-$name.log"; }
+          run docker-default-root
+          run docker-default-nonroot --user "$(id -u):$(id -g)"
+          run docker-seccomp-unconfined-root --security-opt seccomp=unconfined
+          run docker-privileged-root --privileged
+          run docker-privileged-host-cgroupns --privileged --cgroupns=host
+          sudo chown -R "$(id -u):$(id -g)" explore-out
+          exit 0
+
+      - name: Alpine containers (musl libc, busybox sh)
+        run: |
+          set +e
+          for mode in default privileged; do
+            extra=""; [ "$mode" = privileged ] && extra="--privileged"
+            docker run --rm $extra -v "$PWD":/w -w /w alpine:3.20 sh explore/linux/env_alpine.sh "alpine-$mode" 2>&1 | tee "explore-out/env-alpine-$mode.log"
+          done
+          sudo chown -R "$(id -u):$(id -g)" explore-out
+          exit 0
+
+      - name: A cgroup v1 (named) hierarchy handed to the shard
+        run: |
+          set +e
+          sudo mkdir -p /mnt/cgv1
+          if sudo mount -t cgroup -o none,name=envprobe cgroup /mnt/cgv1; then
+            sudo mkdir /mnt/cgv1/x
+            sudo ./explore-out/build/kit_linux /mnt/cgv1/x > explore-out/env-cgroup-v1-named-kit_linux.jsonl 2> explore-out/env-cgroup-v1-named-kit_linux.err
+            sudo ./explore-out/build/cgroup_env > explore-out/env-cgroup-v1-named-note.txt 2>&1 || true
+            sudo umount /mnt/cgv1
+          else
+            echo "mounting a named v1 hierarchy failed" | tee explore-out/env-cgroup-v1-named-kit_linux.jsonl
+          fi
+          sudo chown -R "$(id -u):$(id -g)" explore-out
+          exit 0
+
+      - name: Show results
+        if: always()
+        run: |
+          for f in explore-out/env-*-cgroup_env.jsonl; do
+            echo "=== $f"
+            grep -E '"case":"(identity|own_cgroup|syscalls|create_in_[a-z_]*|move_self|summary)"' "$f" | cut -c1-520
+          done
+          for f in explore-out/env-*.err; do [ -s "$f" ] && { echo "=== $f"; head -c 800 "$f"; }; done
+          exit 0
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: environments-${{ matrix.runner }}
+          path: |
+            explore-out/env-*
           if-no-files-found: warn
           retention-days: 30
 
