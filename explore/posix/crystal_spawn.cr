@@ -19,7 +19,12 @@ def emit(kase : String, &)
     j.object do
       j.field "probe", PROBE
       j.field "case", kase
-      yield j
+      begin
+        yield j
+      rescue ex
+        # record and carry on: one surprising case must not hide the rest
+        j.field "unhandled_error", "#{ex.class}: #{ex.message}"
+      end
     end
   end
   puts line
@@ -100,6 +105,26 @@ emit("setpgid_by_parent_after_Process_new") do |j|
   j.field "setpgid_other", other
   j.field "child_is_own_group_leader_afterwards", alone
 end
+
+# The first CI run passed a relative path (explore-out/build/sigstate) and chdir: "/tmp" failed with
+# File::NotFoundError: the command path is resolved after the child has changed directory.
+relative = sigstate
+absolute = File.expand_path(sigstate)
+emit("relative_command_path_with_chdir") do |j|
+  j.field "command", relative
+  j.field "command_is_relative", !relative.starts_with?('/')
+  j.field "relative_from_new_dir_exists", File.exists?(File.join("/tmp", relative))
+  begin
+    status, _ = run_dump(relative, chdir: "/tmp")
+    j.field "outcome", "spawned"
+    j.field "status", status.to_s
+  rescue ex
+    j.field "outcome", "raised"
+    j.field "exception", ex.class.name
+    j.field "message", ex.message
+  end
+end
+sigstate = absolute
 
 emit("chdir_tmp") do |j|
   status, text = run_dump(sigstate, chdir: "/tmp")

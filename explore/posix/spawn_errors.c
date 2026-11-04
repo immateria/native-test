@@ -32,7 +32,8 @@ static int forkexec_try(const char *path, char *const argv[], char *const envp[]
   if (p == 0) {
     int out = open("/dev/null", O_WRONLY);
     dup2(out, 1); dup2(out, 2);
-    if (use_path) execvpe(path, argv, envp); else execve(path, argv, envp);
+    /* execvpe is glibc-only; execvp after replacing environ is the portable equivalent */
+    if (use_path) { environ = (char **)envp; execvp(path, argv); } else execve(path, argv, envp);
     int e = errno;
     (void)!write(ep[1], &e, sizeof e);
     _exit(127);

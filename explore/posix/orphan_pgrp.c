@@ -78,14 +78,16 @@ static void run_variant(const variant_t *v) {
   double t_end = now_ms();
   pid_t pgrp_c = getpgid(C);
   int sess_c = (int)getsid(C);
-  int alive_probe = kill(C, 0) == 0;
+  int alive_probe = kill(C, 0) == 0; /* pipe EOF comes before the reaper has collected the zombie */
+  sleep_ms(150);
+  int alive_later = kill(C, 0) == 0;
   emit(PROBE, v->name,
        "\"own_session\":%d,\"child_own_group\":%d,\"child_stopped\":%d,\"hup_mode\":\"%s\",\"supervisor_exit\":\"%s\","
        "\"supervisor_status\":\"%s\",\"letters\":\"%s\",\"child_terminated\":%s,\"kill0_succeeds_after\":%s,"
-       "\"child_pgrp_is_own_pid\":%s,\"child_session_same_as_driver\":%s,\"window_ms\":%.0f,\"setup_ms\":%.0f",
+       "\"kill0_succeeds_150ms_later\":%s,\"child_pgrp_is_own_pid\":%s,\"child_session_same_as_driver\":%s,\"window_ms\":%.0f,\"setup_ms\":%.0f",
        v->own_session, v->child_group, v->stop_child, v->hup_mode == 0 ? "default" : v->hup_mode == 1 ? "handler" : "ignore",
        v->exit_mode == 0 ? "exit" : v->exit_mode == 1 ? "sigkill" : "alive", pst, letters, eof ? "true" : "false",
-       alive_probe ? "true" : "false", pgrp_c == C ? "true" : "false", sess_c == (int)getsid(0) ? "true" : "false",
+       alive_probe ? "true" : "false", alive_later ? "true" : "false", pgrp_c == C ? "true" : "false", sess_c == (int)getsid(0) ? "true" : "false",
        t_end - t_signal, t_signal - t0);
   kill(C, SIGKILL);
   if (v->exit_mode == 2) { kill(P, SIGKILL); reap_blocking(P, 1000, pst, sizeof pst); }

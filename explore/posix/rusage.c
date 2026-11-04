@@ -115,7 +115,7 @@ static int proc_io(pid_t pid, long long *rd, long long *wr, int *err) {
 
 static void observe_live(const char *kase, const char *when, pid_t pid) {
 #ifdef __APPLE__
-  struct rusage_info_current ri;
+  rusage_info_current ri; /* a typedef (of struct rusage_info_vN) on macOS, not a struct tag */
   memset(&ri, 0, sizeof ri);
   int rc = proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, (rusage_info_t *)&ri);
   int e = errno;

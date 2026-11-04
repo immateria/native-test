@@ -92,39 +92,90 @@ static void exp_inherit(void) {
   emit(PROBE, "inherit_posix_spawn", "\"posix_spawn_rc\":\"%s\",\"child_printed\":%s", errno_name(rc), buf[0] ? buf : "null");
 }
 
+/* RLIMIT_CPU with soft 1 s / hard 3 s. The first CI run had Apple Silicon never enforce it while Intel
+ * macOS and Linux did, so each variant runs in two spin styles: "user" burns pure user time (CPU time is
+ * sampled with getrusage every ~2^22 iterations), "syscall" calls clock_gettime(CLOCK_PROCESS_CPUTIME_ID)
+ * in a tight loop (mostly system time on macOS). The parent reaps with wait4 and reports the CPU time
+ * the child had consumed when it died. */
 static volatile sig_atomic_t g_xcpu = 0;
 static void on_xcpu(int s) { (void)s; g_xcpu++; }
 
-static void spin_cpu_limit(int ignore_xcpu, const char *kase) {
+static double ru_cpu_ms(const struct rusage *ru) {
+  return ru->ru_utime.tv_sec * 1000.0 + ru->ru_utime.tv_usec / 1000.0 + ru->ru_stime.tv_sec * 1000.0 + ru->ru_stime.tv_usec / 1000.0;
+}
+
+static double self_cpu_ms(void) {
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  return ru_cpu_ms(&ru);
+}
+
+/* mode: 0 default action, 1 ignored, 2 handler; style: 0 user, 1 syscall */
+static void spin_cpu_limit(int mode, int style, const char *kase) {
   struct rlimit rl = {1, 3};
-  setrlimit(RLIMIT_CPU, &rl);
+  int sr = setrlimit(RLIMIT_CPU, &rl);
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
-  if (ignore_xcpu == 1) { sa.sa_handler = SIG_IGN; sigaction(SIGXCPU, &sa, NULL); }
-  else if (ignore_xcpu == 2) { sa.sa_handler = on_xcpu; sigaction(SIGXCPU, &sa, NULL); }
+  if (mode == 1) { sa.sa_handler = SIG_IGN; sigaction(SIGXCPU, &sa, NULL); }
+  else if (mode == 2) { sa.sa_handler = on_xcpu; sigaction(SIGXCPU, &sa, NULL); }
   double t0 = now_ms();
+  double first_xcpu_cpu_ms = -1;
+  volatile unsigned long x = 0;
   struct timespec ts;
   for (;;) {
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
-    if (ts.tv_sec >= 8) break; /* give up; the limit never fired */
-    if (ignore_xcpu == 2 && g_xcpu && ((long)(now_ms() - t0) % 1000) == 0) { /* keep spinning */ }
+    double cpu;
+    if (style == 0) {
+      for (unsigned long i = 0; i < (1UL << 22); i++) x += i;
+      cpu = self_cpu_ms();
+    } else {
+      clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+      cpu = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+    }
+    if (g_xcpu && first_xcpu_cpu_ms < 0) {
+      first_xcpu_cpu_ms = self_cpu_ms(); /* reported now: the hard limit may kill us before the end */
+      emit(PROBE, "cpu_limit_first_sigxcpu", "\"variant\":\"%s\",\"cpu_ms\":%.0f,\"wall_ms\":%.0f", kase, first_xcpu_cpu_ms, now_ms() - t0);
+    }
+    if (cpu >= 8000) break; /* give up; the limit never ended the process */
   }
-  emit(PROBE, kase, "\"outcome\":\"limit never terminated the process within 8 s of CPU\",\"xcpu_handler_calls\":%d,\"wall_ms\":%.0f", (int)g_xcpu, now_ms() - t0);
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  emit(PROBE, kase, "\"setrlimit\":\"%s\",\"outcome\":\"survived 8 s of CPU\",\"xcpu_handler_calls\":%d,\"cpu_ms_at_first_xcpu\":%.0f,"
+       "\"user_ms\":%.0f,\"system_ms\":%.0f,\"wall_ms\":%.0f",
+       sr == 0 ? "OK" : errno_name(errno), (int)g_xcpu, first_xcpu_cpu_ms, ru.ru_utime.tv_sec * 1000.0 + ru.ru_utime.tv_usec / 1000.0,
+       ru.ru_stime.tv_sec * 1000.0 + ru.ru_stime.tv_usec / 1000.0, now_ms() - t0);
 }
-static void exp_cpu_default(void) { spin_cpu_limit(0, "cpu_limit_default_sigxcpu"); }
-static void exp_cpu_ignored(void) { spin_cpu_limit(1, "cpu_limit_sigxcpu_ignored"); }
 
-static void run_cpu_trio(void) {
-  /* run concurrently so the whole experiment costs ~4 s of wall time */
-  double t0 = now_ms();
-  fflush(stdout);
-  pid_t a = fork_run(exp_cpu_default), b = fork_run(exp_cpu_ignored);
-  char sa_[64], sb_[64];
-  double ta = 0, tb = 0;
-  reap_blocking(a, 12000, sa_, sizeof sa_); ta = now_ms() - t0;
-  reap_blocking(b, 12000, sb_, sizeof sb_); tb = now_ms() - t0;
-  emit(PROBE, "cpu_limit_soft1_hard3", "\"default_action_status\":\"%s\",\"default_action_wall_ms\":%.0f,"
-       "\"sigxcpu_ignored_status\":\"%s\",\"sigxcpu_ignored_wall_ms\":%.0f", sa_, ta, sb_, tb);
+static void run_cpu_variants(void) {
+  static const struct { int mode, style; const char *name; } v[] = {
+    {0, 0, "cpu_limit_default_action_user_spin"},
+    {1, 0, "cpu_limit_sigxcpu_ignored_user_spin"},
+    {2, 0, "cpu_limit_sigxcpu_handler_user_spin"},
+    {0, 1, "cpu_limit_default_action_syscall_spin"},
+    {1, 1, "cpu_limit_sigxcpu_ignored_syscall_spin"},
+    {2, 1, "cpu_limit_sigxcpu_handler_syscall_spin"},
+  };
+  /* two at a time: hosted runners have 3-4 cores, and CPU limits do not care about wall time */
+  for (size_t i = 0; i < sizeof v / sizeof v[0]; i += 2) {
+    pid_t pids[2];
+    double t0 = now_ms();
+    for (int k = 0; k < 2; k++) {
+      fflush(stdout);
+      pids[k] = fork();
+      if (pids[k] == 0) { spin_cpu_limit(v[i + k].mode, v[i + k].style, v[i + k].name); fflush(stdout); _exit(0); }
+    }
+    for (int n = 0; n < 2; n++) {
+      int st = 0;
+      struct rusage ru;
+      memset(&ru, 0, sizeof ru);
+      pid_t r = wait4(-1, &st, 0, &ru); /* whichever ends first, so wall_ms is that child's */
+      int k = r == pids[0] ? 0 : 1;
+      char sbuf[64] = "";
+      if (r > 0) status_text(st, sbuf, sizeof sbuf);
+      emit(PROBE, "cpu_limit_result", "\"variant\":\"%s\",\"status\":\"%s\",\"child_cpu_ms_at_death\":%.0f,\"child_user_ms\":%.0f,\"child_system_ms\":%.0f,\"wall_ms\":%.0f",
+           v[i + k].name, sbuf, ru_cpu_ms(&ru), ru.ru_utime.tv_sec * 1000.0 + ru.ru_utime.tv_usec / 1000.0,
+           ru.ru_stime.tv_sec * 1000.0 + ru.ru_stime.tv_usec / 1000.0, now_ms() - t0);
+    }
+  }
 }
 
 static void nofile_exhausted(int cloexec, const char *kase) {
@@ -275,13 +326,13 @@ int main(int argc, char **argv) {
   if (!realpath(argv[0], g_self)) snprintf(g_self, sizeof g_self, "%s", argv[0]);
   if (argc > 2 && strcmp(argv[1], "--print-limits") == 0) return print_limits(argv[2]);
   if (argc > 1 && strcmp(argv[1], "--noop") == 0) return 0;
-  watchdog(120);
+  watchdog(150);
   emit_header(PROBE);
   char b[2048];
   limits_json(b, sizeof b);
   emit(PROBE, "defaults_soft_slash_hard", "%s", b);
   wait_report(fork_run(exp_inherit), "inherit", 8000);
-  run_cpu_trio();
+  run_cpu_variants();
   wait_report(fork_run(exp_nofile_leaky), "nofile", 8000);
   wait_report(fork_run(exp_nofile_cloexec), "nofile", 8000);
   wait_report(fork_run(exp_nofile_infinity), "nofile_inf", 8000);

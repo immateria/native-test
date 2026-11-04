@@ -65,6 +65,15 @@ static void emit(const char *kase, const char *fmt, ...) {
 
 static const char *bstr(int b) { return b ? "true" : "false"; }
 
+static double ft_ms(FILETIME f) { ULARGE_INTEGER u; u.LowPart = f.dwLowDateTime; u.HighPart = f.dwHighDateTime; return (double)u.QuadPart / 10000.0; }
+
+/* kernel exit time of an exited process minus t_ref (both ms since 1601); -1 if it has not exited */
+static double exit_after(HANDLE h, double t_ref) {
+  FILETIME c, x, k, u;
+  if (WaitForSingleObject(h, 0) != WAIT_OBJECT_0 || !GetProcessTimes(h, &c, &x, &k, &u)) return -1;
+  return ft_ms(x) - t_ref;
+}
+
 static wchar_t g_self[MAX_PATH * 2];
 static wchar_t g_tmp[MAX_PATH * 2];
 
@@ -233,14 +242,20 @@ static int child_crash(int nogpfault) {
 /* a debugger that owns one sleeping child; used to test "debuggee dies with its debugger" */
 static int child_debugger(const wchar_t *logpath, int kill_on_exit) {
   HANDLE log = open_log(logpath);
-  if (!kill_on_exit) DebugSetProcessKillOnExit(FALSE);
+  BOOL early = TRUE;
+  DWORD early_err = 0;
+  if (kill_on_exit == 2) { early = DebugSetProcessKillOnExit(FALSE); early_err = early ? 0 : GetLastError(); } /* before any debug object exists */
   PROCESS_INFORMATION pi;
   DWORD err;
   if (!spawn_self(L"--child-sleep 60000", DEBUG_ONLY_THIS_PROCESS, NULL, &pi, &err)) {
     log_to(log, "ready spawn_failed=%lu\n", (unsigned long)err);
     return 1;
   }
-  log_to(log, "ready child=%lu\n", (unsigned long)pi.dwProcessId);
+  BOOL set = TRUE;
+  DWORD set_err = 0;
+  if (kill_on_exit == 0) { set = DebugSetProcessKillOnExit(FALSE); set_err = set ? 0 : GetLastError(); }
+  log_to(log, "ready child=%lu early_call_ok=%d early_err=%lu late_call_ok=%d late_err=%lu\n", (unsigned long)pi.dwProcessId, early != FALSE,
+         (unsigned long)early_err, set != FALSE, (unsigned long)set_err);
   DEBUG_EVENT de;
   for (;;) {
     if (!WaitForDebugEvent(&de, INFINITE)) break;
@@ -308,7 +323,6 @@ static void run_ctrl_case(const ctrl_case_t *c, int idx) {
   }
   int exited;
   DWORD code = wait_exit(pi.hProcess, 2500, &exited);
-  double t_exit = abs_ms();
   char evs[512];
   int saw;
   int n = events_text(log, t_send, evs, sizeof evs, &saw);
@@ -316,7 +330,7 @@ static void run_ctrl_case(const ctrl_case_t *c, int idx) {
        "\"parent_has_console\":%s,\"child\":\"%s\",\"send\":\"%s\",\"send_result\":\"%s\",\"events_received\":%d,\"events\":\"%s\","
        "\"child_exited_within_2500ms\":%s,\"child_exit_code\":\"0x%08lX\",\"ms_to_exit\":%.0f",
        bstr(parent_has_console()), info, c->send, send_result, n, evs, bstr(exited), (unsigned long)(exited ? code : 0),
-       exited ? t_exit - t_send : -1.0);
+       exit_after(pi.hProcess, t_send));
   kill_close(&pi);
 }
 
@@ -436,14 +450,13 @@ static void run_conpty_case(const char *name, const wchar_t *child_mode, const c
   }
   int exited;
   DWORD code = wait_exit(pi.hProcess, strcmp(action, "close") == 0 ? 12000 : 2500, &exited);
-  double t_exit = abs_ms();
   char evs[512];
   int saw;
   int n = events_text(log, t_send, evs, sizeof evs, &saw);
   emit(name,
        "\"child\":\"%s\",\"action\":\"%s\",\"action_result\":\"%s\",\"close_returned\":%s,\"close_ms\":%.0f,\"events_received\":%d,\"events\":\"%s\","
        "\"child_exited\":%s,\"child_exit_code\":\"0x%08lX\",\"ms_to_exit\":%.0f",
-       info, action, what, bstr(close_returned), close_ms, n, evs, bstr(exited), (unsigned long)(exited ? code : 0), exited ? t_exit - t_send : -1.0);
+       info, action, what, bstr(close_returned), close_ms, n, evs, bstr(exited), (unsigned long)(exited ? code : 0), exit_after(pi.hProcess, t_send));
   kill_close(&pi);
   CloseHandle(in_w);
   if (hpc) closepc(hpc);
@@ -521,6 +534,8 @@ static void probe_parent(void) {
   /* parent = a process we did not create */
   const wchar_t *targets[] = {L"explorer.exe", L"services.exe", L"winlogon.exe", L"svchost.exe"};
   DWORD our_parent = parent_pid_of(GetCurrentProcessId());
+  DWORD our_session = 0xFFFFFFFF;
+  ProcessIdToSessionId(GetCurrentProcessId(), &our_session);
   DWORD pids[5] = {our_parent, 0, 0, 0, 0};
   const wchar_t *names[5] = {L"our_parent", L"explorer.exe", L"services.exe", L"winlogon.exe", L"svchost.exe"};
   for (int i = 0; i < 4; i++) pids[i + 1] = find_process(targets[i]);
@@ -532,18 +547,21 @@ static void probe_parent(void) {
     DWORD oe = h ? 0 : GetLastError();
     int spawned = 0;
     DWORD se = 0;
-    DWORD reported = 0;
+    DWORD reported = 0, child_session = 0xFFFFFFFF, target_session = 0xFFFFFFFF;
+    ProcessIdToSessionId(pids[i], &target_session);
     if (h) {
       LPPROC_THREAD_ATTRIBUTE_LIST a2 = make_attrs(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &h, sizeof(HANDLE));
       PROCESS_INFORMATION x;
       spawned = a2 && spawn_self(L"--child-sleep 2000", 0, a2, &x, &se);
       if (!a2) se = GetLastError();
-      if (spawned) { reported = parent_pid_of(x.dwProcessId); kill_close(&x); }
+      if (spawned) { reported = parent_pid_of(x.dwProcessId); ProcessIdToSessionId(x.dwProcessId, &child_session); kill_close(&x); }
       if (a2) DeleteProcThreadAttributeList(a2);
       CloseHandle(h);
     }
-    emit(nm, "\"present\":true,\"OpenProcess_PROCESS_CREATE_PROCESS_ok\":%s,\"OpenProcess_err\":%lu,\"spawn_with_this_parent_ok\":%s,\"spawn_err\":%lu,\"child_reports_that_parent\":%s",
-         bstr(h != NULL), (unsigned long)oe, bstr(spawned), (unsigned long)se, bstr(spawned && reported == pids[i]));
+    emit(nm, "\"present\":true,\"OpenProcess_PROCESS_CREATE_PROCESS_ok\":%s,\"OpenProcess_err\":%lu,\"spawn_with_this_parent_ok\":%s,\"spawn_err\":%lu,\"child_reports_that_parent\":%s,"
+         "\"target_pid\":%lu,\"child_reported_parent_pid\":%lu,\"target_session\":%ld,\"child_session\":%ld,\"our_session\":%ld",
+         bstr(h != NULL), (unsigned long)oe, bstr(spawned), (unsigned long)se, bstr(spawned && reported == pids[i]),
+         (unsigned long)pids[i], (unsigned long)reported, (long)target_session, (long)child_session, (long)our_session);
   }
   CloseHandle(job);
 }
@@ -551,8 +569,6 @@ static void probe_parent(void) {
 /* ------------------------------------------------------------------ waits */
 static volatile LONG g_fired;
 static VOID CALLBACK wait_cb(PVOID ctx, BOOLEAN timed_out) { (void)ctx; if (!timed_out) InterlockedIncrement(&g_fired); }
-
-static double ft_ms(FILETIME f) { ULARGE_INTEGER u; u.LowPart = f.dwLowDateTime; u.HighPart = f.dwHighDateTime; return (double)u.QuadPart / 10000.0; }
 
 static void probe_wait(void) {
   HANDLE ev[70];
@@ -592,7 +608,8 @@ static void probe_wait(void) {
   }
   char seq[128] = "";
   size_t sl = 0;
-  double max_lat = 0;
+  double max_lat = 0, prev_exit = 0;
+  int in_exit_order = 1;
   int n = 8;
   while (n > 0) {
     DWORD w = WaitForMultipleObjects(n, hs, FALSE, 5000);
@@ -602,12 +619,15 @@ static void probe_wait(void) {
     FILETIME c, x, kt, ut;
     GetProcessTimes(hs[k], &c, &x, &kt, &ut);
     double lat = woke - ft_ms(x);
+    if (ft_ms(x) < prev_exit) in_exit_order = 0;
+    prev_exit = ft_ms(x);
     if (lat > max_lat) max_lat = lat;
     sl += (size_t)snprintf(seq + sl, sizeof seq - sl, "%s%d", sl ? "," : "", orig[k]);
     hs[k] = hs[n - 1]; orig[k] = orig[n - 1];
     n--;
   }
-  emit("wait_any_over_eight_processes", "\"exit_order_by_start_index\":\"%s\",\"expected\":\"7,6,5,4,3,2,1,0\",\"max_ms_between_process_exit_time_and_wakeup\":%.1f", seq, max_lat);
+  emit("wait_any_over_eight_processes", "\"wake_order_by_start_index\":\"%s\",\"if_started_instantly\":\"7,6,5,4,3,2,1,0\",\"wakeups_in_kernel_exit_time_order\":%s,"
+       "\"max_ms_between_process_exit_time_and_wakeup\":%.1f", seq, bstr(in_exit_order), max_lat);
   for (int i = 0; i < 8; i++) { CloseHandle(pis[i].hProcess); CloseHandle(pis[i].hThread); }
 
   /* registered waits at scale */
@@ -634,6 +654,7 @@ static void probe_wait(void) {
   /* is a job handle ever signaled? time limit with POST vs TERMINATE at end of job */
   HANDLE jobs[2];
   PROCESS_INFORMATION jp[2];
+  HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
   for (int i = 0; i < 2; i++) {
     jobs[i] = CreateJobObjectW(NULL, NULL);
     JOBOBJECT_BASIC_LIMIT_INFORMATION bl;
@@ -644,6 +665,12 @@ static void probe_wait(void) {
     JOBOBJECT_END_OF_JOB_TIME_INFORMATION eoj;
     eoj.EndOfJobTimeAction = i == 0 ? JOB_OBJECT_POST_AT_END_OF_JOB : JOB_OBJECT_TERMINATE_AT_END_OF_JOB;
     BOOL s2 = SetInformationJobObject(jobs[i], JobObjectEndOfJobTimeInformation, &eoj, sizeof eoj);
+    if (i == 0) {
+      JOBOBJECT_ASSOCIATE_COMPLETION_PORT acp;
+      acp.CompletionKey = (PVOID)(ULONG_PTR)0x77;
+      acp.CompletionPort = port;
+      SetInformationJobObject(jobs[i], JobObjectAssociateCompletionPortInformation, &acp, sizeof acp);
+    }
     DWORD se;
     spawn_self(L"--child-spin", CREATE_SUSPENDED, NULL, &jp[i], &se);
     BOOL as = AssignProcessToJobObject(jobs[i], jp[i].hProcess);
@@ -662,10 +689,22 @@ static void probe_wait(void) {
     else break;
   }
   int alive0 = WaitForSingleObject(jp[0].hProcess, 0) == WAIT_TIMEOUT, alive1 = WaitForSingleObject(jp[1].hProcess, 0) == WAIT_TIMEOUT;
+  char msgs[256] = "";
+  size_t ml = 0;
+  DWORD msg;
+  ULONG_PTR key;
+  LPOVERLAPPED ov;
+  while (GetQueuedCompletionStatus(port, &msg, &key, &ov, 0)) ml += (size_t)snprintf(msgs + ml, sizeof msgs - ml, "%s%lu", ml ? "," : "", (unsigned long)msg);
+  JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+  memset(&acct, 0, sizeof acct);
+  QueryInformationJobObject(jobs[0], JobObjectBasicAccountingInformation, &acct, sizeof acct, NULL);
   emit("job_handle_signaled_at_time_limit",
-       "\"post_at_end_of_job_signaled_ms\":%.0f,\"post_at_end_of_job_child_alive\":%s,\"terminate_at_end_of_job_signaled_ms\":%.0f,\"terminate_at_end_of_job_child_alive\":%s,\"note\":\"-1 = never signaled within the wait\"",
-       sig[0], bstr(alive0), sig[1], bstr(alive1));
+       "\"post_at_end_of_job_signaled_ms\":%.0f,\"post_at_end_of_job_child_alive\":%s,\"post_job_port_messages\":\"%s\",\"post_job_user_ms\":%.0f,"
+       "\"terminate_at_end_of_job_signaled_ms\":%.0f,\"terminate_at_end_of_job_child_alive\":%s,"
+       "\"note\":\"-1 = never signaled within the wait; port messages: 1 END_OF_JOB_TIME, 2 END_OF_PROCESS_TIME, 4 ACTIVE_PROCESS_ZERO, 6 NEW_PROCESS, 7 EXIT_PROCESS\"",
+       sig[0], bstr(alive0), msgs, (double)acct.TotalUserTime.QuadPart / 10000.0, sig[1], bstr(alive1));
   for (int i = 0; i < 2; i++) { kill_close(&jp[i]); CloseHandle(jobs[i]); }
+  CloseHandle(port);
   for (int i = 0; i < 70; i++) CloseHandle(ev[i]);
   for (int i = 0; i < 4; i++) CloseHandle(all[i]);
 }
@@ -713,10 +752,12 @@ static void probe_rate(void) {
       DWORD le = GetLastError();
       MY_IO_RATE *blocks = NULL;
       ULONG count = 0;
+      SetLastError(0);
       DWORD qr = queryio ? queryio(job, NULL, &blocks, &count) : 0xFFFFFFFF;
+      DWORD qe = GetLastError();
       emit(i == 0 ? "io_rate_control_enable" : "io_rate_control_enable_standalone_volume",
-           "\"set_return\":%lu,\"last_error\":%lu,\"query_return\":%lu,\"query_block_count\":%lu,\"first_block_max_iops\":%lld",
-           (unsigned long)ret, (unsigned long)le, (unsigned long)qr, (unsigned long)count, (long long)(blocks && count ? blocks[0].MaxIops : -1));
+           "\"set_return\":%lu,\"last_error\":%lu,\"query_return\":%lu,\"query_last_error\":%lu,\"query_block_count\":%lu,\"first_block_max_iops\":%lld",
+           (unsigned long)ret, (unsigned long)le, (unsigned long)qr, (unsigned long)qe, (unsigned long)count, (long long)(blocks && count ? blocks[0].MaxIops : -1));
     }
   }
   CloseHandle(job);
@@ -838,8 +879,11 @@ static void debugger_dies_case(const char *name, int kill_on_exit) {
   double dt = abs_ms() - t0;
   DWORD code = 0;
   if (ch) GetExitCodeProcess(ch, &code);
-  emit(name, "\"debugger_calls_DebugSetProcessKillOnExit_FALSE\":%s,\"debuggee_alive_before\":%s,\"debuggee_died_after_debugger_was_terminated\":%s,\"ms\":%.0f,\"debuggee_exit_code\":\"0x%08lX\"",
-       bstr(!kill_on_exit), bstr(alive_before), bstr(died), died ? dt : -1.0, (unsigned long)(died ? code : 0));
+  char *rl = strstr(b, "early_call_ok");
+  char helper_said[160] = "";
+  if (rl) { snprintf(helper_said, sizeof helper_said, "%s", rl); helper_said[strcspn(helper_said, "\r\n")] = 0; }
+  emit(name, "\"kill_on_exit_mode\":%d,\"helper\":\"%s\",\"debuggee_alive_before\":%s,\"debuggee_died_after_debugger_was_terminated\":%s,\"ms\":%.0f,\"debuggee_exit_code\":\"0x%08lX\"",
+       kill_on_exit, helper_said, bstr(alive_before), bstr(died), died ? dt : -1.0, (unsigned long)(died ? code : 0));
   if (ch) { TerminateProcess(ch, 1); CloseHandle(ch); }
   kill_close(&helper);
 }
@@ -850,6 +894,7 @@ static void probe_debug(void) {
   debug_crash_case();
   debugger_dies_case("debuggee_when_its_debugger_is_terminated_default", 1);
   debugger_dies_case("debuggee_when_its_debugger_is_terminated_kill_on_exit_false", 0);
+  debugger_dies_case("debuggee_when_its_debugger_is_terminated_kill_on_exit_false_called_too_early", 2);
 }
 
 /* ------------------------------------------------------------------ silo */
@@ -858,10 +903,24 @@ static void probe_silo(void) {
   typedef LONG(NTAPI * PFN_NtSetInformationJobObject)(HANDLE, int, PVOID, ULONG);
   PFN_NtSetInformationJobObject f = (PFN_NtSetInformationJobObject)(void *)GetProcAddress(nt, "NtSetInformationJobObject");
   if (!f) { emit("silo_create", "\"unsupported\":\"NtSetInformationJobObject not found\""); return; }
-  HANDLE job = CreateJobObjectW(NULL, NULL);
-  LONG st = f(job, 35 /* JobObjectCreateSilo */, NULL, 0);
-  emit("silo_create_application_silo", "\"ntstatus\":\"0x%08lX\",\"note\":\"0 = created; 0xC0000022 = access denied; 0xC0000003 = information class not valid\"", (unsigned long)st);
-  CloseHandle(job);
+  for (int variant = 0; variant < 3; variant++) {
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    BOOL ready = TRUE;
+    DWORD ready_err = 0;
+    if (variant >= 1) {
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION ex;
+      memset(&ex, 0, sizeof ex);
+      ex.BasicLimitInformation.LimitFlags = 0x00400000; /* JOB_OBJECT_LIMIT_SILO_READY */
+      ready = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &ex, sizeof ex);
+      ready_err = ready ? 0 : GetLastError();
+    }
+    char dummy[8] = {0};
+    LONG st = variant == 2 ? f(job, 35, dummy, 0) : f(job, 35 /* JobObjectCreateSilo */, NULL, 0);
+    emit(variant == 0 ? "silo_create_plain_job" : variant == 1 ? "silo_create_after_LIMIT_SILO_READY" : "silo_create_after_LIMIT_SILO_READY_nonnull_buffer",
+         "\"silo_ready_set_ok\":%s,\"silo_ready_err\":%lu,\"ntstatus\":\"0x%08lX\",\"note\":\"0 = created; 0xC0000022 access denied; 0xC0000003 class not valid; 0xC000000D invalid parameter\"",
+         bstr(ready), (unsigned long)ready_err, (unsigned long)st);
+    CloseHandle(job);
+  }
 }
 
 /* ------------------------------------------------------------------ job CPU-time enforcement period */
