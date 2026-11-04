@@ -207,6 +207,7 @@ static void suspended_case(const char *name, int action) {
   char end[96] = "";
   size_t after = 0;
   int alive_after_term = -1;
+  char term_status[64] = "-";
   if (action == 0) {
     kill(pid, SIGCONT);
     after = drain_until(p[0], buf, sizeof buf, 2000, &eof);
@@ -217,10 +218,14 @@ static void suspended_case(const char *name, int action) {
   } else {
     kill(pid, SIGTERM);
     sleep_ms(150);
-    alive_after_term = waitpid(pid, &st, WNOHANG) == 0;
-    kill(pid, SIGCONT);
-    after = drain_until(p[0], buf, sizeof buf, 1000, &eof);
-    reap_blocking(pid, 2000, end, sizeof end);
+    pid_t tw = waitpid(pid, &st, WNOHANG);
+    alive_after_term = tw == 0;
+    if (tw == pid) { status_text(st, term_status, sizeof term_status); snprintf(end, sizeof end, "%s", term_status); }
+    else {
+      kill(pid, SIGCONT);
+      after = drain_until(p[0], buf, sizeof buf, 1000, &eof);
+      reap_blocking(pid, 2000, end, sizeof end);
+    }
   }
   double t_done = now_ms() - t1;
   close(p[0]);

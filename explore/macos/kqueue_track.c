@@ -25,6 +25,7 @@ int main(void) { printf("{\"probe\":\"kqueue_track\",\"case\":\"_unsupported\"}\
 #include <limits.h>
 #include <spawn.h>
 #include <sys/event.h>
+#include <sys/sysctl.h>
 #define PROBE "kqueue_track"
 
 #ifdef NOTE_TRACK
@@ -117,9 +118,52 @@ static int bsd_ppid(pid_t p) {
   return proc_pidinfo(p, PROC_PIDTBSDINFO, 0, &bi, sizeof bi) == (int)sizeof bi ? (int)bi.pbi_ppid : -1;
 }
 
+
+static int bytes_contain(const char *hay, size_t n, const char *needle) {
+  size_t k = strlen(needle);
+  if (k == 0 || n < k) return 0;
+  for (size_t i = 0; i + k <= n; i++) if (hay[i] == needle[0] && memcmp(hay + i, needle, k) == 0) return 1;
+  return 0;
+}
+
+/* every process of this user whose original argument/environment block (KERN_PROCARGS2) contains needle */
+static int env_marker_scan(const char *needle, pid_t *found, int cap, int *scanned, double *ms) {
+  double t0 = now_ms();
+  int hits = 0;
+  *scanned = 0;
+  int n = proc_listallpids(NULL, 0);
+  if (n > 0) {
+    int room = n + 64;
+    pid_t *all = malloc((size_t)room * sizeof(pid_t));
+    size_t bufcap = 1 << 20;
+    char *buf = malloc(bufcap);
+    n = proc_listallpids(all, room * (int)sizeof(pid_t));
+    for (int i = 0; i < n; i++) {
+      pid_t p = all[i];
+      if (p <= 0 || p == getpid()) continue;
+      int mib[3] = {CTL_KERN, KERN_PROCARGS2, (int)p};
+      size_t len = bufcap;
+      if (sysctl(mib, 3, buf, &len, NULL, 0) != 0) continue;
+      (*scanned)++;
+      if (bytes_contain(buf, len, needle)) {
+        if (hits < cap) found[hits] = p;
+        hits++;
+      }
+    }
+    free(all);
+    free(buf);
+  }
+  *ms = now_ms() - t0;
+  return hits;
+}
+
 static void run_case(const char *name, int mode, int n, int track) {
   int p[2];
   if (pipe(p) != 0) return;
+  char token[96], needle[128];
+  snprintf(token, sizeof token, "%d-%s", (int)getpid(), name);
+  snprintf(needle, sizeof needle, "KT_MARKER=%s", token);
+  setenv("KT_MARKER", token, 1);   /* inherited by everything the forker creates */
   int rfd = p[0], wfd = fcntl(p[1], F_DUPFD, 10);
   close(p[1]);
   set_cloexec(rfd);
@@ -201,9 +245,16 @@ static void run_case(const char *name, int mode, int n, int track) {
     sup_enum_sees_last = contains(mine, nm < 512 ? nm : 512, reported[nrep - 1]);
   }
 
+  pid_t mfound[256];
+  int mscanned = 0;
+  double mms = 0;
+  int mn = env_marker_scan(needle, mfound, 256, &mscanned, &mms);
+  int marker_hits = 0;
+  for (int i = 0; i < nrep; i++) if (contains(mfound, mn < 256 ? mn : 256, reported[i])) marker_hits++;
+
   emit(PROBE, name,
-       "\"NOTE_TRACK_in_header\":%d,\"track_requested\":%d,\"registration_errno\":\"%s\",\"descendants_reported_by_the_child\":%d,\"kevents_returned\":%d,\"with_NOTE_FORK\":%d,\"with_NOTE_EXEC\":%d,\"with_NOTE_EXIT\":%d,\"with_NOTE_CHILD\":%d,\"with_NOTE_TRACKERR\":%d,\"EV_ERROR\":%d,\"reported_pids_named_by_NOTE_CHILD_events\":%d,\"found_by_proc_listchildpids_from_the_child\":%d,\"reported_pids_in_that_enumeration\":%d,\"last_reported_pid_ppid\":%d,\"supervisor_enumeration_sees_last_reported_pid\":%d",
-       TRACK_FROM_HEADER, track, errno_name(reg_errno), nrep, evs_total, fork_ev, exec_ev, exit_ev, child_ev, trackerr, error_ev, named, nfound, enum_hits, ppid_of_last, sup_enum_sees_last);
+       "\"NOTE_TRACK_in_header\":%d,\"track_requested\":%d,\"registration_errno\":\"%s\",\"descendants_reported_by_the_child\":%d,\"kevents_returned\":%d,\"with_NOTE_FORK\":%d,\"with_NOTE_EXEC\":%d,\"with_NOTE_EXIT\":%d,\"with_NOTE_CHILD\":%d,\"with_NOTE_TRACKERR\":%d,\"EV_ERROR\":%d,\"reported_pids_named_by_NOTE_CHILD_events\":%d,\"found_by_proc_listchildpids_from_the_child\":%d,\"reported_pids_in_that_enumeration\":%d,\"last_reported_pid_ppid\":%d,\"supervisor_enumeration_sees_last_reported_pid\":%d,\"env_marker_scan\":{\"processes_readable\":%d,\"processes_carrying_the_marker\":%d,\"reported_pids_among_them\":%d,\"scan_ms\":%.1f}",
+       TRACK_FROM_HEADER, track, errno_name(reg_errno), nrep, evs_total, fork_ev, exec_ev, exit_ev, child_ev, trackerr, error_ev, named, nfound, enum_hits, ppid_of_last, sup_enum_sees_last, mscanned, mn, marker_hits, mms);
 
   for (int i = 0; i < nrep; i++) kill(reported[i], SIGKILL);
   kill(child, SIGKILL);
@@ -220,9 +271,7 @@ int main(int argc, char **argv) {
   run_case("fork_events_no_track", 0, 30, 0);
   run_case("fork_events_with_track", 0, 30, 1);
   run_case("tree_no_track", 1, 30, 0);
-  run_case("tree_with_track", 1, 30, 1);
   run_case("daemonize_no_track", 2, 1, 0);
-  run_case("daemonize_with_track", 2, 1, 1);
   return 0;
 }
 

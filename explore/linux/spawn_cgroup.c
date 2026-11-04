@@ -273,7 +273,6 @@ static void run_trial(int kind, const char *leaf, int dirfd, trial_t *o) {
       do { k = read(ep[0], &c, 1); } while (k < 0 && errno == EINTR);   /* EOF = the exec happened */
       t_notice = now_ms();
     }
-    o->populated_before_attach = cg_key(leaf, "cgroup.events", "populated") == 1;
     char num[24];
     snprintf(num, sizeof num, "%d", (int)pid);
     cg_write(leaf, "cgroup.procs", num);
@@ -338,7 +337,7 @@ static void escape_series(int kind, int loaded, int n) {
   int dirfd = open(leaf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   long cpus = sysconf(_SC_NPROCESSORS_ONLN);
   if (loaded) start_load((int)(cpus * 2));
-  int ok = 0, with_escape = 0, grand = 0, escaped = 0, parent_not_in = 0, pop_before = 0;
+  int ok = 0, with_escape = 0, grand = 0, escaped = 0, parent_not_in = 0;
   double main_ms[400], attach_us[400];
   int nm = 0, na = 0;
   for (int i = 0; i < n; i++) {
@@ -350,7 +349,6 @@ static void escape_series(int kind, int loaded, int n) {
     escaped += t.escaped;
     if (t.escaped) with_escape++;
     if (!t.parent_in) parent_not_in++;
-    if (t.populated_before_attach) pop_before++;
     if (nm < 400) main_ms[nm++] = t.to_main_ms;
     if (kind == K_FORK_AFTER_EXEC && na < 400) attach_us[na++] = t.attach_after_notice_us;
   }
@@ -360,8 +358,8 @@ static void escape_series(int kind, int loaded, int n) {
   char cname[96];
   snprintf(cname, sizeof cname, "escape_%s_%s", kind_name(kind), loaded ? "busy" : "idle");
   emit(PROBE, cname,
-       "\"children_forked_first_thing\":%d,\"trials_completed\":%d,\"trials_with_an_escapee\":%d,\"children_total\":%d,\"children_outside_cgroup\":%d,\"program_itself_not_in_cgroup_at_end\":%d,\"cgroup_populated_before_the_pid_was_attached\":%d,\"cpus\":%ld,\"busy_processes\":%ld,\"spawn_to_program_main_ms\":{\"median\":%.3f,\"p95\":%.3f},\"attach_after_exec_notice_us\":{\"median\":%.1f,\"p95\":%.1f}",
-       g_burst_n, ok, with_escape, grand, escaped, parent_not_in, pop_before, cpus, loaded ? cpus * 2 : 0L,
+       "\"children_forked_first_thing\":%d,\"trials_completed\":%d,\"trials_with_an_escapee\":%d,\"children_total\":%d,\"children_outside_cgroup\":%d,\"program_itself_not_in_cgroup_at_end\":%d,\"cpus\":%ld,\"busy_processes\":%ld,\"spawn_to_program_main_ms\":{\"median\":%.3f,\"p95\":%.3f},\"attach_after_exec_notice_us\":{\"median\":%.1f,\"p95\":%.1f}",
+       g_burst_n, ok, with_escape, grand, escaped, parent_not_in, cpus, loaded ? cpus * 2 : 0L,
        pct(main_ms, nm, 0.5), pct(main_ms, nm, 0.95), pct(attach_us, na, 0.5), pct(attach_us, na, 0.95));
 }
 
@@ -422,7 +420,9 @@ static void case_clone3_errors(void) {
 
   clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 400, &c);
   int pop = c.pid > 0 ? (int)cg_key(leaf, "cgroup.events", "populated") : -1;
-  long long cur = c.pid > 0 ? cg_key(leaf, "pids.current", "") : -1;
+  char pcb[32] = "";
+  cg_read(leaf, "pids.current", pcb, sizeof pcb);
+  long long cur = c.pid > 0 ? atoll(pcb) : -1;
   char procs[256] = "";
   cg_read(leaf, "cgroup.procs", procs, sizeof procs);
   char want[24];
@@ -525,21 +525,38 @@ static void case_clone3_pids_and_kill(void) {
   finish(&b);
   cg_write(leaf, "pids.max", "max");
 
-  /* cgroup.kill is a one-shot: a child cloned in afterwards lives */
-  clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 1500, &a);
-  ran(&a, 300);
-  cg_write(leaf, "cgroup.kill", "1");
-  int st1 = 0;
-  pid_t w1 = waitpid(a.pid, &st1, 0);
-  char s1[64];
-  status_text(st1, s1, sizeof s1);
-  clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 1500, &b);
-  int ran_b = ran(&b, 300);
-  int st2 = 0;
-  pid_t w2 = b.pid > 0 ? waitpid(b.pid, &st2, WNOHANG) : -1;
-  emit(PROBE, "clone3_after_cgroup_kill", "\"first_child_end\":\"%s\",\"first_reaped\":%d,\"child_started_after_the_kill_ran\":%d,\"it_is_still_alive_300ms_later\":%d", s1, w1 == a.pid, ran_b, w2 == 0);
-  finish(&a);
-  finish(&b);
+  /* a child cloned in right after cgroup.kill: does it live? (delay between the kill and the clone3 varies) */
+  int delays[] = {0, 1, 10, 100, 500};
+  char kout[2000] = "[";
+  for (size_t d = 0; d < sizeof delays / sizeof delays[0]; d++) {
+    cp_t first, second;
+    clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &first);
+    ran(&first, 300);
+    int kw = cg_write(leaf, "cgroup.kill", "1");
+    int st1 = 0;
+    waitpid(first.pid, &st1, 0);
+    char s1[64], populated_txt[16];
+    status_text(st1, s1, sizeof s1);
+    snprintf(populated_txt, sizeof populated_txt, "%lld", cg_key(leaf, "cgroup.events", "populated"));
+    if (delays[d]) sleep_ms(delays[d]);
+    clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &second);
+    int ran2 = second.pid > 0 && ran(&second, 300);
+    int st2 = 0;
+    pid_t w2 = second.pid > 0 ? waitpid(second.pid, &st2, WNOHANG) : -1;
+    char s2[64] = "-";
+    if (w2 > 0) status_text(st2, s2, sizeof s2);
+    size_t l = strlen(kout);
+    snprintf(kout + l, sizeof kout - l, "%s{\"delay_ms\":%d,\"kill_write\":\"%s\",\"first_end\":\"%s\",\"populated_after_kill\":%s,\"second_clone3\":\"%s\",\"second_ran\":%d,\"second_reaped_within_300ms\":%d,\"second_end\":\"%s\"}",
+             l > 1 ? "," : "", delays[d], errno_name(kw), s1, populated_txt, second.pid > 0 ? "OK" : errno_name(second.err), ran2, w2 > 0, s2);
+    finish(&first);
+    finish(&second);
+    cg_write(leaf, "cgroup.kill", "1");
+    double e2 = now_ms() + 500;
+    while (now_ms() < e2 && cg_key(leaf, "cgroup.events", "populated") == 1) sleep_ms(1);
+  }
+  size_t kl = strlen(kout);
+  snprintf(kout + kl, sizeof kout - kl, "]");
+  emit(PROBE, "clone3_after_cgroup_kill", "\"results\":%s", kout);
   close(dfd);
   leaf_empty_and_remove(leaf);
 }
@@ -724,7 +741,7 @@ static void case_trampoline_exit_codes(void) {
   if (make_leaf("tramp-exit", leaf, sizeof leaf)) return;
   snprintf(g_cgprocs, sizeof g_cgprocs, "%s/cgroup.procs", leaf);
   char noexec[600];
-  snprintf(noexec, sizeof noexec, "%s/not-executable", g_root);
+  snprintf(noexec, sizeof noexec, "%s/spawn-cgroup-not-executable-%d", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
   FILE *f = fopen(noexec, "w");
   if (f) { fputs("x\n", f); fclose(f); chmod(noexec, 0644); }
   struct { const char *what; char *prog; char *a1; char *a2; const char *cgp; } tc[] = {

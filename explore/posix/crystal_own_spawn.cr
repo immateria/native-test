@@ -51,6 +51,7 @@ end
 
 # NUL-terminated C string array whose strings stay alive as long as this object does
 class CStrings
+  @strs : Array(String)
   getter ptrs : Pointer(Pointer(UInt8))
 
   def initialize(list : Array(String))
@@ -387,11 +388,11 @@ end
       pid = clone3_spawn(dirfd, "/bin/cat", ["/proc/self/cgroup"], w.fd)
       w.close
       p = wrap(pid)
-      out = r.gets_to_end.strip
+      seen = r.gets_to_end.strip
       r.close
-      j.field "child_saw_cgroup", out
+      j.field "child_saw_cgroup", seen
       j.field "expected", "0::#{rel}"
-      j.field "child_in_target", out == "0::#{rel}"
+      j.field "child_in_target", seen == "0::#{rel}"
       j.field "status", status_text(wait_within(p, 3.seconds))
     end
 
