@@ -1069,6 +1069,49 @@ already on the image. Earlier cgroup results in this file all used a subtree I d
   (incremented); through bash on Alpine nothing differed. Exit-code behaviour of the trampoline was the same as on dash.
 * `posix_spawn` results were identical in all 33 glibc environment/runner combinations (host, root, systemd, Docker).
 
+## The shard now spawns contained children on Linux and macOS (what was built, what building it found)
+
+Built in `probes/workspace` (details in the shard README): `CgroupV2#spawn` (clone3 `CLONE_INTO_CGROUP | CLONE_PIDFD`, fork
+fallback whose child enters the cgroup before exec), `ProcessGroup#spawn` and `.spawn_leader` (the same engine with `setpgid` on
+Linux; `posix_spawn` started suspended on macOS), `ProcessHandle::Linux.adopt_child` and `ProcessHandle::Kqueue` (macOS exit
+watch), `CgroupV2.usable?` / `.delegated_parent`, `ProcessSupervision.spawn` / `.strongest_mechanism`, `Error::Killed`, and the
+refusal of process group 1. The loop used was `.github/workflows/shard-dev.yml`: formatter applied, specs built and run on a
+chosen runner and, on Linux, inside the environments of the previous section.
+
+Spec results (38 examples on Linux, 23 on macOS; runs `41925930006`, `41926354364`, `41926366594`, `41925944136`, `41926309194`,
+`41926321192`, `41926333437`): **0 failures in every cell** — Ubuntu 22.04, 24.04 and 24.04 arm64, each as the plain runner
+user, as root, in a systemd service with and without `Delegate=yes`, in the user manager, and in a default and a privileged
+Docker container; macOS 14, 15, 26 (arm64) and 15 (Intel). Pending examples are the ones that need a cgroup this environment
+does not give (4 plain and 4 in a service without `Delegate=`; 11 in a default container, where the spec binary is also PID 1)
+or that only apply where none is available (1 where a cgroup can be made). `ProcessSupervision.spawn` chose `CgroupV2` exactly
+where `delegated_parent` found one and `ProcessGroup` everywhere else, and its shutdown drained and released the group in each.
+The burst test (30 spawns of a shell that forks three `sleep`s, `cgroup.kill`, then a scan of every `/proc/*/environ` for a
+token) found no survivor in any delegated environment.
+
+What building it found:
+
+* **Process group 1 is a broadcast.** The specs ran as PID 1 of a container, whose process group is 1; `ProcessGroup.new(1)`
+  then addressed `kill(-1, sig)`, which signals every process the caller may signal. It is refused now (the kit validates 0,
+  -1 and `Int32::MAX + 1` only, so no kit case changed).
+* **`ProcessHandle.open` rejects a process that has already exited** (it retries three times, then `NoSuchProcess`), which
+  would make a command that finishes at once unsupervisable; hence `adopt_child`, fed by the pidfd that `clone3` returns
+  with the process.
+* **A fiber must not yield while holding a `Thread::Mutex`**: a second fiber on the same thread would block the thread and
+  deadlock. The spawn is split: `create` (no call that can yield) runs under the group's mutex, `complete` (reads the
+  exec-error pipe) runs outside it.
+* **The earlier classification gaps are closed and checked where they occurred**: in a default Docker container
+  `create` on the read-only mount is now `Error::Unavailable`; in a privileged container the namespace-root cgroup can be
+  opened and spawned into.
+* The specs read sources through paths baked in at compile time, so a binary run from another path (a container mount)
+  fails five unrelated examples; the loop mounts the workspace at its own path.
+* The kit pins its sources by hash, so `MANIFEST.sha256` was regenerated and the four new files added; the kit's case names
+  and meaning are unchanged.
+
+Not built yet: redirecting stdio (children inherit 0-2, as on Windows); descendant tracking on macOS (the marker scan is
+measured, not implemented); `posix_spawn` as the Linux engine for process groups (the fork cost grows with the heap);
+kit qualification cases for the new API (the shard specs cover it on Linux and macOS; no Windows case exercises
+`ProcessSupervision.spawn`, whose Windows branch only compiles).
+
 ## Still open
 
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time
