@@ -692,7 +692,9 @@ memory test.)
   spawn attributes with `memorystatus_set_memlimits` and no privilege check (`kern_exec.c`), unlike the
   `memorystatus_control` system call. As the ordinary runner user on all five macOS runners (run `41886046710`) a child
   allocating 8 MiB steps was **killed with `SIGKILL` under a 64 MB and a 128 MB fatal limit**, while the control (no
-  attribute) and a non-fatal 64 MB limit kept running to 512 MiB. As root, `GET_MEMLIMIT_PROPERTIES` on the child read
+  attribute) and a non-fatal 64 MB limit kept running to 512 MiB. The kill comes on the step that crosses the limit:
+  the last step reported was 56 MiB (64 MB limit) and 120 MiB (128 MB limit), 120–150 ms and 220–400 ms after spawn,
+  identical as the runner user and as root (run `41888597722`, macOS 14 and 26). As root, `GET_MEMLIMIT_PROPERTIES` on the child read
   back exactly the requested limits (64/128 MB, attribute 1 = fatal; non-fatal: attribute 0). It is private SPI (no
   public header, no stability promise) and works only for children created with `posix_spawn`, not `fork`.
 
