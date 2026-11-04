@@ -1,0 +1,138 @@
+name: shard-dev
+
+# Development loop for the supervision shard. The Crystal compiler is only available on the runners, so this job applies
+# the formatter (verify.sh runs `crystal tool format --check`), builds and runs both shards' specs, and returns a patch with
+# the formatting changes (git apply it locally) plus every log. On Linux it also runs the compiled supervision specs in the
+# environments that decide which mechanism is usable: a systemd Delegate=yes unit, the systemd user manager, root, and
+# Docker (default and privileged). Standard hosted runners only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "runner"
+        type: choice
+        options: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm, macos-15, macos-14, macos-15-intel, macos-26]
+        default: ubuntu-24.04
+      scenarios:
+        description: "also run the compiled specs in systemd / root / Docker environments (Linux only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CRYSTAL_VERSION: "1.21.1"
+
+jobs:
+  shard:
+    name: shard ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Crystal ${{ env.CRYSTAL_VERSION }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/crystal-lang/crystal/releases/download/${CRYSTAL_VERSION}"
+          case "$(uname -s)-$(uname -m)" in
+            Darwin-*)       asset="crystal-${CRYSTAL_VERSION}-1-darwin-universal.tar.gz"; sum=ba34fa7fb8bc8b951f12d17e12f69c9d7ccce38900caa4b8a17f1b4f29d37605 ;;
+            Linux-x86_64)   asset="crystal-${CRYSTAL_VERSION}-1-linux-x86_64.tar.gz";     sum=08b5779df8cf280c4a799599862bbe4d42103ba082aa73429562713c8a9f3b43 ;;
+            Linux-aarch64)  asset="crystal-${CRYSTAL_VERSION}-1-linux-aarch64.tar.gz";    sum=a37365b79f58d4cd32b6113bbb9983e21eb41d233667e003c019520e3c245e49 ;;
+          esac
+          curl -fsSL -o crystal.tar.gz "$base/$asset"
+          echo "$sum  crystal.tar.gz" | shasum -a 256 -c -
+          tar -xzf crystal.tar.gz -C "$HOME"
+          echo "$HOME/crystal-${CRYSTAL_VERSION}-1/bin" >> "$GITHUB_PATH"
+
+      - name: Format (applied; the patch is returned) and build the specs
+        run: |
+          set +e
+          mkdir -p shard-out
+          cd probes/workspace
+          crystal tool format process-handle/src process-handle/spec process-supervision/src process-supervision/spec > "$GITHUB_WORKSPACE/shard-out/format.txt" 2>&1
+          echo "format exit=$?"
+          git diff > "$GITHUB_WORKSPACE/shard-out/shard-format.patch"
+          git diff --stat | tail -5
+          CP="$PWD/process-handle/src:$PWD/process-supervision/src:$(crystal env CRYSTAL_PATH)"
+          for s in process-handle process-supervision; do
+            (cd "$s" && CRYSTAL_PATH="$CP" crystal build --no-color -o "$GITHUB_WORKSPACE/shard-out/spec-$s" spec/${s//-/_}_spec.cr) > "$GITHUB_WORKSPACE/shard-out/build-$s.txt" 2>&1
+            echo "build $s exit=$?"
+            head -c 3000 "$GITHUB_WORKSPACE/shard-out/build-$s.txt"
+          done
+          # the verify.sh consumer check
+          printf '%s\n' 'require "process-supervision"' 'puts ProcessSupervision::VERSION' > "$RUNNER_TEMP/consumer.cr"
+          CRYSTAL_PATH="$CP" crystal run --no-color "$RUNNER_TEMP/consumer.cr" > "$GITHUB_WORKSPACE/shard-out/consumer.txt" 2>&1; echo "consumer exit=$?"
+          # the same checks cross-compiled for the other targets (compile only)
+          for t in x86_64-windows-msvc; do
+            (cd process-supervision && CRYSTAL_PATH="$CP" crystal build --no-color --cross-compile --target $t -o "$RUNNER_TEMP/cross-$t" spec/process_supervision_spec.cr) > "$GITHUB_WORKSPACE/shard-out/cross-$t.txt" 2>&1; echo "cross $t exit=$?"
+          done
+          exit 0
+
+      - name: Run the specs
+        run: |
+          set +e
+          cd shard-out
+          for s in process-handle process-supervision; do
+            [ -x "spec-$s" ] || { echo "no binary for $s"; continue; }
+            (cd "../probes/workspace/$s" && "$GITHUB_WORKSPACE/shard-out/spec-$s" --verbose) > "run-plain-$s.txt" 2>&1
+            echo "== $s plain exit=$?"; tail -n 12 "run-plain-$s.txt"
+          done
+          exit 0
+
+      - name: Run the supervision specs in other Linux environments
+        if: runner.os == 'Linux' && inputs.scenarios
+        run: |
+          set +e
+          uid="$(id -u)"; gid="$(id -g)"
+          S="$GITHUB_WORKSPACE/shard-out/spec-process-supervision"
+          W="$GITHUB_WORKSPACE/probes/workspace/process-supervision"
+          [ -x "$S" ] || { echo "no spec binary"; exit 0; }
+          cd "$W"
+          out="$GITHUB_WORKSPACE/shard-out"
+          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p Delegate=yes -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-delegate-yes.txt" 2>&1
+          echo "== systemd Delegate=yes exit=$?"; tail -n 6 "$out/run-systemd-delegate-yes.txt"
+          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-no-delegate.txt" 2>&1
+          echo "== systemd no Delegate exit=$?"; tail -n 6 "$out/run-systemd-no-delegate.txt"
+          sudo loginctl enable-linger "$(id -un)"
+          for i in $(seq 1 30); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
+          XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemd-run --user --quiet --pipe --wait --collect -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-user-manager.txt" 2>&1
+          echo "== systemd user manager exit=$?"; tail -n 6 "$out/run-systemd-user-manager.txt"
+          sudo "$S" --verbose > "$out/run-host-root.txt" 2>&1
+          echo "== host root exit=$?"; tail -n 6 "$out/run-host-root.txt"
+          sudo chown -R "$uid:$gid" "$out"
+          # containers: the spec binary is dynamically linked, so use an Ubuntu image of the host's release
+          REL=$(. /etc/os-release; echo "$VERSION_ID")
+          printf 'FROM ubuntu:%s\nRUN apt-get update -qq && apt-get install -y -qq --no-install-recommends libpcre2-8-0 libgc1 libevent-2.1-7t64 bash ca-certificates > /dev/null 2>&1 || apt-get install -y -qq --no-install-recommends libpcre2-8-0 libgc1 libevent-2.1-7 bash ca-certificates > /dev/null 2>&1; rm -rf /var/lib/apt/lists/*\n' "$REL" > "$RUNNER_TEMP/Dockerfile"
+          docker build -q -t shardspec -f "$RUNNER_TEMP/Dockerfile" "$RUNNER_TEMP" > /dev/null || echo "docker build failed"
+          for mode in default privileged; do
+            extra=""; [ "$mode" = privileged ] && extra="--privileged"
+            docker run --rm $extra -v "$GITHUB_WORKSPACE":/ws -w /ws/probes/workspace/process-supervision shardspec /ws/shard-out/spec-process-supervision --verbose > "$out/run-docker-$mode.txt" 2>&1
+            echo "== docker $mode exit=$?"; tail -n 6 "$out/run-docker-$mode.txt"
+          done
+          sudo chown -R "$uid:$gid" "$out"
+          exit 0
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ inputs.runner }}
+          path: shard-out/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-patch-${{ inputs.runner }}
+          path: shard-out/shard-format.patch
+          if-no-files-found: warn
+          retention-days: 14
