@@ -84,8 +84,9 @@ jobs:
             echo "core_pipe_limit: $(cat /proc/sys/kernel/core_pipe_limit)"
             echo "== coredump.conf"; systemd-analyze cat-config systemd/coredump.conf 2>/dev/null | grep -v '^#' | grep . || cat /etc/systemd/coredump.conf 2>/dev/null
             echo "== systemd-coredump: $(systemd-coredump --version 2>/dev/null | head -1 || /usr/lib/systemd/systemd-coredump --version 2>/dev/null | head -1)"
-            echo "== kernel log lines about RLIMIT_CORE=1: $(sudo dmesg | grep -c 'has RLIMIT_CORE set to 1')"
-            sudo dmesg | grep -E 'RLIMIT_CORE set to 1|Aborting core|over core_pipe_limit' | tail -6
+            # 6.8: "has RLIMIT_CORE set to 1"; newer kernels: "coredump: N(comm): RLIMIT_CORE is set to 1, aborting core"
+            echo "== kernel log lines about RLIMIT_CORE=1: $(sudo dmesg | grep -c -E 'RLIMIT_CORE (is )?set to 1')"
+            sudo dmesg | grep -i -E 'RLIMIT_CORE (is )?set to 1|aborting core|core_pipe_limit' | tail -6
             echo "== coredumpctl (last 8)"; coredumpctl list --no-pager 2>/dev/null | tail -8
           } > explore-out/linux-crash-handler-details.txt 2>&1
           cat explore-out/linux-crash-handler-details.txt

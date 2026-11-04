@@ -630,8 +630,9 @@ instant a crashed child disappears must allow ~200 ms. The `__builtin_trap` inst
   (`RLIMIT_CPU` 1 s), `SIGSYS`: 93–113 ms (22.04, 24.04 x64) and 57–62 ms (24.04 arm64), the same as `SIGSEGV`. A
   supervisor that stops children with `SIGQUIT` pays it on every stop.
 * **Two per-child opt-outs skip the helper entirely:** soft `RLIMIT_CORE` of **exactly 1 byte** (the kernel's
-  recursion guard for the helper itself: "has RLIMIT_CORE set to 1 / Aborting core", one such pair in the kernel log
-  per crash, 8 lines for 8 crashes), and `prctl(PR_SET_DUMPABLE, 0)` in the child: 0.1–1.5 ms, status without the
+  recursion guard for the helper itself; kernel 6.8 (22.04) logs "Process N(comm) has RLIMIT_CORE set to 1 / Aborting
+  core" for every such crash — 8 pairs for 8 crashes — and current kernels log "coredump: N(comm): RLIMIT_CORE is set to
+  1, aborting core" through `printk_ratelimited`), and `prctl(PR_SET_DUMPABLE, 0)` in the child: 0.1–1.5 ms, status without the
   core flag. The `RLIMIT_CORE=1` setting survives `exec`; **dumpability does not** — `linux_extras` set it to 0 before
   `execve` and the new program read back 1 (`fs/exec.c` resets it), so only a child that sets it itself can use it.
 * **A large core takes long, and `SIGKILL` cuts it short:** with 384 MiB dirtied, the crash took 605–887 ms to reach
