@@ -1120,11 +1120,24 @@ description); the parent has to close the child's ends as soon as the process ex
 descriptor is first copied above 2 so that a `dup2` cannot overwrite a later source (a process with a closed stdin gets
 descriptor 0 back from `pipe()`).
 
-Not built yet: stream redirection for Windows Jobs (they still inherit only, and `ProcessSupervision.spawn` raises
-`Unsupported` if asked for more) and for arbitrary `IO` objects; descendant tracking on macOS (the marker scan is
+Windows Jobs got the same `input:`/`output:`/`error:` contract afterwards (`Job#spawn` and `ProcessSupervision.spawn`),
+and `shard-dev.yml` gained Windows runners, so the Windows branch is now run natively instead of only compiled: runs
+`41931785086` (windows-2022) and `41931789343` (windows-2025), 19 supervision examples and 7 handle examples, 0 failures,
+0 pending in both. The new examples pipe through a child, keep stdout and stderr apart, hand a closed stream the null
+device, read and write files, move a megabyte each way, leave the process handle count unchanged over 30 failed creations
+with three pipes each, and see EOF on a pipe a grandchild still held once the Job is killed. The children are
+`spec/support/stdio_child.cr` (the runners have no `cat`). The kit's qualification against this source (run
+`41931774414`): Windows x64 elevated 459 and unelevated 459, macOS arm64 386 Crystal + 45 C/SDK, all
+`qualification_validation=pass`, manifest checks before and after pass. Ubuntu 24.04 in all eight environments (run
+`41931793815`): 0 failures. Design points: each stream is its own duplicate, so the `HANDLE_LIST` never holds a value
+twice even when output and error name the same file; the child's pipe ends are synchronous and the parent's overlapped,
+as in the stdlib; the parent's copies of the child's ends are closed after the Job mutex is released (closing an IO may
+yield, and a fiber must not yield while holding a `Thread::Mutex`).
+
+Not built yet: stream redirection for arbitrary `IO` objects; descendant tracking on macOS (the marker scan is
 measured, not implemented); `posix_spawn` as the Linux engine for process groups (the fork cost grows with the heap);
-kit qualification cases for the new API (the shard specs cover it on Linux and macOS; no Windows case exercises
-`ProcessSupervision.spawn`, whose Windows branch only compiles).
+kit qualification cases for the new API (the shard specs cover it natively on Linux, macOS and Windows; no kit case
+exercises `ProcessSupervision.spawn` or the stream options).
 
 ## Still open
 
