@@ -118,11 +118,17 @@ end
       end
     end
 
-    it "never opens the hierarchy root as a killable supervision group" do
-      if mount = ProcessSupervision::Linux::CgroupV2.mountpoint
+    it "never opens the machine's hierarchy root as a killable supervision group" do
+      mount = ProcessSupervision::Linux::CgroupV2.mountpoint
+      pending!("no cgroup-v2 mount") unless mount
+      if File.readlink("/proc/self/ns/cgroup") == "cgroup:[4026531835]"
         expect_raises(ArgumentError, /hierarchy root/) do
-          ProcessSupervision::Linux::CgroupV2.open(mount)
+          ProcessSupervision::Linux::CgroupV2.open(mount.not_nil!)
         end
+      else
+        # a private cgroup namespace (a container): the mount root is only the container's own cgroup, an ordinary
+        # cgroup on the host, so it may be opened (killing it kills the caller, as for any cgroup the caller is in)
+        ProcessSupervision::Linux::CgroupV2.open(mount.not_nil!).close
       end
     end
 
