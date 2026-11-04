@@ -77,6 +77,101 @@
         values.map { |key, value| "#{key}=#{value}" }
       end
 
+      # Standard-stream plumbing for one spawn. `build` creates the pipes and descriptor copies; the engines dup2 the
+      # `sources` onto 0-2 in the child; `release_child_side` must run right after the process exists (the parent must not
+      # keep the child's ends open or the other side never sees EOF); `abandon` also closes the parent's ends.
+      #
+      # Supported: Process::Redirect::Inherit / Close (the null device) / Pipe, and an IO::FileDescriptor (a File, STDOUT).
+      # Every source is copied to a descriptor >= 3 first, so that a source which is itself 0, 1 or 2 (a closed stdin makes
+      # pipe() return 0) cannot be overwritten by an earlier dup2.
+      class Plumbing
+        getter sources = StaticArray(Int32, 3).new(-1)
+        getter input : IO::FileDescriptor? = nil
+        getter output : IO::FileDescriptor? = nil
+        getter error : IO::FileDescriptor? = nil
+
+        @child_ends = [] of IO::FileDescriptor
+        @copies = [] of Int32
+
+        def self.build(input : ::Process::Stdio, output : ::Process::Stdio, error : ::Process::Stdio) : Plumbing
+          plumbing = new
+          begin
+            plumbing.add(0, input)
+            plumbing.add(1, output)
+            plumbing.add(2, error)
+          rescue ex
+            plumbing.abandon
+            raise ex
+          end
+          plumbing
+        end
+
+        def self.inherit : Plumbing
+          new
+        end
+
+        def add(target : Int32, spec : ::Process::Stdio) : Nil
+          case spec
+          when ::Process::Redirect
+            case spec
+            when .inherit?
+              # keep the parent's descriptor
+            when .close?
+              fd = LibC.open("/dev/null", LibC::O_RDWR | LibC::O_CLOEXEC)
+              raise native_error("open(/dev/null)") if fd < 0
+              @copies << fd
+              @sources[target] = fd
+            when .pipe?
+              if target == 0
+                reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
+                @child_ends << reader
+                @input = writer
+                @sources[target] = movable(reader)
+              else
+                reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
+                @child_ends << writer
+                target == 1 ? (@output = reader) : (@error = reader)
+                @sources[target] = movable(writer)
+              end
+            end
+          when IO::FileDescriptor
+            @sources[target] = duplicate_above_stdio(spec.fd)
+          else
+            raise ArgumentError.new("only Process::Redirect and IO::FileDescriptor are supported for standard streams")
+          end
+        end
+
+        def release_child_side : Nil
+          @child_ends.each { |io| io.close rescue nil }
+          @child_ends.clear
+          @copies.each { |fd| LibC.close(fd) }
+          @copies.clear
+        end
+
+        def abandon : Nil
+          release_child_side
+          {@input, @output, @error}.each { |io| io.try { |stream| stream.close rescue nil } }
+        end
+
+        private def movable(io : IO::FileDescriptor) : Int32
+          io.fd >= 3 ? io.fd : duplicate_above_stdio(io.fd)
+        end
+
+        private def duplicate_above_stdio(fd : Int32) : Int32
+          copy = LibC.fcntl(fd, F_DUPFD_CLOEXEC, 3)
+          raise native_error("fcntl(F_DUPFD_CLOEXEC)") if copy < 0
+          @copies << copy
+          copy
+        end
+
+        private def native_error(operation : String) : Exception
+          errno = Errno.value
+          ProcessSupervision::Error::Native.new(operation, errno.message, errno.value.to_i64)
+        end
+      end
+
+      F_DUPFD_CLOEXEC = {% if flag?(:darwin) %}67{% else %}1030{% end %}
+
       # The stdlib's classification of a failed exec, so callers see the same exception classes as for Process.new.
       def self.exec_error(command : String, errno : Errno) : Exception
         if ::File::NotFoundError.os_error?(errno) || ::File::AccessDeniedError.os_error?(errno) || errno == Errno::ENOEXEC

@@ -699,3 +699,145 @@ end
     end
   end
 {% end %}
+
+{% if flag?(:unix) %}
+  describe "ProcessSupervision standard stream redirection" do
+    pipe = Process::Redirect::Pipe
+
+    it "pipes input to output through a child and sees EOF when it exits" do
+      child = leader("cat", input: pipe, output: pipe)
+      begin
+        child.input.puts "hello"
+        child.input.puts "world"
+        child.input.close
+        child.output.gets_to_end.should eq("hello\nworld\n")
+        child.wait(10.seconds).not_nil!.success?.should be_true
+      ensure
+        child.close
+        child.group.close
+      end
+    end
+
+    it "keeps standard output and standard error apart" do
+      child = leader("sh", ["-c", "echo out; echo err >&2"], output: pipe, error: pipe)
+      begin
+        child.output.gets_to_end.should eq("out\n")
+        child.error.gets_to_end.should eq("err\n")
+        child.wait(10.seconds).not_nil!.success?.should be_true
+      ensure
+        child.close
+        child.group.close
+      end
+    end
+
+    it "hands a closed stream the null device" do
+      child = leader("cat", input: Process::Redirect::Close, output: pipe)
+      begin
+        child.output.gets_to_end.should eq("")
+        child.wait(10.seconds).not_nil!.success?.should be_true
+      ensure
+        child.close
+        child.group.close
+      end
+    end
+
+    it "reads from and writes to files" do
+      with_temp_dir do |dir|
+        source = File.join(dir, "in")
+        target = File.join(dir, "out")
+        File.write(source, "from a file\n")
+        File.open(source) do |reader|
+          File.open(target, "w") do |writer|
+            child = leader("cat", input: reader, output: writer)
+            finish(child).success?.should be_true
+            child.group.close
+          end
+        end
+        File.read(target).should eq("from a file\n")
+      end
+    end
+
+    it "moves a megabyte in both directions without deadlock" do
+      data = "0123456789abcdef" * 65_536
+      child = leader("cat", input: pipe, output: pipe)
+      done = Channel(Nil).new
+      spawn do
+        child.input.print data
+        child.input.close
+        done.send(nil)
+      end
+      begin
+        received = child.output.gets_to_end
+        done.receive
+        received.bytesize.should eq(data.bytesize)
+        (received == data).should be_true
+        child.wait(10.seconds).not_nil!.success?.should be_true
+      ensure
+        child.close
+        child.group.close
+      end
+    end
+
+    it "raises for a stream that was not piped, and closes the pipes with the child" do
+      child = leader("cat", input: pipe)
+      begin
+        expect_raises(NilAssertionError) { child.output }
+        input = child.input
+        child.input.close
+        child.wait(10.seconds).should_not be_nil
+      ensure
+        child.close
+        child.group.close
+      end
+      input.not_nil!.closed?.should be_true
+    end
+
+    it "rejects stream objects it cannot hand to a child" do
+      expect_raises(ArgumentError) { leader("true", output: IO::Memory.new) }
+    end
+
+    it "leaks no descriptors when the exec fails" do
+      fd_directory = File.directory?("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd"
+      before = Dir.children(fd_directory).size
+      30.times do
+        expect_raises(File::NotFoundError) { leader("/nonexistent-ps-spec/program", input: pipe, output: pipe, error: pipe) }
+      end
+      Dir.children(fd_directory).size.should eq(before)
+    end
+
+    it "carries the streams through ProcessSupervision.spawn too" do
+      child = ProcessSupervision.spawn("sh", ["-c", "echo through"], output: pipe)
+      begin
+        child.output.gets_to_end.should eq("through\n")
+        child.wait(10.seconds).not_nil!.success?.should be_true
+        child.group.shutdown
+      ensure
+        child.close
+      end
+    end
+  end
+{% end %}
+
+{% if flag?(:linux) %}
+  describe "ProcessSupervision::Linux::CgroupV2 spawn standard streams" do
+    {false, true}.each do |forced|
+      it "pipes the streams of a child inside the cgroup (fork path forced: #{forced})" do
+        group = new_cgroup
+        ProcessSupervision::Linux::RawSpawn.clone3_disabled = forced
+        begin
+          child = group.spawn("sh", ["-c", "cat /proc/self/cgroup; cat"], input: Process::Redirect::Pipe, output: Process::Redirect::Pipe)
+          child.input.print "tail\n"
+          child.input.close
+          text = child.output.gets_to_end
+          text.should contain(File.basename(group.path.to_s))
+          text.should end_with("tail\n")
+          child.wait(10.seconds).not_nil!.success?.should be_true
+          child.close
+        ensure
+          ProcessSupervision::Linux::RawSpawn.clone3_disabled = false
+          group.close
+        end
+      end
+    end
+  end
+{% end %}

@@ -179,17 +179,26 @@
       # (measured on kernels 6.8, 7.0 and 6.18), so `spawn` raises `Error::Killed`; create a new cgroup instead.
       def spawn(command : String, args : Enumerable(String) = [] of String, *,
                 env : ::Process::Env = nil, clear_env : Bool = false,
-                chdir : Path | String? = nil) : ProcessSupervision::Child
+                chdir : Path | String? = nil,
+                input : ::Process::Stdio = ::Process::Redirect::Inherit,
+                output : ::Process::Stdio = ::Process::Redirect::Inherit,
+                error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
         run_on_execution_context("process-supervision-cgroup-spawn") do
           prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
-          pending = @mutex.synchronize do
-            check_open_locked
-            if @killed
-              raise ProcessSupervision::Error::Killed.new("cgroup #{@path} was killed and cannot take new children")
+          plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+          pending = begin
+            @mutex.synchronize do
+              check_open_locked
+              if @killed
+                raise ProcessSupervision::Error::Killed.new("cgroup #{@path} was killed and cannot take new children")
+              end
+              ProcessSupervision::Linux::RawSpawn.create(prepared, plumbing, cgroup: @path)
             end
-            ProcessSupervision::Linux::RawSpawn.create(prepared, cgroup: @path)
+          rescue ex
+            plumbing.abandon
+            raise ex
           end
-          ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, self)
+          ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, self)
         end
       end
 

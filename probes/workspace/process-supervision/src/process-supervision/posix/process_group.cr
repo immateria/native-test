@@ -25,24 +25,39 @@
       # group is not a kill-on-close container: a descendant can still leave it (setsid/setpgid).
       def spawn(command : String, args : Enumerable(String) = [] of String, *,
                 env : ::Process::Env = nil, clear_env : Bool = false,
-                chdir : Path | String? = nil) : ProcessSupervision::Child
+                chdir : Path | String? = nil,
+                input : ::Process::Stdio = ::Process::Redirect::Inherit,
+                output : ::Process::Stdio = ::Process::Redirect::Inherit,
+                error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
         {% if flag?(:linux) %}
           run_on_execution_context("process-supervision-posix-spawn") do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
             group = @pgid.to_i32
-            pending = @mutex.synchronize do
-              check_open_locked
-              ProcessSupervision::Linux::RawSpawn.create(prepared, pgroup: group)
+            pending = begin
+              @mutex.synchronize do
+                check_open_locked
+                ProcessSupervision::Linux::RawSpawn.create(prepared, plumbing, pgroup: group)
+              end
+            rescue ex
+              plumbing.abandon
+              raise ex
             end
-            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, self, group)
+            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, self, group)
           end
         {% elsif flag?(:darwin) %}
           run_on_execution_context("process-supervision-posix-spawn") do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
-            @mutex.synchronize do
-              check_open_locked
-              _, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, @pgid.to_i32)
-              ProcessSupervision::Child.new(process, handle, self)
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+            begin
+              @mutex.synchronize do
+                check_open_locked
+                _, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, @pgid.to_i32, plumbing)
+                ProcessSupervision::Child.new(process, handle, self, plumbing.input, plumbing.output, plumbing.error)
+              end
+            rescue ex
+              plumbing.abandon
+              raise ex
             end
           end
         {% else %}
@@ -54,19 +69,24 @@
       # Closing or shutting down the group is the caller's job, as for every Child.
       def self.spawn_leader(command : String, args : Enumerable(String) = [] of String, *,
                             env : ::Process::Env = nil, clear_env : Bool = false,
-                            chdir : Path | String? = nil) : ProcessSupervision::Child
+                            chdir : Path | String? = nil,
+                            input : ::Process::Stdio = ::Process::Redirect::Inherit,
+                            output : ::Process::Stdio = ::Process::Redirect::Inherit,
+                            error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
         {% if flag?(:linux) %}
           run_on_execution_context("process-supervision-posix-spawn-leader") do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
-            pending = ProcessSupervision::Linux::RawSpawn.create(prepared, pgroup: 0)
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+            pending = ProcessSupervision::Linux::RawSpawn.create(prepared, plumbing, pgroup: 0)
             # the group object needs the pid, so build it from the pending child
-            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, new(pending.pid.to_i64), nil)
+            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, new(pending.pid.to_i64), nil)
           end
         {% elsif flag?(:darwin) %}
           run_on_execution_context("process-supervision-posix-spawn-leader") do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
-            pid, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, 0)
-            ProcessSupervision::Child.new(process, handle, new(pid.to_i64))
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+            pid, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, 0, plumbing)
+            ProcessSupervision::Child.new(process, handle, new(pid.to_i64), plumbing.input, plumbing.output, plumbing.error)
           end
         {% else %}
           raise ProcessSupervision::Error::Unsupported.new("spawning is not implemented for this target yet")

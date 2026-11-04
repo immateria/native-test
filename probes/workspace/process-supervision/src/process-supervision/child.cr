@@ -15,7 +15,17 @@ module ProcessSupervision
     @wait_waiters = [] of Channel(Nil)
     @status : Process::Status? = nil
 
-    def initialize(@process : Process, @handle : ProcessHandle, @group : Group)
+    # The parent's ends of the child's standard streams, present for the ones spawned with `Process::Redirect::Pipe`.
+    getter! input : IO::FileDescriptor
+    getter! output : IO::FileDescriptor
+    getter! error : IO::FileDescriptor
+
+    def initialize(@process : Process, @handle : ProcessHandle, @group : Group,
+                   input : IO::FileDescriptor? = nil, output : IO::FileDescriptor? = nil,
+                   error : IO::FileDescriptor? = nil)
+      @input = input
+      @output = output
+      @error = error
     end
 
     def pid : Int64
@@ -48,10 +58,18 @@ module ProcessSupervision
     def close : Nil
       run_on_execution_context("process-supervision-child-close") do
         first_error = nil.as(Exception?)
+        {@input, @output, @error}.each do |pipe|
+          begin
+            pipe.try { |io| io.close unless io.closed? }
+          rescue ex
+            first_error ||= ex
+          end
+        end
+
         begin
           @process.close
         rescue ex
-          first_error = ex
+          first_error ||= ex
         end
 
         begin

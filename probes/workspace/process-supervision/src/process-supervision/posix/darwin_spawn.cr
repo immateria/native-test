@@ -10,6 +10,7 @@
     fun posix_spawn_file_actions_init(actions : Void*) : Int32
     fun posix_spawn_file_actions_destroy(actions : Void*) : Int32
     fun posix_spawn_file_actions_addinherit_np(actions : Void*, fd : Int32) : Int32
+    fun posix_spawn_file_actions_adddup2(actions : Void*, fd : Int32, target : Int32) : Int32
     fun posix_spawn_file_actions_addchdir_np(actions : Void*, path : UInt8*) : Int32
   end
 
@@ -32,14 +33,23 @@
       private SPAWN_START_SUSPENDED = 0x0080_i16
       private SPAWN_CLOEXEC_DEFAULT = 0x4000_i16
 
-      def self.launch(prepared : Spawn::Prepared, pgroup : Int32?) : {Int32, ::Process, ProcessHandle}
-        pid = create_suspended(prepared, pgroup)
+      def self.launch(prepared : Spawn::Prepared, pgroup : Int32?, plumbing : Spawn::Plumbing) : {Int32, ::Process, ProcessHandle}
+        pid = begin
+          create_suspended(prepared, pgroup, plumbing.sources)
+        rescue ex
+          plumbing.abandon
+          raise ex
+        ensure
+          # the parent must not hold the child's ends open, or the other side never sees EOF
+          plumbing.release_child_side
+        end
         process = Spawn.adopt(pid)
         handle = begin
           ProcessHandle::Kqueue.adopt_child(pid.to_i64)
         rescue ex
           LibC.kill(pid, Signal::KILL.value)
           process.wait rescue nil
+          plumbing.abandon
           raise ex
         end
 
@@ -48,12 +58,13 @@
           LibC.kill(pid, Signal::KILL.value)
           process.wait rescue nil
           handle.close rescue nil
+          plumbing.abandon
           raise ProcessSupervision::Error::Native.new("kill(SIGCONT)", errno.message, errno.value.to_i64)
         end
         {pid, process, handle}
       end
 
-      private def self.create_suspended(prepared : Spawn::Prepared, pgroup : Int32?) : Int32
+      private def self.create_suspended(prepared : Spawn::Prepared, pgroup : Int32?, stdio : StaticArray(Int32, 3)) : Int32
         attributes = StaticArray(UInt64, 64).new(0_u64)
         actions = StaticArray(UInt64, 64).new(0_u64)
         every = StaticArray(UInt64, 32).new(0_u64)
@@ -71,8 +82,15 @@
             LibProcessSupervisionDarwin.posix_spawnattr_setpgroup(pointerof(attributes), group)
           end
           LibProcessSupervisionDarwin.posix_spawnattr_setflags(pointerof(attributes), flags)
-          # CLOEXEC_DEFAULT closes everything that is not named here
-          {0, 1, 2}.each { |fd| LibProcessSupervisionDarwin.posix_spawn_file_actions_addinherit_np(pointerof(actions), fd) }
+          # CLOEXEC_DEFAULT closes everything that is not named here: inherit 0-2 unless redirected
+          3.times do |target|
+            source = stdio[target]
+            if source >= 0
+              LibProcessSupervisionDarwin.posix_spawn_file_actions_adddup2(pointerof(actions), source, target)
+            else
+              LibProcessSupervisionDarwin.posix_spawn_file_actions_addinherit_np(pointerof(actions), target)
+            end
+          end
           prepared.chdir.try do |directory|
             rc = LibProcessSupervisionDarwin.posix_spawn_file_actions_addchdir_np(pointerof(actions), directory)
             raise Spawn.exec_error(prepared.command, Errno.new(rc)) unless rc == 0

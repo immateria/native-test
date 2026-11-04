@@ -72,8 +72,15 @@ module ProcessSupervision
   # and releases the group; closing the child does neither.
   def self.spawn(command : String, args : Enumerable(String) = [] of String, *,
                  env : ::Process::Env = nil, clear_env : Bool = false,
-                 chdir : Path | String? = nil) : Child
+                 chdir : Path | String? = nil,
+                 input : ::Process::Stdio = ::Process::Redirect::Inherit,
+                 output : ::Process::Stdio = ::Process::Redirect::Inherit,
+                 error : ::Process::Stdio = ::Process::Redirect::Inherit) : Child
     {% if flag?(:win32) %}
+      unless input.is_a?(::Process::Redirect) && input.inherit? && output.is_a?(::Process::Redirect) && output.inherit? &&
+             error.is_a?(::Process::Redirect) && error.inherit?
+        raise Error::Unsupported.new("redirecting standard streams is not implemented for Windows Jobs yet")
+      end
       job = Windows::Job.new
       begin
         job.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir)
@@ -90,7 +97,7 @@ module ProcessSupervision
         end
         if group
           begin
-            return group.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir)
+            return group.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
           rescue ex : Error::Unavailable
             # lost the delegation between the probe and the spawn: use the weaker mechanism rather than fail
             group.close rescue nil
@@ -100,9 +107,9 @@ module ProcessSupervision
           end
         end
       end
-      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir)
+      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
     {% elsif flag?(:unix) %}
-      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir)
+      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
     {% else %}
       raise Error::Unsupported.new("spawning is not implemented for this target")
     {% end %}

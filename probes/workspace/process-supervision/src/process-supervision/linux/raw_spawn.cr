@@ -52,7 +52,8 @@
       end
 
       # Creates the process. Makes no call that can yield to another fiber, so it may run under a Thread::Mutex.
-      def self.create(prepared : ProcessSupervision::POSIX::Spawn::Prepared, *, cgroup : Path? = nil, pgroup : Int32? = nil) : Pending
+      def self.create(prepared : ProcessSupervision::POSIX::Spawn::Prepared, plumbing : ProcessSupervision::POSIX::Spawn::Plumbing, *,
+                      cgroup : Path? = nil, pgroup : Int32? = nil) : Pending
         error_reader, error_writer = IO.pipe
         cgroup_fd = -1
         procs_fd = -1
@@ -61,12 +62,15 @@
             cgroup_fd = open_fd(cgroup.to_s, LibC::O_RDONLY | LibC::O_CLOEXEC)
             procs_fd = open_fd((cgroup / "cgroup.procs").to_s, LibC::O_WRONLY | LibC::O_CLOEXEC)
           end
-          pid, pidfd = clone_process(prepared, cgroup_fd, procs_fd, pgroup, error_writer.fd)
+          pid, pidfd = clone_process(prepared, cgroup_fd, procs_fd, pgroup, error_writer.fd, plumbing.sources)
           Pending.new(pid, pidfd >= 0 ? pidfd : nil, error_reader)
         rescue ex
           error_reader.close rescue nil
+          plumbing.abandon
           raise ex
         ensure
+          # the parent must not hold the child's ends open, or the other side never sees EOF
+          plumbing.release_child_side
           error_writer.close rescue nil
           LibC.close(cgroup_fd) if cgroup_fd >= 0
           LibC.close(procs_fd) if procs_fd >= 0
@@ -75,7 +79,8 @@
 
       # Waits for the exec to succeed or fail, adopts the process into Crystal's reaper and builds the Child. A failed
       # exec reaps the child and raises the stdlib's exception class for the errno.
-      def self.complete(pending : Pending, prepared : ProcessSupervision::POSIX::Spawn::Prepared, group : ProcessSupervision::Group,
+      def self.complete(pending : Pending, prepared : ProcessSupervision::POSIX::Spawn::Prepared,
+                        plumbing : ProcessSupervision::POSIX::Spawn::Plumbing, group : ProcessSupervision::Group,
                         pgroup : Int32? = nil) : ProcessSupervision::Child
         process = ProcessSupervision::POSIX::Spawn.adopt(pending.pid)
         pidfd = pending.pidfd
@@ -90,6 +95,7 @@
           errno = Errno.new(buffer.to_unsafe.as(Int32*).value)
           process.wait rescue nil
           LibC.close(pidfd) if pidfd
+          plumbing.abandon
           if pgroup && pgroup > 0 && (errno == Errno::EPERM || errno == Errno::ESRCH)
             raise ProcessSupervision::Error::Unavailable.new("process group #{pgroup} cannot be joined: #{errno.message}")
           end
@@ -98,10 +104,11 @@
 
         begin
           handle = ProcessHandle::Linux.adopt_child(pending.pid.to_i64, pidfd)
-          ProcessSupervision::Child.new(process, handle, group)
+          ProcessSupervision::Child.new(process, handle, group, plumbing.input, plumbing.output, plumbing.error)
         rescue ex
           process.terminate(graceful: false) rescue nil
           process.wait rescue nil
+          plumbing.abandon
           raise ex
         end
       end
@@ -117,7 +124,7 @@
       end
 
       private def self.clone_process(prepared : ProcessSupervision::POSIX::Spawn::Prepared, cgroup_fd : Int32, procs_fd : Int32,
-                                     pgroup : Int32?, error_fd : Int32) : {Int32, Int32}
+                                     pgroup : Int32?, error_fd : Int32, stdio : StaticArray(Int32, 3)) : {Int32, Int32}
         mask = uninitialized LibC::SigsetT
         previous = uninitialized LibC::SigsetT
         # Block every signal around the fork so the child cannot run one of the runtime's handlers (they write to the
@@ -143,7 +150,7 @@
               result = LibC.syscall(SYS_CLONE3, pointerof(args), CLONE_ARGS_SIZE_VER2)
               if result == 0
                 # clone3 already placed the child in the cgroup: no need for the cgroup.procs descriptor
-                child_exec(prepared, pgroup, -1, error_fd)
+                child_exec(prepared, pgroup, -1, error_fd, stdio)
               elsif result > 0
                 pid = result.to_i32
               else
@@ -156,7 +163,7 @@
             if pid < 0 && (!use_clone3? || failure == Errno::ENOSYS || failure == Errno::EPERM)
               forked = LibC.fork
               if forked == 0
-                child_exec(prepared, pgroup, procs_fd, error_fd)
+                child_exec(prepared, pgroup, procs_fd, error_fd, stdio)
               end
               if forked > 0
                 pid = forked
@@ -189,7 +196,8 @@
       end
 
       # The child side. Plain system calls only: no allocation, no Crystal runtime, nothing that can raise.
-      private def self.child_exec(prepared : ProcessSupervision::POSIX::Spawn::Prepared, pgroup : Int32?, procs_fd : Int32, error_fd : Int32) : NoReturn
+      private def self.child_exec(prepared : ProcessSupervision::POSIX::Spawn::Prepared, pgroup : Int32?, procs_fd : Int32,
+                                  error_fd : Int32, stdio : StaticArray(Int32, 3)) : NoReturn
         empty = uninitialized LibC::SigsetT
         LibC.sigemptyset(pointerof(empty))
         if procs_fd >= 0
@@ -199,6 +207,13 @@
         end
         if group = pgroup
           child_fail(error_fd) unless LibProcessSupervisionLinux.setpgid(0, group) == 0
+        end
+        target = 0
+        while target < 3
+          source = stdio[target]
+          # sources are all >= 3 (see Plumbing), so no dup2 can overwrite a later source
+          child_fail(error_fd) if source >= 0 && LibC.dup2(source, target) < 0
+          target += 1
         end
         number = 1
         while number <= 64
