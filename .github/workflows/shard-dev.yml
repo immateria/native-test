@@ -7,6 +7,12 @@ name: shard-dev
 # Docker (default and privileged). Standard hosted runners only.
 
 on:
+  # a push registers the workflow (a new file is not dispatchable until GitHub has seen it on a push); touching
+  # .github/shard-dev.trigger runs it on the default runner
+  push:
+    paths:
+      - ".github/workflows/shard-dev.yml"
+      - ".github/shard-dev.trigger"
   workflow_dispatch:
     inputs:
       runner:
@@ -27,8 +33,8 @@ env:
 
 jobs:
   shard:
-    name: shard ${{ inputs.runner }}
-    runs-on: ${{ inputs.runner }}
+    name: shard ${{ inputs.runner || 'ubuntu-24.04' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 45
     defaults:
       run:
@@ -86,7 +92,7 @@ jobs:
           exit 0
 
       - name: Run the supervision specs in other Linux environments
-        if: runner.os == 'Linux' && inputs.scenarios
+        if: runner.os == 'Linux' && (github.event_name != 'workflow_dispatch' || inputs.scenarios)
         run: |
           set +e
           uid="$(id -u)"; gid="$(id -g)"
@@ -123,7 +129,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shard-${{ inputs.runner }}
+          name: shard-${{ inputs.runner || 'ubuntu-24.04' }}
           path: shard-out/*.txt
           if-no-files-found: warn
           retention-days: 14
@@ -132,7 +138,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shard-patch-${{ inputs.runner }}
+          name: shard-patch-${{ inputs.runner || 'ubuntu-24.04' }}
           path: shard-out/shard-format.patch
           if-no-files-found: warn
           retention-days: 14
