@@ -53,6 +53,28 @@ static double abs_ms(void) { /* ms since 1601, comparable across processes */
   return (double)u.QuadPart / 10000.0;
 }
 
+static double qpc_ms(void) {
+  LARGE_INTEGER f, c;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&c);
+  return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+typedef VOID(WINAPI *PFN_QueryInterruptTimePrecise)(PULONGLONG);
+static double itime_ms(void) { /* the kernel's interrupt-time clock (100 ns units), -1 if unavailable */
+  static PFN_QueryInterruptTimePrecise f = NULL;
+  static int looked = 0;
+  if (!looked) {
+    looked = 1;
+    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+    if (kb) f = (PFN_QueryInterruptTimePrecise)(void *)GetProcAddress(kb, "QueryInterruptTimePrecise");
+  }
+  if (!f) return -1;
+  ULONGLONG t = 0;
+  f(&t);
+  return (double)t / 10000.0;
+}
+
 static void emit(const char *kase, const char *fmt, ...) {
   char body[4096];
   va_list ap;
@@ -229,6 +251,21 @@ static int child_spawn_try(const wchar_t *resultpath) {
   DWORD e = ok ? 0 : GetLastError();
   log_to(h, "ready create_ok=%d err=%lu\n", ok != FALSE, (unsigned long)e);
   if (ok) { WaitForSingleObject(pi.hProcess, 3000); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
+  return 0;
+}
+
+static int child_write(const wchar_t *path, int count) {
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 2;
+  void *buf = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); /* page-aligned, as NO_BUFFERING needs */
+  if (!buf) return 4;
+  memset(buf, 'w', 4096);
+  for (int i = 0; i < count; i++) {
+    DWORD w;
+    if (!WriteFile(h, buf, 4096, &w, NULL)) return 3;
+  }
+  CloseHandle(h);
+  DeleteFileW(path);
   return 0;
 }
 
@@ -755,12 +792,55 @@ static void probe_rate(void) {
       SetLastError(0);
       DWORD qr = queryio ? queryio(job, NULL, &blocks, &count) : 0xFFFFFFFF;
       DWORD qe = GetLastError();
+      if (blocks) {
+        typedef VOID(WINAPI * PFN_FreeMemoryJobObject)(VOID *);
+        PFN_FreeMemoryJobObject fm = (PFN_FreeMemoryJobObject)(void *)GetProcAddress(k, "FreeMemoryJobObject");
+        if (fm) fm(blocks);
+      }
       emit(i == 0 ? "io_rate_control_enable" : "io_rate_control_enable_standalone_volume",
            "\"set_return\":%lu,\"last_error\":%lu,\"query_return\":%lu,\"query_last_error\":%lu,\"query_block_count\":%lu,\"first_block_max_iops\":%lld",
            (unsigned long)ret, (unsigned long)le, (unsigned long)qr, (unsigned long)qe, (unsigned long)count, (long long)(blocks && count ? blocks[0].MaxIops : -1));
     }
   }
   CloseHandle(job);
+
+  /* the call reports success; measure whether it changes anything: 300 write-through 4 KiB writes with and without
+   * MaxIops = 20 (enforced, that would take ~15 s) */
+  for (int limited = 0; limited < 2; limited++) {
+    HANDLE j = CreateJobObjectW(NULL, NULL);
+    DWORD sret = 0, serr = 0;
+    if (limited && setio) {
+      MY_IO_RATE r;
+      memset(&r, 0, sizeof r);
+      r.MaxIops = 20;
+      r.ControlFlags = 1; /* JOB_OBJECT_IO_RATE_CONTROL_ENABLE */
+      SetLastError(0);
+      sret = setio(j, &r);
+      serr = GetLastError();
+    }
+    wchar_t path[MAX_PATH * 2], args[1024];
+    tmp_file(path, MAX_PATH * 2, limited ? L"io-limited.bin" : L"io-plain.bin");
+    swprintf(args, 1024, L"--child-write \"%ls\" 300", path);
+    PROCESS_INFORMATION pi;
+    DWORD e = 0;
+    if (!spawn_self(args, CREATE_SUSPENDED, NULL, &pi, &e)) { emit("io_rate_effect", "\"spawn_error\":%lu", (unsigned long)e); CloseHandle(j); continue; }
+    BOOL as = AssignProcessToJobObject(j, pi.hProcess);
+    double t0 = abs_ms();
+    ResumeThread(pi.hThread);
+    int ex;
+    DWORD code = wait_exit(pi.hProcess, 25000, &ex);
+    double dt = abs_ms() - t0;
+    JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION io;
+    memset(&io, 0, sizeof io);
+    QueryInformationJobObject(j, JobObjectBasicAndIoAccountingInformation, &io, sizeof io, NULL);
+    emit(limited ? "io_rate_effect_max_iops_20" : "io_rate_effect_no_limit",
+         "\"set_return\":%lu,\"set_err\":%lu,\"assign_ok\":%s,\"writes\":300,\"exited\":%s,\"exit_code\":\"0x%08lX\",\"ms\":%.0f,"
+         "\"job_write_ops\":%llu,\"write_ops_per_s\":%.0f",
+         (unsigned long)sret, (unsigned long)serr, bstr(as), bstr(ex), (unsigned long)code, dt, (unsigned long long)io.IoInfo.WriteOperationCount,
+         dt > 0 ? (double)io.IoInfo.WriteOperationCount * 1000.0 / dt : 0.0);
+    kill_close(&pi);
+    CloseHandle(j);
+  }
 }
 
 /* ------------------------------------------------------------------ child-process policy */
@@ -946,13 +1026,16 @@ static void probe_period(void) {
   DWORD adj = 0, inc = 0;
   BOOL dis = FALSE;
   GetSystemTimeAdjustment(&adj, &inc, &dis);
-  emit("period_environment", "\"logical_processors\":%lu,\"clock_increment_100ns\":%lu", (unsigned long)si.dwNumberOfProcessors, (unsigned long)inc);
-  double t_prog = abs_ms();
+  LARGE_INTEGER qf;
+  QueryPerformanceFrequency(&qf);
+  emit("period_environment", "\"logical_processors\":%lu,\"clock_increment_100ns\":%lu,\"time_adjustment_100ns\":%lu,\"time_adjustment_disabled\":%s,\"qpc_frequency\":%lld",
+       (unsigned long)si.dwNumberOfProcessors, (unsigned long)inc, (unsigned long)adj, bstr(dis), (long long)qf.QuadPart);
+  double t_prog = abs_ms(), q_prog = qpc_ms(), i_prog = itime_ms();
   for (int kind = 0; kind < 2; kind++) {
     const char *kname = kind ? "per_process_user_time_100ms" : "per_job_user_time_100ms";
-    double prev_end = -1;
-    char gaps[256] = "";
-    size_t gl = 0;
+    double prev_end = -1, prev_q = -1, prev_i = -1;
+    char gaps[256] = "", qgaps[256] = "", igaps[256] = "";
+    size_t gl = 0, ql = 0, il = 0;
     for (int trial = 0; trial < 6; trial++) {
       HANDLE job;
       PROCESS_INFORMATION pi;
@@ -960,7 +1043,7 @@ static void probe_period(void) {
       if (!start_limited_spinner(kind, &job, &pi, &err)) { emit("period_sequential", "\"limit\":\"%s\",\"trial\":%d,\"error\":%lu", kname, trial, (unsigned long)err); CloseHandle(job); continue; }
       double t_start = abs_ms();
       int exited = WaitForSingleObject(pi.hProcess, 25000) == WAIT_OBJECT_0;
-      double t_end = abs_ms();
+      double t_end = abs_ms(), q_end = qpc_ms(), i_end = itime_ms();
       DWORD code = 0;
       GetExitCodeProcess(pi.hProcess, &code);
       FILETIME c, x, k, u;
@@ -969,12 +1052,19 @@ static void probe_period(void) {
       uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
       emit("period_sequential", "\"limit\":\"%s\",\"trial\":%d,\"started_at_ms\":%.1f,\"ended_at_ms\":%.1f,\"lived_ms\":%.1f,\"killed\":%s,\"exit_code\":\"0x%08lX\",\"user_ms\":%.1f",
            kname, trial, t_start - t_prog, t_end - t_prog, t_end - t_start, bstr(exited), (unsigned long)code, (double)uu.QuadPart / 10000.0);
-      if (exited && prev_end >= 0) gl += (size_t)snprintf(gaps + gl, sizeof gaps - gl, "%s%.1f", gl ? "," : "", t_end - prev_end);
+      if (exited && prev_end >= 0) {
+        gl += (size_t)snprintf(gaps + gl, sizeof gaps - gl, "%s%.1f", gl ? "," : "", t_end - prev_end);
+        ql += (size_t)snprintf(qgaps + ql, sizeof qgaps - ql, "%s%.1f", ql ? "," : "", q_end - prev_q);
+        il += (size_t)snprintf(igaps + il, sizeof igaps - il, "%s%.1f", il ? "," : "", i_end - prev_i);
+      }
       prev_end = exited ? t_end : -1;
+      prev_q = exited ? q_end : -1;
+      prev_i = exited ? i_end : -1;
       kill_close(&pi);
       CloseHandle(job);
     }
-    emit("period_sequential_summary", "\"limit\":\"%s\",\"ms_between_successive_kills\":\"%s\"", kname, gaps);
+    emit("period_sequential_summary", "\"limit\":\"%s\",\"ms_between_successive_kills\":\"%s\",\"same_by_qpc\":\"%s\",\"same_by_interrupt_time\":\"%s\"",
+         kname, gaps, qgaps, igaps);
   }
   /* two jobs 2.5 s apart (one job limit, one per-process limit): one pass kills both at once, a per-job timer would not */
   HANDLE ja, jb;
@@ -998,6 +1088,9 @@ static void probe_period(void) {
   if (okb) kill_close(&pb);
   CloseHandle(ja);
   CloseHandle(jb);
+  double t_all = abs_ms() - t_prog, q_all = qpc_ms() - q_prog, i_all = i_prog >= 0 ? itime_ms() - i_prog : -1;
+  emit("period_clock_rates", "\"system_time_ms\":%.1f,\"qpc_ms\":%.1f,\"interrupt_time_ms\":%.1f,\"system_per_qpc\":%.6f,\"interrupt_per_qpc\":%.6f",
+       t_all, q_all, i_all, t_all / q_all, i_all >= 0 ? i_all / q_all : -1.0);
 }
 
 /* ------------------------------------------------------------------ header and main */
@@ -1039,6 +1132,7 @@ int main(void) {
   if (argc >= 3 && wcscmp(argv[1], L"--child-sleep") == 0) { Sleep((DWORD)_wtoi(argv[2])); return 0; }
   if (argc >= 2 && wcscmp(argv[1], L"--child-spin") == 0) { double end = abs_ms() + 60000; volatile unsigned long x = 0; while (abs_ms() < end) { for (int i = 0; i < 100000; i++) x++; } return 0; }
   if (argc >= 3 && wcscmp(argv[1], L"--child-crash") == 0) return child_crash(_wtoi(argv[2]));
+  if (argc >= 4 && wcscmp(argv[1], L"--child-write") == 0) return child_write(argv[2], _wtoi(argv[3]));
   if (argc >= 3 && wcscmp(argv[1], L"--child-spawn-try") == 0) return child_spawn_try(argv[2]);
   if (argc >= 5 && wcscmp(argv[1], L"--sender") == 0) return child_sender(argv[2], (DWORD)_wtoi(argv[3]), argv[4]);
   if (argc >= 4 && wcscmp(argv[1], L"--child-debugger") == 0) return child_debugger(argv[2], _wtoi(argv[3]));

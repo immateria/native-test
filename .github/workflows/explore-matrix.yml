@@ -81,6 +81,23 @@ jobs:
           ./explore-out/build/kqueue_zombie > "explore-out/$tag-kqueue_zombie.jsonl"
           wc -l explore-out/*.jsonl
 
+      # Ubuntu 22.04 (glibc 2.35, kernel 6.8) gave EPERM from posix_spawn under RLIMIT_NPROC, 24.04 (glibc 2.39,
+      # kernel 7.0) EAGAIN. Run the case with both releases' glibc on this runner's kernel to see which one matters.
+      # seccomp is unconfined because Docker's default profile changes how glibc can create the child (clone3).
+      - name: glibc vs kernel - posix_spawn errno under RLIMIT_NPROC
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          kernel=$(uname -r)
+          for rel in 22.04 24.04; do
+            bin="explore-out/build/rlimit-glibc-ubuntu-$rel"
+            docker run --rm --security-opt seccomp=unconfined -v "$PWD":/w -w /w "ubuntu:$rel" sh -c \
+              "apt-get update -qq > /dev/null && apt-get install -y -qq gcc libc6-dev > /dev/null && cc -O1 -o /w/$bin explore/posix/rlimit.c && ldd --version | head -1" \
+              || { echo "container build failed for $rel"; continue; }
+            out="explore-out/posix-Linux-x86_64-nproc-glibc-of-ubuntu-$rel-on-kernel-$kernel.jsonl"
+            docker run --rm --security-opt seccomp=unconfined --user "$(id -u):$(id -g)" -v "$PWD":/w -w /w "ubuntu:$rel" "/w/$bin" --only nproc > "$out" 2>&1 || true
+            echo "== ubuntu:$rel userland on kernel $kernel"; cat "$out"
+          done
+
       - name: Show results
         if: always()
         run: |

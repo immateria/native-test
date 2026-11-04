@@ -178,6 +178,74 @@ static void run_cpu_variants(void) {
   }
 }
 
+/* XNU charges RLIMIT_CPU at every trap/syscall/interrupt with the CPU time since the previous check, truncated
+ * to whole microseconds, and drops the remainder (bsd/kern/kern_sig.c bsd_ast, osfmk/kern/task.c
+ * task_vtimer_update). If that is why syscall-heavy load escapes the limit, the CPU time at SIGXCPU should grow
+ * as the CPU time between syscalls falls towards 1 us. Soft limit 1 s; getppid() every `gap` loop iterations;
+ * stops at the first SIGXCPU or at 8 s of CPU. */
+static void syscall_gap_trial(unsigned long gap) {
+  struct rlimit rl = {1, RLIM_INFINITY};
+  setrlimit(RLIMIT_CPU, &rl);
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = on_xcpu;
+  sigaction(SIGXCPU, &sa, NULL);
+  volatile unsigned long x = 0;
+  unsigned long long calls = 0;
+  for (;;) {
+    for (int burst = 0; burst < 4096; burst++) {
+      for (unsigned long i = 0; i < gap; i++) x += i;
+      (void)getppid();
+      calls++;
+      if (g_xcpu) break;
+    }
+    if (g_xcpu) break;
+    if (self_cpu_ms() >= 8000) break;
+  }
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  double cpu = ru_cpu_ms(&ru);
+  emit(PROBE, "cpu_limit_vs_syscall_gap",
+       "\"loop_iterations_between_syscalls\":%lu,\"sigxcpu\":%s,\"cpu_ms_at_end\":%.0f,\"user_ms\":%.0f,\"system_ms\":%.0f,"
+       "\"syscalls\":%llu,\"cpu_us_per_syscall_interval\":%.3f,\"fraction_charged\":%.3f",
+       gap, g_xcpu ? "true" : "false", cpu, ru.ru_utime.tv_sec * 1000.0 + ru.ru_utime.tv_usec / 1000.0,
+       ru.ru_stime.tv_sec * 1000.0 + ru.ru_stime.tv_usec / 1000.0, calls, calls ? cpu * 1000.0 / (double)calls : 0.0,
+       g_xcpu ? 1000.0 / cpu : 0.0);
+}
+
+/* soft == hard: Linux kills at the hard limit; XNU's code never looks at rlim_max for CPU */
+static void soft_equals_hard(void) {
+  struct rlimit rl = {1, 1};
+  int sr = setrlimit(RLIMIT_CPU, &rl);
+  signal(SIGXCPU, SIG_IGN);
+  volatile unsigned long x = 0;
+  while (self_cpu_ms() < 5000) for (unsigned long i = 0; i < (1UL << 22); i++) x += i;
+  emit(PROBE, "cpu_limit_soft_equals_hard_sigxcpu_ignored", "\"setrlimit\":\"%s\",\"outcome\":\"survived 5 s of CPU\"", sr == 0 ? "OK" : errno_name(errno));
+}
+
+static void run_cpu_mechanism(void) {
+  static const unsigned long gaps[] = {0, 20, 100, 400, 2000, 20000};
+  size_t n = sizeof gaps / sizeof gaps[0];
+  for (size_t i = 0; i < n; i += 2) {
+    pid_t p[2];
+    for (int k = 0; k < 2 && i + k < n; k++) {
+      fflush(stdout);
+      p[k] = fork();
+      if (p[k] == 0) { syscall_gap_trial(gaps[i + k]); fflush(stdout); _exit(0); }
+    }
+    for (int k = 0; k < 2 && i + k < n; k++) { char st[64]; reap_blocking(p[k], 20000, st, sizeof st); }
+  }
+  fflush(stdout);
+  pid_t q = fork();
+  if (q == 0) { soft_equals_hard(); fflush(stdout); _exit(0); }
+  int st = 0;
+  struct rusage ru;
+  wait4(q, &st, 0, &ru);
+  char sbuf[64];
+  status_text(st, sbuf, sizeof sbuf);
+  emit(PROBE, "cpu_limit_soft_equals_hard_result", "\"status\":\"%s\",\"child_cpu_ms_at_death\":%.0f", sbuf, ru_cpu_ms(&ru));
+}
+
 static void nofile_exhausted(int cloexec, const char *kase) {
   struct rlimit rl = {32, 32};
   int sr = setrlimit(RLIMIT_NOFILE, &rl);
@@ -326,13 +394,18 @@ int main(int argc, char **argv) {
   if (!realpath(argv[0], g_self)) snprintf(g_self, sizeof g_self, "%s", argv[0]);
   if (argc > 2 && strcmp(argv[1], "--print-limits") == 0) return print_limits(argv[2]);
   if (argc > 1 && strcmp(argv[1], "--noop") == 0) return 0;
-  watchdog(150);
+  watchdog(240);
   emit_header(PROBE);
+  if (argc > 2 && strcmp(argv[1], "--only") == 0 && strcmp(argv[2], "nproc") == 0) { /* used to swap glibc and kernel in containers */
+    wait_report(fork_run(exp_nproc), "nproc", 8000);
+    return 0;
+  }
   char b[2048];
   limits_json(b, sizeof b);
   emit(PROBE, "defaults_soft_slash_hard", "%s", b);
   wait_report(fork_run(exp_inherit), "inherit", 8000);
   run_cpu_variants();
+  run_cpu_mechanism();
   wait_report(fork_run(exp_nofile_leaky), "nofile", 8000);
   wait_report(fork_run(exp_nofile_cloexec), "nofile", 8000);
   wait_report(fork_run(exp_nofile_infinity), "nofile_inf", 8000);
