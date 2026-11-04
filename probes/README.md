@@ -1,26 +1,30 @@
-# Crystal Process Development — exhaustive native probes (revision 10)
+# Crystal Process Development — exhaustive native probes (revision 12)
 
-This is the native qualification kit for exact **checkpoint 0008 / working** source under `workspace/`. Revision 10 preserves the complete revision-9 matrix and closes two production defects found during an adversarial source/runtime pass, while hardening the handoff so native receipts cannot silently run against edited or stale kit bytes.
+This is the native qualification kit for exact **checkpoint 0009 / working** source under `workspace/`. Revision 12 preserves all **889** revision-11 behavioral case identities and hardens both the Linux production API and native handback admission.
 
 It contains **459 Windows Crystal cases**, **385 macOS Crystal cases**, and **45 independent macOS C/SDK behavioral checks**: **889 behavioral checks total**.
 
-See `COVERAGE.md` for every literal case name, `R10-BEHAVIOR-MATRIX.md` for the behavior matrix, and `REVISION-10-CHANGES.md` for the production and harness changes in this pass.
+See `COVERAGE.md` for every literal case name, `R12-BEHAVIOR-MATRIX.md` for the active behavior matrix, and `REVISION-12-CHANGES.md` for this pass.
 
 ## Production source in this kit
 
-- `process-handle` 0.7.0
-- `process-supervision` 0.7.0
-- checkpoint 0008 source SHA-256 `0cc24ea5284d5e2efe6a2b533755f4ab9556812ed9551079649bc3418df341b7`
-- deterministic checkpoint archive SHA-256 `28e292cc13f1109448e7f51d481efd0477cfc24a0e7cd18d895a95121ed6cc7c`
-- 48 source files / 168,893 bytes
+- `process-handle` **0.8.0**
+- `process-supervision` **0.7.0**
+- checkpoint 0009 source SHA-256 `2eca11ff1b63d0a0671679f1cb1e54583bac2eb344e05ac5555dd0a1b2b402a5`
+- deterministic checkpoint archive SHA-256 `37f380ac3785317655932377d30ed7d97e6831742e50b2c8e9f69f59d9c971ac`
+- **48 source files / 170,026 bytes**
 
-Checkpoint 0008 adds first-error-wins cleanup to the public block-scoped `ProcessHandle.open` API and fixes Linux pidfd access-denied diagnostics so the low-level error retains the actual target PID instead of a hard-coded PID 1. Revision 10 adds a native Windows fault-injection case for the block-scoped cleanup rule.
+Checkpoint 0009 adds explicit Linux signed-native-PID range validation before pidfd conversion and `/proc` observation/identity lookup. Values above `Int32::MAX` now fail with a stable `ArgumentError` rather than leaking `OverflowError` or being interpreted as a nonexistent PID.
+
+Checkpoint 0008's first-error-wins block-scoped `ProcessHandle.open` cleanup and corrected Linux pidfd access-denied diagnostics remain intact.
 
 ## Handoff integrity
 
-Both native launchers now verify every file listed in `MANIFEST.sha256` before compiling anything. They also reject redirected build directories and recreate `.build` from scratch for each run. The exact admitted manifest is copied into the handback output.
+Both native launchers verify every file listed in `MANIFEST.sha256` before compilation, reject redirected build/output paths, and recreate `.build` from scratch. Revision 12 additionally re-verifies the manifest hash and every covered file after execution so changes during a native run cannot silently qualify.
 
-A changed or missing kit file therefore fails before native qualification begins instead of producing a receipt against unknown source bytes.
+Native JSONL admission is independent of the probe's exit code. Every expected case from `COVERAGE.md` must occur exactly once and pass; unexpected non-informational cases, duplicates, skips, failures, malformed records, missing/non-final summaries, or contradictory summary counters fail qualification. The macOS C/SDK lane now validates its actual final-summary format rather than rejecting it.
+
+Diagnostic handbacks are packaged even when qualification fails.
 
 ## Windows
 
@@ -40,14 +44,14 @@ Run without `sudo`:
 ./run-macos.sh
 ```
 
-Return `macos-probe-handback.zip` unchanged even if compilation, a Crystal case, the C/SDK lane, manifest admission, or the watchdog fails.
+Return `macos-probe-handback.zip` unchanged even if compilation, a Crystal case, the C/SDK lane, manifest admission/revalidation, coverage validation, or the watchdog fails.
 
 ## Requirements
 
-- Native probe lane: Crystal 1.21.1 or newer.
-- macOS: Xcode Command Line Tools (`clang`) plus Python 3 for the watchdog.
-- No third-party shards; exact checkpoint-0008 source is bundled.
+- Native probe lane: Crystal **1.21.1 or newer**.
+- macOS: Xcode Command Line Tools (`clang`) plus Python 3 for the watchdog/result validator.
+- No third-party shards; exact checkpoint-0009 source is bundled.
 - Whole-run watchdog: **1800 seconds**.
 - Partial/failing handbacks are diagnostic evidence and should still be returned.
 
-Revision 10 is **native runtime pending**. Linux-hosted specs and Windows/macOS cross-target compilation are verification evidence, not native Windows/macOS qualification.
+Revision 12 is **native runtime pending**. Linux-hosted specs and Windows/macOS cross-target compilation are verification evidence, not native Windows/macOS qualification.

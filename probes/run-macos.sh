@@ -15,8 +15,8 @@ fi
 if [ -d "$RUN" ]; then rm -rf -- "$RUN"; fi
 mkdir -p "$RUN/child-artifacts"
 {
-  echo "probe=macos-0008-r10"
-  echo "probe_revision=10"
+  echo "probe=macos-0009-r12"
+  echo "probe_revision=12"
   echo "date_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   echo "os=$(uname -s)"
   echo "arch=$(uname -m)"
@@ -129,5 +129,35 @@ if command -v clang >/dev/null 2>&1; then
   fi
 else
   echo "clang unavailable" > "$RUN/abi-build.log"
+fi
+# Never interpret a zero process exit as complete native qualification: require
+# every named case, without duplicates, plus coherent per-lane summaries.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -B "$ROOT/validate-results.py" --coverage "$ROOT/COVERAGE.md" --lane macos --results "$RUN" > "$RUN/crystal-validation.log" 2>&1
+  CRYSTAL_VALIDATION_RC=$?
+  python3 -B "$ROOT/validate-results.py" --coverage "$ROOT/COVERAGE.md" --lane sdk --results "$RUN" > "$RUN/sdk-validation.log" 2>&1
+  SDK_VALIDATION_RC=$?
+  echo "crystal_coverage_exit=$CRYSTAL_VALIDATION_RC" >> "$RUN/environment.txt"
+  echo "sdk_coverage_exit=$SDK_VALIDATION_RC" >> "$RUN/environment.txt"
+  if [ "$CRYSTAL_VALIDATION_RC" -ne 0 ] || [ "$SDK_VALIDATION_RC" -ne 0 ]; then
+    [ "$RUN_RC" -ne 0 ] || RUN_RC=1
+  fi
+else
+  echo "coverage_validation=unavailable-python3" >> "$RUN/environment.txt"
+  [ "$RUN_RC" -ne 0 ] || RUN_RC=1
+fi
+
+# Revalidate the admitted kit after execution. This catches edits or sync races
+# between the preflight and compilation/run, including changes to the manifest.
+POST_MANIFEST_SHA=$(shasum -a 256 "$MANIFEST" 2>/dev/null | awk '{print $1}')
+if [ -z "$POST_MANIFEST_SHA" ] || [ "$POST_MANIFEST_SHA" != "$MANIFEST_SHA" ]; then
+  echo "post_manifest_check=fail" >> "$RUN/environment.txt"
+  echo "manifest changed during native run" > "$RUN/post-manifest-check.log"
+  [ "$RUN_RC" -ne 0 ] || RUN_RC=1
+elif shasum -a 256 -c "$MANIFEST" > "$RUN/post-manifest-check.log" 2>&1; then
+  echo "post_manifest_check=pass" >> "$RUN/environment.txt"
+else
+  echo "post_manifest_check=fail" >> "$RUN/environment.txt"
+  [ "$RUN_RC" -ne 0 ] || RUN_RC=1
 fi
 exit "$RUN_RC"

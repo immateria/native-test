@@ -73,6 +73,17 @@ require "./spec_helper"
       (error.message || "").should contain("close(pidfd)")
     end
 
+    it "rejects Linux native PID overflow before pid_t conversion" do
+      [
+        -> { ProcessHandle.open(Int64::MAX) },
+        -> { ProcessHandle.observe(Int64::MAX) },
+        -> { ProcessHandle.lookup(Int64::MAX) },
+      ].each do |operation|
+        error = expect_raises(ArgumentError) { operation.call }
+        (error.message || "").should contain("pid exceeds native pid range")
+      end
+    end
+
     it "threads the real PID through pidfd signal access-denied diagnostics" do
       native = File.read(Path[__DIR__].parent / "src/process-handle/linux/native.cr")
       handle = File.read(Path[__DIR__].parent / "src/process-handle/linux/handle.cr")
@@ -137,7 +148,7 @@ require "./spec_helper"
 {% else %}
   describe ProcessHandle do
     it "loads the public surface" do
-      ProcessHandle::VERSION.should eq("0.7.0")
+      ProcessHandle::VERSION.should eq("0.8.0")
     end
   end
 {% end %}

@@ -1,4 +1,4 @@
-# macOS native process qualification harness for Crystal Process Development 0008, probe revision 10.
+# macOS native process qualification harness for Crystal Process Development 0009, probe revision 12.
 # Compile with Crystal 1.21.1+; this file uses only the bundled workspace shards.
 # Every signal targets a process/group created by this executable. Never elevate.
 require "json"
@@ -197,7 +197,7 @@ module NativeProbe
       j.object do
         j.field "schema", 1
         j.field "platform", "macos"
-        j.field "checkpoint", "0008"
+        j.field "checkpoint", "0009"
         j.field "case", name
         j.field "status", status
         j.field "elapsed_ms", elapsed.total_milliseconds.round(3)

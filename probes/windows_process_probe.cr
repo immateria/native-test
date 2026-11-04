@@ -1,4 +1,4 @@
-# Windows native process qualification harness for Crystal Process Development 0008, probe revision 10.
+# Windows native process qualification harness for Crystal Process Development 0009, probe revision 12.
 # Compile with Crystal 1.21.1+. All destructive operations target owned children
 # and newly created unnamed Job Objects; never use with elevation.
 require "json"
@@ -497,7 +497,7 @@ module NativeProbe
       j.object do
         j.field "schema", 1
         j.field "platform", "windows"
-        j.field "checkpoint", "0008"
+        j.field "checkpoint", "0009"
         j.field "case", name
         j.field "status", status
         j.field "elapsed_ms", elapsed.total_milliseconds.round(3)

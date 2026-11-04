@@ -11,7 +11,10 @@ Detached identity comparison is deliberately stricter than retained-handle
 identity. `Identity#same_pid?` is numeric equality only. `same_process?` returns
 true only when both identities carry generation tokens and those tokens match.
 A pidfd can therefore remain a stable retained capability even when restricted
-procfs forces its plain `Identity` to carry no generation token.
+procfs forces its plain `Identity` to carry no generation token. Linux rejects
+PID values outside signed native `pid_t` range before converting them for
+`pidfd_open` or interpreting them as `/proc/<pid>` identities, matching the
+explicit native-range checks on the other POSIX backends.
 
 Observation follows the pty-server daemon-supervision rule: inability to prove a
 live identity is `Unknown`, never optimistic `Live`. Linux uses `/proc` state plus

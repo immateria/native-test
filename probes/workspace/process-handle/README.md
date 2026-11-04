@@ -52,7 +52,8 @@ POSIX targets retain the conservative `kill(pid, 0)` presence-only fallback.
 Current backends:
 
 - Linux x86-64/aarch64: `pidfd_open` + `pidfd_send_signal`; `/proc/<pid>/stat`
-  start-time token when readable; event-loop-based pidfd termination waits with
+  start-time token when readable; public open/observe/lookup reject values beyond
+  native signed `pid_t` range before syscall or `/proc` conversion; event-loop-based pidfd termination waits with
   a private CLOEXEC duplicate for each waiter. The pidfd remains a stable retained process
   capability even when restricted/missing procfs means the detached
   `Identity#generation` cannot be recorded.
@@ -72,7 +73,7 @@ numeric PID equality, while `Identity#same_process?` requires generation evidenc
 on both sides. A tokenless identity therefore never promotes PID reuse risk into a
 false same-process claim.
 
-macOS still has no stable process-reference backend in 0.7.0, but it can now
+macOS still has no stable process-reference backend in 0.8.0, but it can now
 return generation-bearing `lookup`/`observe` snapshots through `libproc`.
 FreeBSD retains the conservative `observe` fallback; other targets do not gain
 an unsupported stable handle merely from point-in-time process inspection.

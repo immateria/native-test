@@ -26,6 +26,8 @@ creation-time process observations, and Windows lifecycle hardening found by exh
 native qualification: finite registered-wait timeouts, close/effect admission, strict
 post-close Job behavior, leak-free Job event-reader teardown, and first-error-wins
 cleanup for both supervised-spawn rollback and block-scoped `ProcessHandle.open`. Linux
-pidfd signalling diagnostics also retain the actual target PID through access-denied errors.
+pidfd signalling diagnostics also retain the actual target PID through access-denied errors,
+and Linux rejects out-of-range native PID values before conversion rather than leaking
+an arithmetic overflow from the implementation.
 Platform capability boundaries remain explicit. See the installed Skill references for external-source
 comparison and exact native qualification receipts.

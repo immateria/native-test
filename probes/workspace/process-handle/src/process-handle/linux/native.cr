@@ -27,6 +27,7 @@
     end
 
     def self.open_pidfd(pid : Int64) : IO::FileDescriptor
+      validate_native_pid!(pid)
       {% if flag?(:x86_64) || flag?(:aarch64) %}
         fd = retry_eintr { LibC.syscall(SYS_PIDFD_OPEN, pid.to_i32, 0_u32) }
         if fd < 0
@@ -117,6 +118,7 @@
     # If procfs cannot be inspected but kill(pid, 0) still proves presence, the
     # result is Unknown rather than optimistically Live or falsely Dead.
     def self.observe(pid : Int64) : ProcessHandle::Observation
+      validate_native_pid!(pid)
       if stat = read_stat(pid)
         state, token = stat
         observed_state = case state
@@ -144,6 +146,7 @@
     # /proc/<pid>/stat field 22. The comm field is parenthesized and may contain
     # spaces or parentheses, so split only after its final ') '.
     def self.lookup_identity(pid : Int64) : ProcessHandle::Identity?
+      validate_native_pid!(pid)
       stat = read_stat(pid)
       stat ? ProcessHandle::Identity.new(pid, stat[1]) : nil
     end
@@ -176,6 +179,10 @@
       raise ex
     rescue ex
       raise ProcessHandle::Error::Native.new("read /proc/#{pid}/stat", ex.message || ex.class.name)
+    end
+
+    private def self.validate_native_pid!(pid : Int64) : Nil
+      raise ArgumentError.new("pid exceeds native pid range") if pid > Int32::MAX
     end
 
     private def self.process_present_by_signal?(pid : Int64) : Bool

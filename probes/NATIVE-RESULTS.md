@@ -1,16 +1,13 @@
-# Native qualification status — revision 10
+# Native qualification status — revision 12
 
-Revision 10 is **native runtime pending**. Its matrix is **459 Windows Crystal + 385 macOS Crystal + 45 independent macOS C/SDK = 889 checks**.
+Revision 12 is **native runtime pending**. Its matrix remains **459 Windows Crystal + 385 macOS Crystal + 45 independent macOS C/SDK = 889 checks**.
 
-Revision 7 supplied a complete macOS diagnostic run; revision 8 corrected the zombie fixture but was superseded before a new native handback. No valid revision-7/8/9 Windows process handback exists, and revision 9 itself did not receive a complete native closure receipt before this source hardening pass.
+Revision 7 supplied a complete macOS diagnostic run; later revisions corrected and broadened the native suite before a new complete handback. There is no native revision-12 Windows or macOS receipt yet.
 
-Checkpoint 0008 changes two production behaviors:
+Checkpoint 0009 retains the checkpoint-0008 cleanup/diagnostic fixes and adds one Linux-only production correction: public Linux `open`, `observe`, and `lookup` reject PIDs outside signed native `pid_t` range before conversion or `/proc` lookup.
 
-1. block-scoped `ProcessHandle.open` preserves a caller exception when owner cleanup also fails;
-2. Linux pidfd signal access-denied errors retain the actual target PID through the low-level diagnostic.
+The Windows/macOS production backend behavior is otherwise unchanged, but revision 12 changes checkpoint metadata and the native handoff admission path. Fresh execution of these exact bytes is therefore required for both native lanes.
 
-The first change has a new Windows native fault-injection case, `r10_block_scoped_open_preserves_primary_error`, so fresh Windows execution against the exact revision-10 bytes is mandatory before promoting that lane.
-
-The macOS production backend behavior is unchanged by checkpoint 0008, but revision 10 changes probe metadata and the native handoff admission path. Fresh macOS execution is therefore also required to qualify the complete revision-10 kit and its manifest-preflight wrapper.
+Revision 12 also repairs the revision-11 C/SDK result validator: the independent C probe emits a final summary and the validator now checks that summary instead of rejecting it. Both wrappers additionally revalidate the admitted manifest after execution.
 
 Linux-hosted specs and Windows/macOS cross-target compiles are recorded in `VERIFICATION.md`; neither substitutes for native execution.

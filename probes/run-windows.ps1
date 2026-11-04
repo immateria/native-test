@@ -15,11 +15,57 @@ if (Test-Path -LiteralPath $Run) {
   }
   Remove-Item -LiteralPath $Run -Recurse -Force
 }
+# PowerShell 5.1 native coverage verifier: no new Windows runtime dependency.
+function Assert-CompleteWindowsResults {
+  param([string]$CoveragePath, [string]$ResultsPath)
+  if (!(Test-Path -LiteralPath $ResultsPath -PathType Leaf)) { throw "Missing Windows results: $ResultsPath" }
+  $Names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $InWindows = $false
+  foreach ($line in (Get-Content -LiteralPath $CoveragePath -Encoding UTF8)) {
+    if ($line.StartsWith('## ')) { $InWindows = $line.StartsWith('## Windows Crystal ') }
+    elseif ($InWindows -and $line.StartsWith('- `')) {
+      if ($line -cnotmatch '^- `([^`]+)`$') { throw "Malformed Windows coverage entry: $line" }
+      if (!$Names.Add($Matches[1])) { throw "Duplicate coverage declaration: $($Matches[1])" }
+    }
+  }
+  if ($Names.Count -eq 0) { throw 'Empty Windows coverage ledger' }
+  $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  $Body = 0; $Failures = 0; $Skips = 0; $Summary = $null
+  $Lines = @(Get-Content -LiteralPath $ResultsPath -Encoding UTF8)
+  foreach ($line in $Lines) {
+    if ([string]::IsNullOrWhiteSpace($line)) { throw 'Empty JSONL record' }
+    $record = ConvertFrom-Json -InputObject $line -ErrorAction Stop
+    if ($record.schema -ne 1 -or $record.platform -ne 'windows' -or $record.checkpoint -ne '0009') { throw 'Wrong record schema, platform or checkpoint' }
+    if ($record.case -eq 'summary') {
+      if ($null -ne $Summary) { throw 'Duplicate summary' }
+      $Summary = $record
+      continue
+    }
+    if ($null -ne $Summary) { throw 'Summary was not last' }
+    if ($record.status -cnotin @('pass','fail','error','skip','info')) { throw "Invalid result status: $($record.status)" }
+    $Body++
+    if ($record.status -cin @('fail','error')) { $Failures++ }
+    if ($record.status -ceq 'skip') { $Skips++ }
+    if ($Names.Contains([string]$record.case)) {
+      if (!$Seen.Add([string]$record.case)) { throw "Duplicate result: $($record.case)" }
+      if ($record.status -cne 'pass') { throw "Nonpassing case: $($record.case)=$($record.status)" }
+    } elseif ($record.status -cne 'info') {
+      throw "Unexpected result: $($record.case)"
+    }
+  }
+  if ($null -eq $Summary) { throw 'Missing final summary' }
+  if ($Seen.Count -ne $Names.Count) { throw "Incomplete coverage: got $($Seen.Count) expected $($Names.Count)" }
+  if ($Failures -ne 0 -or $Skips -ne 0 -or $Summary.status -cne 'pass') { throw 'Nonpassing summary or diagnostic records' }
+  if ([string]$Summary.details.cases -cne [string]$Body -or
+      [string]$Summary.details.failures -cne [string]$Failures -or
+      [string]$Summary.details.skips -cne [string]$Skips) { throw 'Summary counters contradict recorded results' }
+  return $Seen.Count
+}
 $ExitCode = 0
 New-Item -ItemType Directory -Force -Path $Run,$ChildDir | Out-Null
 $Report = Join-Path $Run "environment.txt"
-"probe=windows-0008-r10" | Set-Content -Encoding UTF8 $Report
-"probe_revision=10" | Add-Content $Report
+"probe=windows-0009-r12" | Set-Content -Encoding UTF8 $Report
+"probe_revision=12" | Add-Content $Report
 "os_version=$([Environment]::OSVersion.VersionString)" | Add-Content $Report
 "processor_architecture=$env:PROCESSOR_ARCHITECTURE" | Add-Content $Report
 "processor_count=$([Environment]::ProcessorCount)" | Add-Content $Report
@@ -92,6 +138,39 @@ try {
     try { $p.WaitForExit(5000) | Out-Null } catch {}
     $ExitCode = 124
     "run_state=timeout-1800s`nexit_code=124" | Set-Content -Encoding UTF8 (Join-Path $Run "run-status.txt")
+  }
+  try {
+    $ValidCount = Assert-CompleteWindowsResults -CoveragePath (Join-Path $Root 'COVERAGE.md') -ResultsPath $Result
+    "qualification_validation=pass cases=$ValidCount" | Set-Content -Encoding UTF8 (Join-Path $Run 'coverage-validation.log')
+  } catch {
+    "qualification_validation=fail error=$($_.Exception.Message)" | Set-Content -Encoding UTF8 (Join-Path $Run 'coverage-validation.log')
+    if ($ExitCode -eq 0) { $ExitCode = 1 }
+  }
+
+  # Bind the handback to the same kit admitted before compilation. Rehash both
+  # the manifest and every covered file so mid-run edits cannot silently qualify.
+  try {
+    $PostManifestHash = (Get-FileHash -LiteralPath $Manifest -Algorithm SHA256).Hash
+    if ($PostManifestHash -ne $ManifestHash) { throw 'Manifest changed during native run' }
+    $PostManifestCount = 0
+    foreach ($line in Get-Content -LiteralPath $Manifest) {
+      if ($line -notmatch '^([0-9a-fA-F]{64})  (.+)$') { throw "Malformed manifest line: $line" }
+      $Expected = $Matches[1]
+      $Relative = $Matches[2]
+      $Candidate = Join-Path $Root ($Relative -replace '/', [IO.Path]::DirectorySeparatorChar)
+      if (!(Test-Path -LiteralPath $Candidate -PathType Leaf)) { throw "Manifest file missing: $Relative" }
+      $Actual = (Get-FileHash -LiteralPath $Candidate -Algorithm SHA256).Hash
+      if ($Actual -ne $Expected) { throw "Manifest hash mismatch: $Relative" }
+      $PostManifestCount++
+    }
+    if ($PostManifestCount -ne $ManifestCount) { throw 'Manifest entry count changed during native run' }
+    'post_manifest_check=pass' | Add-Content $Report
+    "manifest_entries_post=$PostManifestCount" | Add-Content $Report
+    'post_manifest_check=pass' | Set-Content -Encoding UTF8 (Join-Path $Run 'post-manifest-check.log')
+  } catch {
+    'post_manifest_check=fail' | Add-Content $Report
+    "post_manifest_check=fail error=$($_.Exception.Message)" | Set-Content -Encoding UTF8 (Join-Path $Run 'post-manifest-check.log')
+    if ($ExitCode -eq 0) { $ExitCode = 1 }
   }
 } catch {
   if ($ExitCode -eq 0) { $ExitCode = 125 }

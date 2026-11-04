@@ -1,6 +1,6 @@
-# Revision 10 literal coverage ledger
+# Revision 12 literal coverage ledger
 
-Revision 10 is rebased on Crystal Process Development **checkpoint 0008** and contains **889 individually named behavioral checks**: **459 Windows Crystal**, **385 macOS Crystal**, and **45 independent macOS C/SDK** checks. The names below are the qualification authority used by the handback validator; a current-revision handback is incomplete if any expected name is absent.
+Revision 12 is bound to Crystal Process Development **checkpoint 0009** and contains **889 individually named behavioral checks**: **459 Windows Crystal**, **385 macOS Crystal**, and **45 independent macOS C/SDK** checks. The names below are the qualification authority used by the handback validator; a current-revision handback is incomplete if any expected name is absent.
 
 ## Windows Crystal — 459 cases
 

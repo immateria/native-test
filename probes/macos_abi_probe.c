@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE 1
 /*
- * Independent macOS SDK/libproc qualification companion for checkpoint 0008, probe revision 10.
+ * Independent macOS SDK/libproc qualification companion for checkpoint 0009, probe revision 12.
  * This intentionally does not share the Crystal FFI definitions. It exercises
  * the SDK's proc_bsdinfo layout and a bounded set of libproc behaviors using
  * only this process and children it creates. Never run elevated.
