@@ -60,11 +60,10 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
   `SeIncreaseBasePriorityPrivilege` disabled.** Measured in fresh processes (no earlier calls): the kit executable
   and `job_explore` both get 1314 for all three request shapes (basic, extended, extended + KILL_ON_JOB_CLOSE), with
   no thread token. This matches Microsoft's "the calling process must enable" the privilege (and a Stack Overflow
-  report that fixed the same 1314 by enabling it). An earlier `job_explore` run appeared to succeed because something it did
-  first changed the process state. It is **not** `SetPriorityClass(self, X)` for any of the six classes, REALTIME
-  included (measured: the HIGH request stays 1314 and the privilege stays disabled throughout); `priority_flip`
-  rows now replay the remaining candidates (creating a job with a lower class, a suspended child, assigning it,
-  resuming, terminating). `r6_priority_applied_high` enables the privilege when the token holds it, verifies the
+  report that fixed the same 1314 by enabling it). Inside the exploration program, HIGH requests in one loop iteration
+  reported success while trace calls bracketing it reported 1314; **I did not find the cause** (it is not
+  `SetPriorityClass(self, X)` for any class, nor creating a lower-class job, a suspended child, assigning,
+  resuming or terminating it — all replayed, all stayed 1314). The kit's conclusion does not depend on it. `r6_priority_applied_high` enables the privilege when the token holds it, verifies the
   state by reading the token, restores it afterwards, and expects success; a token that does not hold it (the
   unelevated run) is expected to get 1314. Its details record `privilege_before`/`privilege_during`.
 * The fault-injection helpers (`job_checked_close_failure_surfaces` and siblings) close a handle behind the library's
@@ -99,6 +98,8 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
 
 ## Evidence boundary
 
-First pass (the harness fixes + C rename) ran natively. The second-pass changes above are type-checked
-for `x86_64-windows-msvc` and `aarch64-apple-darwin` (and the shard's 18 Linux specs pass) but had not run
-natively when this was written.
+Everything above ran natively: run `41776017433` qualifies the kit on macOS 15 arm64 (386 Crystal + 45 C/SDK
+cases), on Windows Server 2025 elevated as the runner provides it (459) and on Windows with a filtered, unelevated
+token (459); all three validators pass. The measurements behind the changes are in `explore/FINDINGS.md`. The kit was
+run green once in that configuration after several intermittent failures (one macOS kqueue case, one handle-reuse
+race) that were fixed or are listed as open there, so it is not evidence of zero flakiness.
