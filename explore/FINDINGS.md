@@ -35,11 +35,15 @@ Not when a limit is crossed. Microsoft only says the system "periodically checks
   they read zero again, and no further message is sent until that query is made (documented).
 * Consequence for tests: any assertion that a limit was enforced must allow **two periods (≥ 15 s)**. The kit's
   4 s spin / 7 s wait and 5 s notification wait passed or failed by where the tick happened to land.
-* **Not specific to one build or to job limits** (`proc_explore period`, runs `41783031447`, `41783972189`): successive
-  kills were 6990.7–7015.1 ms apart on Server 2022 (20348) and 6998.3–7002.1 ms on Server 2025 (26100), elevated and
-  unelevated, for a per-job **and** a per-process user-time limit; on Windows 11 arm64 (26200) 7042–7130 ms. A job
+* **Not specific to one build or to job limits** (`proc_explore period`, runs `41783031447`, `41783972189`, `41788061976`): successive
+  kills were 6989.6–7015.1 ms apart on Server 2022 (20348) and 6998.3–7002.1 ms on Server 2025 (26100), elevated and
+  unelevated, for a per-job **and** a per-process user-time limit; on Windows 11 arm64 (26200) 7042–7161 ms. A job
   with a job limit and a job with a process limit, started 2.5 s apart, were killed in the same millisecond on every
   build. The exit code is `0xC0000044` (`STATUS_QUOTA_EXCEEDED`).
+* The longer arm64 period is **not a clock effect** (run `41788061976`): the same kills timed with
+  `QueryPerformanceCounter` and with interrupt time agree with system time to 0.1 ms, and over the 90 s probe the
+  three clocks ran at the same rate (system/QPC 1.000002 on arm64, 0.999988–1.000013 on x64). On arm64 the pass came
+  every 7070–7161 ms in that run.
 
 ### A HIGH or REALTIME job priority class needs `SeIncreaseBasePriorityPrivilege` ENABLED (verified)
 
@@ -231,8 +235,13 @@ the same in all five configurations unless a difference is stated.
   (`ERROR_CHILD_PROCESS_BLOCKED`), also with the override flag; `..._RESTRICTED_UNLESS_SECURE` lets it create.
 * `JobObjectNetRateControlInformation` (bandwidth, DSCP tag) is accepted and read back, also with the filtered token
   (verified).
-* `SetIoRateControlInformationJobObject` reports success, but `QueryIoRateControlInformationJobObject` fails (24
-  elevated, 5 with the filtered token), so whether the I/O limit took effect is **not settled**.
+* **I/O rate control works, although Microsoft marks it unsupported.** Both `SetIoRateControlInformationJobObject` and
+  `QueryIoRateControlInformationJobObject` carry "Windows 10, version 1607, and newer: This function is not
+  supported", and the query does fail (24 elevated, 5 with the filtered token). But with `MaxIops = 20`
+  (`ControlFlags = ENABLE`, no volume name) a child doing 4 KiB write-through writes managed 224–240 writes in 25 s
+  (9–10 per second) on every build and token, against 300 writes in 0.7–3.6 s without the limit (run
+  `41788061976`). That the rate is about half of `MaxIops` was not explained (inferred: a write-through write counts
+  as two I/Os).
 * Creating a silo through `NtSetInformationJobObject(JobObjectCreateSilo)` returned `STATUS_INVALID_PARAMETER`
   everywhere, and the extended limit `JOB_OBJECT_LIMIT_SILO_READY` was rejected (87). Not pursued.
 
@@ -306,8 +315,29 @@ runners).
   | user-time spin, `SIGXCPU` ignored or handled | **never killed** (ran to the 8 s cut-off) | `SIGKILL` at 3.00 s |
   | syscall-heavy spin (about half system time) | `SIGXCPU` seconds late (6.6–6.8 s CPU) or **not at all** in 8 s | `SIGXCPU` at 1.00 s, `SIGKILL` at 3.00 s |
 
-  The hard limit was never enforced on any macOS runner. The handler variant got exactly one `SIGXCPU`. A CPU budget
-  on macOS has to be enforced by the supervisor (sample `proc_pid_rusage`, then kill).
+  The hard limit was never enforced on any macOS runner, also not with soft = hard = 1 s (`SIGXCPU` ignored: ran 5 s;
+  Linux: `SIGKILL` at 1.000 s). The handler variant got exactly one `SIGXCPU`. A CPU budget on macOS has to be
+  enforced by the supervisor (sample `proc_pid_rusage`, then kill).
+* **Why (XNU source, confirmed by measurement):** `setrlimit(RLIMIT_CPU)` arms a per-task timer for the *soft*
+  limit only (`bsd/kern/kern_resource.c`). `task_vtimer_check` sets `AST_BSD` on every trap, system call and
+  interrupt (`osfmk/arm64/sleh.c`; `hndl_alltraps`, `hndl_unix_scall` and the interrupt path in
+  `osfmk/x86_64/idt64.s`). `bsd_ast` (`bsd/kern/kern_sig.c`) then charges the CPU time since the previous check, as
+  returned by `task_vtimer_update` (`osfmk/kern/task.c`): that converts the delta with `absolutetime_to_microtime`,
+  keeps only the **whole microseconds** (and drops whole seconds), and always resets the saved value, so the
+  remainder is lost. When the budget is used up it sends one `SIGXCPU` and switches the timer off; nothing looks at
+  `rlim_max`. So every check discards up to 1 µs, and a process that enters the kernel more often than once per
+  microsecond of CPU is barely charged. Measured with `getppid()` every N loop iterations (soft limit 1 s; run
+  `41788061976`):
+
+  | CPU time between syscalls | share charged, macOS (5 runners) | Linux (3 runners) |
+  |---|---|---|
+  | 0.23–0.6 µs | 0 % — no `SIGXCPU` in 8 s (macOS 15 Intel, at 0.86–0.97 µs: 18 %) | 100 % |
+  | 1.1–1.6 µs | 79–93 % | 100 % |
+  | 3.3–5.7 µs | 85–92 % | 100 % |
+  | 29–54 µs | 98–99 % | 100 % |
+
+  which is roughly ⌊interval⌋ / interval. A pure user-time spin is checked only at timer interrupts (milliseconds
+  apart), loses almost nothing, and gets `SIGXCPU` on time.
 * `RLIMIT_AS` and `RLIMIT_DATA` below the current usage: `setrlimit` fails with `EINVAL` on macOS (so nothing is
   limited; a 768 MiB allocation succeeds); Linux accepts both and the allocation fails with `ENOMEM`.
 * `RLIMIT_NOFILE`: macOS defaults 10240/unlimited and accepts a soft limit of `RLIM_INFINITY`; Linux defaults
@@ -316,8 +346,10 @@ runners).
   macOS dyld aborts (`SIGABRT`), Linux's loader exits 127 (`libc.so.6: ... Error 24`). With `O_CLOEXEC` descriptors the
   child starts normally on both.
 * `RLIMIT_NPROC` 1 for the runner user: `fork` fails `EAGAIN` everywhere; `posix_spawn` fails `EAGAIN`, except
-  `EPERM` on Ubuntu 22.04 (glibc 2.35, kernel 6.8; 24.04 has glibc 2.39, kernel 7.0 — which one matters was not
-  isolated).
+  `EPERM` with Ubuntu 22.04's glibc 2.35. Running the case in containers with each release's glibc on both runners'
+  kernels (seccomp unconfined) settles it: glibc 2.35 gives `EPERM` on kernel 6.8 and 7.0, glibc 2.39 gives `EAGAIN`
+  on both (run `41788061976`). This is glibc bug 29109, "posix_spawn() always returns 1 (EPERM) on clone() failure"
+  (the real errno was discarded), fixed in 2.36; Ubuntu 22.04's 2.35 does not carry the fix.
 * `RLIMIT_FSIZE` with `SIGXFSZ` ignored: the write past the limit fails with `EFBIG` on both.
 * Limits set before fork/exec or `posix_spawn` are inherited unchanged on both.
 
@@ -356,7 +388,6 @@ runners).
 * the in-loop HIGH success in the exploration tool (above);
 * the single macOS 8-child kqueue failure (8 registrations, 7 events);
 * why `pwsh` cannot launch native commands under the filtered token on the hosted runner;
-* the Windows enforcement period (7.000 s on x64, about 7.08 s on arm64) is not documented anywhere I found;
-* why macOS enforces `RLIMIT_CPU` late or not at all for syscall-heavy load, and never at the hard limit;
-* whether `SetIoRateControlInformationJobObject` limits anything (its query fails);
-* which of glibc 2.35 or kernel 6.8 makes `posix_spawn` report `EPERM` instead of `EAGAIN` under `RLIMIT_NPROC`.
+* the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect) is not documented
+  anywhere I found, and why arm64's pass runs later is not known;
+* why an I/O rate limit of 20 IOPS allows about 10 write-through writes per second.
