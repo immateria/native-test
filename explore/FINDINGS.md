@@ -1134,10 +1134,34 @@ twice even when output and error name the same file; the child's pipe ends are s
 as in the stdlib; the parent's copies of the child's ends are closed after the Job mutex is released (closing an IO may
 yield, and a fiber must not yield while holding a `Thread::Mutex`).
 
-Not built yet: stream redirection for arbitrary `IO` objects; descendant tracking on macOS (the marker scan is
-measured, not implemented); `posix_spawn` as the Linux engine for process groups (the fork cost grows with the heap);
-kit qualification cases for the new API (the shard specs cover it natively on Linux, macOS and Windows; no kit case
-exercises `ProcessSupervision.spawn` or the stream options).
+## Any IO for streams, `pidfd_spawn`, the descendant marker, kit r14 (what was built, what building it found)
+
+Commit `af9533e`. shard-dev runs `41935986057` (ubuntu-24.04), `41935994918` (22.04), `41935998676` (24.04 arm64),
+`41936002311` / `41936024178` / `41936012111` (macOS 15, 26, 15 Intel), `41936016495` / `41936020264` (Windows 2022, 2025);
+kit run `41935986039`. **0 failures everywhere**: 60 supervision examples on Linux in each of the eight environments on each
+of the three Ubuntu runners, and again with the engine forced to clone3 and to fork; 39 on macOS; 22 on Windows. Kit:
+Windows elevated 468 and unelevated 468, macOS 397 Crystal + 45 C/SDK, all `qualification_validation=pass`, manifest checks
+before and after pass; every one of the 20 new r14 cases passes.
+
+* **Any IO for standard streams.** An `IO` that is not a file descriptor gets a pipe and a copy fiber (`StreamCopies`);
+  `Child#wait` waits for the copies and raises a failed one (the status stays in `Child#status`). A child that exits
+  without reading its input is not an error here (the stdlib's `Process#wait` raises the broken pipe). A megabyte each way
+  through `IO::Memory` and a failed exec with IO objects leaking nothing were checked on all three systems.
+* **`pidfd_spawn` (glibc 2.39) as the first Linux engine.** Median spawn at a 512 MiB touched heap: 0.27-0.45 ms against
+  22.3-22.8 ms for fork (x64) and 16.3-17.2 ms (arm64). With `posix_spawnattr_setcgroup_np` it also enters a cgroup at
+  creation (verified in the delegated environments). Ubuntu 22.04 (glibc 2.35) has neither and uses clone3, or fork in a
+  default Docker container (seccomp `ENOSYS`); on 24.04 `pidfd_spawn` works in that same container.
+* **glibc 2.39 leaks the pidfd of a child whose exec failed** (sourceware BZ 31695): the call returns the errno and leaves
+  an `anon_inode:[pidfd]` open whose fdinfo reads `Pid: -1`, and does not say which descriptor it is. Reproduced in C (5 of
+  5). The kernel gives the pidfd the lowest free number, so that number is taken before the call and closed after a failure
+  if, and only if, it is then a pidfd of a gone process: 20 of 20 closed in every 24.04 environment, 0 needed on 22.04.
+* **Descendant marker.** `PROCESS_SUPERVISION_GROUP=<token>` in every child spawned into a `ProcessGroup` (also with
+  `clear_env`). A `setsid` descendant was found by the scan and ended by `shutdown` on Linux and macOS (scan 42.8 ms on the
+  macOS 15 arm64 runner); without the marker the same descendant survived the group's shutdown, which is the weakness the
+  marker addresses. Escapees are signalled through a handle opened first (pidfd, or `ProcessHandle::Kqueue.watch` on macOS)
+  and only after the marker is read again.
+
+Not built: a kit lane for Linux (the shard specs are its native evidence), and FreeBSD.
 
 ## Still open
 

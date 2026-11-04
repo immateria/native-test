@@ -70,11 +70,17 @@ child.input.puts "b\na"
 child.input.close
 child.output.gets_to_end                 # => "a\nb\n"
 
+# Any IO works; one that is not a file descriptor is copied through a pipe, and wait returns once the copy is done
+out = IO::Memory.new
+child = ProcessSupervision.spawn("sort", input: IO::Memory.new("b\na\n"), output: out)
+child.wait                               # out.to_s == "a\nb\n"
+
 # Explicitly
 cg = ProcessSupervision::Linux::CgroupV2.create(parent, "job-1")
 child = cg.spawn("worker")               # in the cgroup before it runs one instruction
 leader = ProcessSupervision::POSIX::ProcessGroup.spawn_leader("worker")   # new group, child == leader
 helper = leader.group.as(ProcessSupervision::POSIX::ProcessGroup).spawn("helper")  # joins that group
+leader.group.as(ProcessSupervision::POSIX::ProcessGroup).escapees   # marked descendants that left the group (setsid)
 
 ProcessSupervision.strongest_mechanism   # => CgroupV2 / ProcessGroup / JobObject, decided by trying
 ProcessSupervision::Linux::CgroupV2.delegated_parent   # where this process may create a cgroup, or nil
@@ -88,27 +94,34 @@ Contract, all of it measured natively (explore/FINDINGS.md, "Spawning into conta
   ignored `SIGPIPE`; a supervisor should not.
 - Errors use the stdlib's classes: `File::NotFoundError`, `File::AccessDeniedError`, `IO::Error`, plus `ArgumentError`
   for NUL bytes and `Error::Unavailable` when a group cannot be joined or a cgroup is unusable.
-- **Linux, cgroup:** `clone3(CLONE_INTO_CGROUP | CLONE_PIDFD)`; where the kernel or a seccomp filter refuses it (a default
-  Docker profile answers `ENOSYS`) a fork whose child enters the cgroup before exec. Writing the pid to `cgroup.procs`
-  after the child exists lost children in 36-73% of trials under CPU contention, so nothing here does that.
-  A cgroup that was killed accepts no new children (`Error::Killed`): every later `clone3` into it is killed at once.
-- **Linux, process group:** the same engine with `setpgid` in the child; the pidfd comes with the process, so a command that
-  exits at once is still supervised. **macOS:** `posix_spawn` with `SETPGROUP`, started suspended so the exit watch
-  (`ProcessHandle::Kqueue`) exists before the child can exit, then resumed.
+- **Linux engines**, best first, each giving the pidfd together with the process (so a command that exits at once is
+  still supervised): `pidfd_spawn` (glibc 2.39+, looked up at run time) with `SETPGROUP` / `posix_spawnattr_setcgroup_np`,
+  which does not copy the supervisor's page tables (0.27-0.45 ms against 16-23 ms for fork at a 512 MiB heap on the hosted
+  runners); `clone3(CLONE_PIDFD [| CLONE_INTO_CGROUP])` with the setup done in the child; fork, where a seccomp filter
+  refuses clone3 (a default Docker profile on Ubuntu 22.04 answers `ENOSYS`). glibc 2.39 leaks the pidfd of a child whose
+  exec failed (BZ 31695); the descriptor is identified (lowest free number before the call, a pidfd of a gone process
+  after it) and closed. Writing the pid to `cgroup.procs` after the child exists lost children in 36-73% of trials under
+  CPU contention, so nothing here does that. A cgroup that was killed accepts no new children (`Error::Killed`).
+- **macOS:** `posix_spawn` with `SETPGROUP`, started suspended so the exit watch (`ProcessHandle::Kqueue`) exists before
+  the child can exit, then resumed.
+- **Descendants that leave a process group** (Linux and macOS): children spawned into a `ProcessGroup` carry
+  `PROCESS_SUPERVISION_GROUP=<token>` (also with `clear_env`; `track_descendants: false` turns it off). `#escapees` finds
+  marked processes outside the group by reading `/proc/<pid>/environ` or `sysctl(KERN_PROCARGS2)` (43 ms on the macOS 15
+  arm64 runner); `terminate`, `kill` and `shutdown` signal them too, through a handle that watches the process before it
+  re-checks the marker, so a recycled PID is never signalled; `empty?` stays false while one lives. A descendant that
+  clears or rewrites its environment before it execs is not found; only a cgroup or a Job contains it.
 - Detection is by trying: `CgroupV2.available?` only says a hierarchy is mounted (a default container mounts it read-only).
   `usable?(parent)` and `delegated_parent` create and remove a probe cgroup. A refused create (`EACCES`, `EROFS`) is
   `Error::Unavailable`, so `ProcessSupervision.cgroup_v2(path, fallback_pgid:)` falls back.
 - **Standard streams** (`input:`, `output:`, `error:`), on Linux, macOS and Windows Jobs: `Process::Redirect::Inherit` (the default),
   `Close` (the null device), `Pipe` (read or write it through `child.input` / `child.output` / `child.error`, closed by
-  `child.close`) or an `IO::FileDescriptor` such as a `File`. Arbitrary `IO` objects (`IO::Memory`) are rejected: pipe and
-  copy. The parent's pipe ends are non-blocking (fiber-friendly), the child's are blocking, and the child's ends are closed
-  in the parent as soon as the process exists, so EOF arrives when the child exits. On Windows each stream is its own
-  inheritable duplicate in the `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` allow-list, the child's pipe ends are synchronous and
-  the parent's overlapped (as in the stdlib), and a file opened for overlapped I/O is rejected (`ArgumentError`): open
-  it blocking, which `File.open` does by default, or pipe and copy.
-- Not yet: descendant tracking on macOS (kqueue `NOTE_TRACK` is refused with `ENOTSUP`;
-  an environment marker scan finds reparented descendants), and `posix_spawn` on Linux for supervisors with very large heaps
-  (fork copies the page tables: 12-22 ms at a 512 MiB Crystal heap).
+  `child.close`), an `IO::FileDescriptor` such as a `File`, or any other `IO` (`IO::Memory`, a wrapper), which gets a pipe
+  and a copy fiber: `Child#wait` returns once the copies are done and raises a failed copy (the exit status stays in
+  `Child#status`); a child that exits without reading its input is not an error. The parent's pipe ends are non-blocking
+  (fiber-friendly), the child's are blocking, and the child's ends are closed in the parent as soon as the process exists,
+  so EOF arrives when the child exits. On Windows each stream is its own inheritable duplicate in the
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` allow-list, the child's pipe ends are synchronous and the parent's overlapped (as in
+  the stdlib), and a file opened for overlapped I/O is copied through a pipe like any other IO.
 
 ## PTY-derived lifecycle semantics
 

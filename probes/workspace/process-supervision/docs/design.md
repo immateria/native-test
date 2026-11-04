@@ -133,8 +133,10 @@ semantics remain with `pty`.
 3. ~~Race-free Linux initial cgroup containment.~~ Done: `CgroupV2#spawn` (clone3 `CLONE_INTO_CGROUP`, fork fallback),
    qualified in plain, root, systemd `Delegate=yes`, user-manager and container environments.
 4. FreeBSD process-reaper investigation. The macOS capability matrix is measured (kqueue tracking refused, environment
-   marker scan works, `START_SUSPENDED` works); a macOS descendant tracker is not implemented.
+   marker scan works, `START_SUSPENDED` works); the marker is implemented for Linux and macOS process groups.
 5. Capability reporting is done by trying (`CgroupV2.usable?`, `delegated_parent`, `ProcessSupervision.strongest_mechanism`);
    adopting an already-running process into a group is still open.
-6. Stdio redirection is done for Linux, macOS and Windows Jobs (Inherit/Close/Pipe/FileDescriptor); arbitrary `IO` targets
-   are open, as is `posix_spawn` as the Linux engine for process groups.
+6. Done: stdio redirection on Linux, macOS and Windows Jobs (Inherit/Close/Pipe/FileDescriptor and any `IO`, copied through
+   a pipe); `pidfd_spawn` as the first Linux engine; the process-group descendant marker (`ProcessGroup#escapees`).
+7. Open: a `pidfd_spawn` that a seccomp filter refuses is detected by `ENOSYS` only; a C library with `pidfd_spawn` but a
+   fix for BZ 31695 is handled by the same code path (the probe finds nothing to close) but was not run here.
