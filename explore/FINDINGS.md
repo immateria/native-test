@@ -694,15 +694,15 @@ results unless stated.
 `CreateAppContainerProfile` worked for the runner (also unelevated); the child was started with
 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` (no capabilities), suspended, assigned to a job (kill on close), resumed.
 The container SID was given read/execute on the program directory and full access on a scratch directory with
-`icacls` (it exited 5 for the program directory when unelevated, but the program started anyway: the workspace ACL
-already allowed it).
+`icacls` (it exited 5 for the program directory when unelevated, but the program started anyway — presumably the workspace
+ACL already allowed it; not checked).
 
 * **It starts, runs and exits normally; the job controls it.** Token: `TokenIsAppContainer` 1, integrity **Low**
   (`0x1000`), in the supervisor's job. Its exit code (0) and wait semantics are those of any child.
 * **It cannot touch the supervisor**: `OpenProcess(supervisor)` for `PROCESS_QUERY_LIMITED_INFORMATION`,
   `SYNCHRONIZE` and `PROCESS_TERMINATE` all failed with access denied (5).
-* **File system**: it wrote to the granted scratch directory and to its own `GetTempPath` (a per-container
-  directory), and was denied (5) in `C:\Users\Public` and `C:\Windows\Temp`.
+* **File system**: it wrote to the granted scratch directory and to its own `GetTempPath` (presumably a per-container
+  directory; not checked), and was denied (5) in `C:\Users\Public` and `C:\Windows\Temp`.
 * **Loopback networking is silently blocked**: `connect` to a listener on `127.0.0.1` neither succeeded nor was
   refused — **no answer within 3 s** (the packets are dropped; a blocking `connect` waits ~21 s, which is what made my
   first version of the probe look hung).
