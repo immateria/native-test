@@ -60,6 +60,12 @@ jobs:
           Start-Process -FilePath $exe -ArgumentList "token" -Wait -NoNewWindow -RedirectStandardOutput explore-out\windows-elevated-token-startprocess.jsonl
           Get-Content explore-out\windows-elevated-token-direct.jsonl, explore-out\windows-elevated-token-startprocess.jsonl | ForEach-Object { $_.Substring(0, [Math]::Min($_.Length, 400)) }
 
+      - name: Priority exploration launched via Start-Process (the kit wrapper's launch method)
+        if: always()
+        run: |
+          $exe = (Resolve-Path explore-out\job_explore.exe).Path
+          Start-Process -FilePath $exe -ArgumentList "priority" -Wait -NoNewWindow -RedirectStandardOutput explore-out\windows-elevated-priority-startprocess.jsonl -RedirectStandardError explore-out\windows-elevated-priority-startprocess.err
+
       - name: Explore job-object behaviour
         if: always()
         env:
@@ -116,21 +122,13 @@ jobs:
           if ($null -eq $t) { throw "launcher produced no token record" }
           if ($t.token_is_elevated -ne 0) { throw "launcher produced an elevated token" }
 
-      - name: Diagnose what the filtered token can launch
-        if: always() && steps.selfcheck.outcome == 'success'
-        run: |
-          $exe = (Resolve-Path explore-out\job_explore.exe).Path
-          & $exe launch-unelevated -- pwsh -NoProfile -File explore\windows\unelevated-diag.ps1
-          "diag exit=$LASTEXITCODE"
-          Get-Content explore-out\unelevated-diag.txt -ErrorAction SilentlyContinue
-
-      - name: Run native probes (kit, unelevated)
+      - name: Run native probes (kit; probe executable unelevated)
         if: always() && steps.selfcheck.outcome == 'success'
         working-directory: probes
-        run: |
-          $exe = (Resolve-Path ..\explore-out\job_explore.exe).Path
-          & $exe launch-unelevated -- pwsh -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1
-          exit $LASTEXITCODE
+        env:
+          # the wrapper (and the Crystal build) stay elevated; only the probe process gets the filtered token
+          PROCESS_PROBE_LAUNCHER: ${{ github.workspace }}\explore-out\job_explore.exe
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\run-windows.ps1
 
       - name: Explore job-object behaviour (unelevated)
         if: always() && steps.selfcheck.outcome == 'success'
@@ -198,6 +196,14 @@ jobs:
           clang -O1 -Wall -Wextra -o explore-out/signal_matrix explore/macos/signal_matrix.c
           ./explore-out/signal_matrix > explore-out/macos-signal-matrix.jsonl
           wc -l explore-out/macos-signal-matrix.jsonl
+
+      - name: Explore kqueue exit registration on zombies
+        if: always()
+        run: |
+          mkdir -p explore-out
+          clang -O1 -Wall -Wextra -o explore-out/kqueue_zombie explore/macos/kqueue_zombie.c
+          ./explore-out/kqueue_zombie > explore-out/macos-kqueue-zombie.jsonl
+          cat explore-out/macos-kqueue-zombie.jsonl
 
       - name: Upload output
         if: always()

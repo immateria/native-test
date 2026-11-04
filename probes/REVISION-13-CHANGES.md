@@ -51,6 +51,15 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
 * `r9_concurrent_failed_spawn_fd_reuse_stress`: `ProbeThread` contexts keep their event-loop descriptors
   until exit (reproduced: +24 fds for 8 contexts on Linux, 0 for 8 fibers), so this case uses `ProbeFiber`.
 
+* `kqueue_many_children_one_queue_all_exit_events` failed once in five native runs (7 of 8 exit events).
+  It registered for the children only after spawning all eight, whose exits are scheduled ~180 ms after each
+  child's own start; on a loaded runner the first child can already be a zombie by then. It now registers each
+  child immediately after spawning it. `explore/macos/kqueue_zombie.c` measures whether a zombie registration
+  delivers an event at all.
+* The kit's HIGH job-priority request returns 1314 in the elevated kit process while an identical request from
+  a fresh elevated process succeeds, and the raw API fails the same way from inside the kit process (so it is
+  not the shard). Informational rows `priority_checkpoint_*` now record the raw request at section
+  boundaries to locate when the process enters that state.
 * `job_user_time_limit_enforced_and_event` (the one remaining short-window enforcement assertion) also spins and
   waits two periods.
 
@@ -62,10 +71,14 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
   pending the caller-class experiment in `explore`.
 * The Windows run was elevated (`runneradmin`). The kit says never to run elevated; CI now also runs
   the kit with a filtered, unelevated token (`explore/windows/job_explore.cr launch-unelevated`: Medium
-  integrity, Administrators deny-only, only SeChangeNotify). Under it the kit wrapper fails at its first
-  `crystal` invocation with `Access is denied`; `C:\crystal\crystal.exe` already grants Users RX and
-  Authenticated Users Modify with no mandatory label, so this is **not** a file ACL problem. Cause under
-  investigation (`explore/windows/unelevated-diag.ps1`).
+  integrity, Administrators deny-only, only SeChangeNotify). `pwsh` cannot be run under that token on a
+  non-interactive runner: every native command it starts fails (`Access is denied`, then PowerShell's
+  `StandardOutputEncoding is only supported when standard output is redirected`), `crystal.exe`'s ACL is open
+  so it is not a file permission problem, and giving the child a fresh console (`CREATE_NO_WINDOW`) makes even
+  a Crystal binary die with `STATUS_DLL_INIT_FAILED`. So only the probe *executable* runs filtered: the
+  wrapper (and the Crystal build) stay elevated, and the new optional `PROCESS_PROBE_LAUNCHER` environment
+  variable in `run-windows.ps1` starts the probe through `job_explore.exe launch-unelevated`. Unset, the
+  wrapper behaves exactly as before.
 
 ## Evidence boundary
 

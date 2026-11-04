@@ -777,10 +777,11 @@ module Explore
     info = LibC::PROCESS_INFORMATION.new
     rc = WX.CreateProcessAsUserW(restricted, Pointer(UInt16).null, command_line.to_unsafe,
       Pointer(LibC::SECURITY_ATTRIBUTES).null, Pointer(LibC::SECURITY_ATTRIBUTES).null,
-      # CREATE_NO_WINDOW: give the child its own hidden console. Inheriting ours would hand a Medium
-      # integrity process a console owned by the elevated step shell; pwsh then cannot launch native
-      # commands ("Access is denied" / "StandardOutputEncoding is only supported when ... redirected").
-      1, 0x08000000_u32, Pointer(Void).null, Pointer(UInt16).null, pointerof(startup), pointerof(info))
+      # creation flags stay 0 on purpose: CREATE_NO_WINDOW / a fresh console makes the filtered child die with
+      # STATUS_DLL_INIT_FAILED (0xC0000142) on a non-interactive runner. The child inherits our console and
+      # std handles. Launch console programs through this, but do not run pwsh under it (see run-windows.ps1
+      # PROCESS_PROBE_LAUNCHER).
+      1, 0_u32, Pointer(Void).null, Pointer(UInt16).null, pointerof(startup), pointerof(info))
     if rc == 0
       STDERR.puts "CreateProcessAsUserW failed: #{LibC.GetLastError}"
       return 92

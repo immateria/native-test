@@ -399,6 +399,13 @@ module NativeProbe
     variants.join(" ")
   end
 
+  # Informational: would a HIGH job priority class be accepted right now? Recorded at section boundaries so a
+  # change in the process's state over the run (the kit's request is rejected, an identical one from a fresh
+  # process is not) can be located.
+  def self.priority_checkpoint(label : String) : Nil
+    note("priority_checkpoint_#{label}", details(high: raw_priority_variants(ProcessSupervision::Windows::Job::PriorityClass::High.value)))
+  end
+
   def self.wait_until(timeout : Time::Span, interval : Time::Span = 10.milliseconds, & : -> Bool) : Bool
     deadline = Time.instant + timeout
     loop do
@@ -5607,6 +5614,7 @@ module NativeProbe
     note("environment", details(crystal: Crystal::VERSION, os: "windows", pid: Process.pid,
       executable: self_exe, workdir: workdir, pointer_bytes: sizeof(Void*)))
     token_note
+    priority_checkpoint("start")
 
     test("win32_parent_job_membership") do
       in_job = LibC::BOOL.new(0)
@@ -6037,9 +6045,13 @@ module NativeProbe
     end
 
     run_expanded
+    priority_checkpoint("after_expanded")
     run_exhaustive
+    priority_checkpoint("after_exhaustive")
     run_deep_native_matrix
+    priority_checkpoint("after_deep_native")
     run_completion_matrix
+    priority_checkpoint("after_completion")
     run_r6_matrix
     run_r9_source_matrix
     run_r10_hardening_matrix

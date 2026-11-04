@@ -128,8 +128,19 @@ try {
   $env:PROCESS_PROBE_WORKDIR = $ChildDir
   $Result = Join-Path $Run "results.jsonl"
   $Stderr = Join-Path $Run "stderr.log"
-  $p = Start-Process -FilePath $Exe -WorkingDirectory $Root -RedirectStandardOutput $Result `
-      -RedirectStandardError $Stderr -PassThru -NoNewWindow
+  $StartArgs = @{
+    FilePath = $Exe; WorkingDirectory = $Root; RedirectStandardOutput = $Result
+    RedirectStandardError = $Stderr; PassThru = $true; NoNewWindow = $true
+  }
+  # Optional: run only the probe EXECUTABLE through a launcher. On an elevated CI runner,
+  # PROCESS_PROBE_LAUNCHER=<job_explore.exe> runs the probe with a filtered (unelevated) token while the
+  # build and this wrapper stay elevated. Unset = the probe starts normally.
+  if ($env:PROCESS_PROBE_LAUNCHER) {
+    $StartArgs.FilePath = $env:PROCESS_PROBE_LAUNCHER
+    $StartArgs.ArgumentList = @('launch-unelevated', '--', $Exe)
+    "probe_launcher=$($env:PROCESS_PROBE_LAUNCHER)" | Add-Content $Report
+  }
+  $p = Start-Process @StartArgs
   if ($p.WaitForExit(1800000)) {
     if ($p.ExitCode -ne 0) { $ExitCode = 1 }
     "run_state=exited`nexit_code=$($p.ExitCode)" | Set-Content -Encoding UTF8 (Join-Path $Run "run-status.txt")

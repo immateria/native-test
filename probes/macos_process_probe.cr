@@ -2345,14 +2345,18 @@ module NativeProbe
       children = [] of Process
       reaped = [] of Bool
       begin
-        8.times do |i|
-          children << Process.new(self_exe, ["--child", "delayed-exit-code", (180 + i * 25).to_s, i.to_s])
-          reaped << false
-        end
         result = with_kqueue do |kq|
-          registrations = children.count do |child|
+          # Register each child immediately after it starts. Spawning eight Crystal children one after another
+          # can take longer than the first child's 180 ms delay on a loaded runner; a registration made after
+          # the child has already exited is a zombie registration (see explore/macos/kqueue_zombie.c) and
+          # made this case a coin flip.
+          registrations = 0
+          8.times do |i|
+            child = Process.new(self_exe, ["--child", "delayed-exit-code", (180 + i * 25).to_s, i.to_s])
+            children << child
+            reaped << false
             rc, _, _ = kevent_register(kq, child.pid, NOTE_EXIT, EV_ADD | EV_ONESHOT)
-            rc == 0
+            registrations += 1 if rc == 0
           end
           seen = Set(UInt64).new
           8.times do
