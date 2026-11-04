@@ -216,6 +216,52 @@ module ProcessSupervision::Windows
   end
 end
 
+# ---------------------------------------------------------------------------
+# Revision 13 thread helpers.
+#
+# In Crystal 1.21 every thread that runs Crystal code needs a
+# Fiber::ExecutionContext. A bare `Thread.new` thread has none, so anything that
+# reaches the event loop (IO.pipe, Process.new, ANY FileDescriptor read/write
+# including File.read and puts, Channel, a contended ::Mutex) raises
+# `NilAssertionError: Thread#execution_context cannot be nil` there.
+#
+#   Thread       bare OS thread. Only for cases whose point is "this library call
+#                works from a native thread". Never do harness I/O in the block;
+#                synchronize with Thread::Mutex / Atomic, never ::Mutex/Channel.
+#   ProbeThread  dedicated OS thread that owns an Isolated execution context.
+#                Any Crystal code is safe. Use for everything else.
+# ---------------------------------------------------------------------------
+class ProbeThread
+  def initialize(name : String = "probe", &block : ->)
+    @context = Fiber::ExecutionContext::Isolated.new(name, &block)
+  end
+
+  def join : Nil
+    @context.wait
+  end
+end
+
+# Fixed-size integer slots shared between threads. `Array(Atomic(Int32))` does
+# not work: Atomic is a struct, so `slots[i].set(x)` mutates a copy of the slot.
+class ProbeSlots
+  def initialize(size : Int32)
+    @mutex = Thread::Mutex.new
+    @values = Array(Int32).new(size, 0)
+  end
+
+  def []=(index : Int32, value : Int32) : Int32
+    @mutex.synchronize { @values[index] = value }
+  end
+
+  def to_a : Array(Int32)
+    @mutex.synchronize { @values.dup }
+  end
+end
+
+def probe_failure_text(ex : Exception) : String
+  "#{ex.class.name}: #{ex.message} @ #{ex.backtrace?.try(&.first?) || "no-backtrace"}"
+end
+
 module NativeProbe
   @@failures = 0
   @@skipped = 0
@@ -1512,7 +1558,7 @@ module NativeProbe
       results = Array(UInt64?).new(48, nil)
       errors = [] of String
       lock = Thread::Mutex.new
-      threads = 16.times.map do |index|
+      threads = Array(Thread).new(16) do |index|
         Thread.new do
           3.times do |round|
             begin
@@ -1624,7 +1670,7 @@ module NativeProbe
       handle = ProcessHandle.open(child.pid)
       begin
         elapsed = [] of Float64
-        early = 8.times.map do
+        early = Array(Bool).new(8) do
           started = Time.instant
           value = handle.wait(15.milliseconds)
           elapsed << (Time.instant - started).total_milliseconds
@@ -1649,7 +1695,7 @@ module NativeProbe
       lock = Thread::Mutex.new
       ready = Atomic(Int32).new(0)
       go = Atomic(Bool).new(false)
-      threads = 8.times.map do
+      threads = Array(Thread).new(8) do
         Thread.new do
           ready.add(1)
           until go.get
@@ -1659,7 +1705,7 @@ module NativeProbe
           lock.synchronize { results << value }
         end
       end
-      wait_until(1.second) { ready.get == 8 }
+      ready_ok = wait_until(1.second) { ready.get == 8 }
       go.set(true)
       sleep 10.milliseconds
       handle.close
@@ -1667,8 +1713,8 @@ module NativeProbe
       status = child.wait
       reaped = true
       allowed = results.all? { |r| r == "true" || r.includes?("Closed") }
-      {allowed && status.success? && results.size == 8,
-       details(results: results.sort.join(" | "), count: results.size)}
+      {ready_ok && allowed && status.success? && results.size == 8,
+       details(ready_ok: ready_ok, results: results.sort.join(" | "), count: results.size)}
     ensure
       handle.try &.close rescue nil
       child.try { |c| cleanup(c, reaped || false) }
@@ -1682,7 +1728,7 @@ module NativeProbe
       lock = Thread::Mutex.new
       ready = Atomic(Int32).new(0)
       go = Atomic(Bool).new(false)
-      threads = 8.times.map do
+      threads = Array(Thread).new(8) do
         Thread.new do
           ready.add(1)
           until go.get
@@ -1692,15 +1738,15 @@ module NativeProbe
           lock.synchronize { results << value }
         end
       end
-      wait_until(1.second) { ready.get == 8 }
+      ready_ok = wait_until(1.second) { ready.get == 8 }
       go.set(true)
       sleep 10.milliseconds
       handle.kill
       threads.each(&.join)
       status = child.wait
       reaped = true
-      {results.size == 8 && results.all? { |r| r == "true" } && status.system_exit_status == 137_u32,
-       details(results: results.join(","), exit: status.system_exit_status)}
+      {ready_ok && results.size == 8 && results.all? { |r| r == "true" } && status.system_exit_status == 137_u32,
+       details(ready_ok: ready_ok, results: results.join(","), exit: status.system_exit_status)}
     ensure
       handle.try &.close rescue nil
       child.try { |c| cleanup(c, reaped || false) }
@@ -1714,7 +1760,7 @@ module NativeProbe
         status = child.wait
         reaped = true
         start = Time.instant
-        results = 32.times.map { handle.wait(1.second) }
+        results = Array(Bool).new(32) { handle.wait(1.second) }
         elapsed = Time.instant - start
         {status.success? && results.all? && elapsed < 1.second,
          details(all_ready: results.all?, elapsed_ms: elapsed.total_milliseconds, count: results.size)}
@@ -1980,9 +2026,11 @@ module NativeProbe
       child = job.spawn(self_exe, ["--child", "sleep", "600"])
       outcomes = [] of String
       lock = Thread::Mutex.new
-      threads = 12.times.map do
+      # Each thread queries until it observes the close (bounded), so the close is
+      # guaranteed to race live accounting calls rather than follow them.
+      threads = Array(Thread).new(12) do
         Thread.new do
-          20.times do
+          200_000.times do
             begin
               job.accounting
               lock.synchronize { outcomes << "ok" }
@@ -1990,7 +2038,7 @@ module NativeProbe
               lock.synchronize { outcomes << "closed" }
               break
             rescue ex
-              lock.synchronize { outcomes << ex.class.name }
+              lock.synchronize { outcomes << probe_failure_text(ex) }
               break
             end
           end
@@ -2001,7 +2049,9 @@ module NativeProbe
       threads.each(&.join)
       close_child(child)
       unexpected = outcomes.reject { |x| x == "ok" || x == "closed" }
-      {unexpected.empty?, details(samples: outcomes.size, unexpected: unexpected.uniq.join(","))}
+      closed_seen = outcomes.count("closed")
+      {unexpected.empty? && closed_seen > 0,
+       details(samples: outcomes.size, ok: outcomes.count("ok"), closed: closed_seen, unexpected: unexpected.uniq.first(3).join(" | "))}
     end
 
     test("spawn_argument_quoting_full_matrix") do
@@ -2262,7 +2312,7 @@ module NativeProbe
       children = [] of ProcessSupervision::Child
       lock = Thread::Mutex.new
       errors = [] of String
-      threads = 24.times.map do |i|
+      threads = Array(Thread).new(24) do |i|
         Thread.new do
           begin
             child = job.spawn(self_exe, ["--child", "exit-code", (i % 4).to_s])
@@ -2638,7 +2688,7 @@ module NativeProbe
     test("accounting_natural_exit_does_not_increment_limit_terminated") do
       job = ProcessSupervision.job
       before = job.accounting
-      children = 4.times.map { |i| job.spawn(self_exe, ["--child", "exit-code", i.to_s]) }
+      children = Array(ProcessSupervision::Child).new(4) { |i| job.spawn(self_exe, ["--child", "exit-code", i.to_s]) }
       children.each { |c| c.wait(2.seconds) }
       wait_until(1.second) { job.accounting.active_processes == 0 }
       after = job.accounting
@@ -3961,8 +4011,11 @@ module NativeProbe
       ready = Atomic(Int32).new(0)
       go = Atomic(Bool).new(false)
       done = Atomic(Int32).new(0)
-      results = Array(Atomic(Int32)).new(count) { Atomic(Int32).new(0) }
-      count.times do |index|
+      # 1 = wait returned true, -1 = wait timed out, -2 = wait raised
+      results = ProbeSlots.new(count)
+      errors = [] of String
+      error_lock = Thread::Mutex.new
+      threads = Array(Thread).new(count) do |index|
         Thread.new do
           ready.add(1)
           until go.get
@@ -3970,10 +4023,11 @@ module NativeProbe
           end
           value = begin
             handle.not_nil!.wait(3.seconds) ? 1 : -1
-          rescue
+          rescue ex
+            error_lock.synchronize { errors << probe_failure_text(ex) }
             -2
           end
-          results[index].set(value)
+          results[index] = value
           done.add(1)
         end
       end
@@ -3982,11 +4036,12 @@ module NativeProbe
       done_ok = wait_until(4.seconds) { done.get == count }
       status = child.wait
       reaped = true
-      values = results.map(&.get)
-      Thread.sleep(15.milliseconds)
+      threads.each(&.join)
+      values = results.to_a
       {ready_ok && done_ok && values.all?(&.==(1)) && status.success?,
        details(waiters: count, ready: ready.get, done: done.get, completed: values.count(1),
-         false_results: values.count(-1), errors: values.count(-2), exit: status.system_exit_status)}
+         false_results: values.count(-1), errors: values.count(-2), exit: status.system_exit_status,
+         first_error: errors.first? || "")}
     ensure
       handle.try &.close
       cleanup(child, reaped)
@@ -5189,7 +5244,7 @@ module NativeProbe
     children = [] of ProcessSupervision::Child
     lock = Thread::Mutex.new
     failures = [] of String
-    threads = [] of Thread
+    threads = [] of ProbeThread
     begin
       count.times do
         event = WindowsProbeNative.CreateEventW(Pointer(LibC::SECURITY_ATTRIBUTES).null, 1, 0, Pointer(UInt16).null)
@@ -5200,7 +5255,7 @@ module NativeProbe
       end
       all = sentinel_handles.map { |h| h.address.to_u64 }.join(",")
       jobs.each_with_index do |job, i|
-        threads << Thread.new do
+        threads << ProbeThread.new("cross-job-#{i}") do
           marker = File.join(workdir, "r9-handle-isolation-#{Process.pid}-#{count}-#{i}.json")
           begin
             child = job.spawn(self_exe, ["--child", "check-handles", marker, all])
@@ -5211,7 +5266,7 @@ module NativeProbe
               failures << "#{i}:exit=#{status.try(&.system_exit_status)} count=#{payload["count"].as_i}" unless status.try(&.success?) == true && payload["count"].as_i == 0
             end
           rescue ex
-            lock.synchronize { failures << "#{i}:#{ex.class.name}:#{ex.message}" }
+            lock.synchronize { failures << "#{i}:#{probe_failure_text(ex)}" }
           end
         end
       end

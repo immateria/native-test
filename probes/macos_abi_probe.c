@@ -355,12 +355,12 @@ int main(void) {
     int all_pids[4096];
     memset(all_pids, 0, sizeof(all_pids));
     errno = 0;
-    int all_count = proc_listallpids(all_pids, (int)sizeof(all_pids));
-    int all_errno = errno;
+    int pid_list_count = proc_listallpids(all_pids, (int)sizeof(all_pids));
+    int pid_list_errno = errno;
     snprintf(d, sizeof(d), "\"count\":%d,\"errno\":%d,\"contains_self\":%s",
-             all_count, all_errno, (all_count > 0 && contains_pid(all_pids, all_count, getpid())) ? "true" : "false");
+             pid_list_count, pid_list_errno, (pid_list_count > 0 && contains_pid(all_pids, pid_list_count, getpid())) ? "true" : "false");
     record("native_sdk_proc_listallpids_contains_self",
-           all_count > 0 && contains_pid(all_pids, all_count, getpid()), d);
+           pid_list_count > 0 && contains_pid(all_pids, pid_list_count, getpid()), d);
 
     char pathbuf[PROC_PIDPATHINFO_MAXSIZE];
     memset(pathbuf, 0, sizeof(pathbuf));

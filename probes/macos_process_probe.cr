@@ -53,6 +53,53 @@ lib MacProbePosix
   fun setsid : Int32
   fun getsid(pid : Int32) : Int32
   fun dup2(oldfd : Int32, newfd : Int32) : Int32
+  fun dup(fd : Int32) : Int32
+end
+
+# ---------------------------------------------------------------------------
+# Revision 13 thread helpers.
+#
+# In Crystal 1.21 every thread that runs Crystal code needs a
+# Fiber::ExecutionContext. A bare `Thread.new` thread has none, so anything that
+# reaches the event loop (IO.pipe, Process.new, ANY FileDescriptor read/write
+# including File.read and puts, Channel, a contended ::Mutex) raises
+# `NilAssertionError: Thread#execution_context cannot be nil` there.
+#
+#   Thread       bare OS thread. Only for cases whose point is "this library call
+#                works from a native thread". Never do harness I/O in the block;
+#                synchronize with Thread::Mutex / Atomic, never ::Mutex/Channel.
+#   ProbeThread  dedicated OS thread that owns an Isolated execution context.
+#                Any Crystal code is safe. Use for everything else.
+# ---------------------------------------------------------------------------
+class ProbeThread
+  def initialize(name : String = "probe", &block : ->)
+    @context = Fiber::ExecutionContext::Isolated.new(name, &block)
+  end
+
+  def join : Nil
+    @context.wait
+  end
+end
+
+# Fixed-size integer slots shared between threads. `Array(Atomic(Int32))` does
+# not work: Atomic is a struct, so `slots[i].set(x)` mutates a copy of the slot.
+class ProbeSlots
+  def initialize(size : Int32)
+    @mutex = Thread::Mutex.new
+    @values = Array(Int32).new(size, 0)
+  end
+
+  def []=(index : Int32, value : Int32) : Int32
+    @mutex.synchronize { @values[index] = value }
+  end
+
+  def to_a : Array(Int32)
+    @mutex.synchronize { @values.dup }
+  end
+end
+
+def probe_failure_text(ex : Exception) : String
+  "#{ex.class.name}: #{ex.message} @ #{ex.backtrace?.try(&.first?) || "no-backtrace"}"
 end
 
 module NativeProbe
@@ -177,6 +224,16 @@ module NativeProbe
     Dir.children("/dev/fd").size
   rescue
     -1
+  end
+
+  # Stdlib Process.new opens /dev/null three times (stdio_to_fd) before it spawns.
+  # If the spawn raises, those File objects are only closed by their finalizers,
+  # so descriptor counts are not stable until the GC has run. Measure both.
+  def self.gc_settle : Nil
+    3.times do
+      GC.collect
+      sleep 5.milliseconds
+    end
   end
 
   def self.workdir : String
@@ -1387,6 +1444,7 @@ module NativeProbe
     end
 
     test("spawn_failure_churn_does_not_leak_fds") do
+      gc_settle
       before = fd_count_observation
       100.times do |i|
         begin
@@ -1394,9 +1452,13 @@ module NativeProbe
         rescue
         end
       end
+      after_no_gc = fd_count_observation
+      gc_settle
       after = fd_count_observation
       delta = before >= 0 && after >= 0 ? after - before : 0
-      {before < 0 || after < 0 || delta.abs <= 2, details(before: before, after: after, delta: delta, attempts: 100)}
+      lingering = before >= 0 && after_no_gc >= 0 ? after_no_gc - before : 0
+      {before < 0 || after < 0 || delta.abs <= 2,
+       details(before: before, after: after, delta: delta, attempts: 100, after_no_gc: after_no_gc, lingering_until_gc: lingering)}
     end
   end
 
@@ -3586,6 +3648,7 @@ module NativeProbe
   end
 
   def self.r6_spawn_failure_churn_case(cycles : Int32)
+    gc_settle
     before = fd_count_observation
     failures = 0
     cycles.times do |i|
@@ -3595,9 +3658,13 @@ module NativeProbe
         failures += 1
       end
     end
+    after_no_gc = fd_count_observation
+    gc_settle
     after = fd_count_observation
     delta = (before >= 0 && after >= 0) ? after - before : 0
-    {failures == cycles && (before < 0 || after < 0 || delta.abs <= 3), details(cycles: cycles, failures: failures, before: before, after: after, delta: delta)}
+    lingering = (before >= 0 && after_no_gc >= 0) ? after_no_gc - before : 0
+    {failures == cycles && (before < 0 || after < 0 || delta.abs <= 3),
+     details(cycles: cycles, failures: failures, before: before, after: after, delta: delta, after_no_gc: after_no_gc, lingering_until_gc: lingering)}
   end
 
   def self.run_r6_matrix : Nil
@@ -4426,14 +4493,14 @@ module NativeProbe
     long_lived = [] of Process
     lock = Thread::Mutex.new
     failures = [] of String
-    threads = [] of Thread
+    threads = [] of ProbeThread
     begin
       count.times do
         long_lived << Process.new(self_exe, ["--child", "sleep", "1300"], input: Process::Redirect::Pipe)
       end
       start = Time.instant
       count.times do |i|
-        threads << Thread.new do
+        threads << ProbeThread.new("mixed-spawn-#{i}") do
           begin
             child = Process.new(self_exe, ["--child", "exit-code", ((i + 17) % 90).to_s])
             begin
@@ -4444,7 +4511,7 @@ module NativeProbe
               child.close rescue nil
             end
           rescue ex
-            lock.synchronize { failures << "#{i}:#{ex.class.name}:#{ex.message}" }
+            lock.synchronize { failures << "#{i}:#{probe_failure_text(ex)}" }
           end
         end
       end
@@ -4508,15 +4575,18 @@ module NativeProbe
       reaped = false
       reader_done = Atomic(Bool).new(false)
       reader_data = ""
-      reader = nil.as(Thread?)
+      reader = nil.as(ProbeThread?)
+      # Process#wait closes the child's pipes ("Waits for this process to complete and
+      # closes any pipes"), so EOF can only be observed through an independent descriptor.
+      output = IO::FileDescriptor.new(MacProbePosix.dup(child.output.fd))
       begin
         grandchild_pid = wait_file_value(marker).to_i64
         start = Time.instant
         status = child.wait
         reaped = true
         direct_elapsed = Time.instant - start
-        reader = Thread.new do
-          reader_data = child.output.gets_to_end
+        reader = ProbeThread.new("pipe-reader") do
+          reader_data = output.gets_to_end
           reader_done.set(true)
         end
         sleep 120.milliseconds
@@ -4530,6 +4600,7 @@ module NativeProbe
            bytes: reader_data.bytesize,
            contract: "direct child exit/reap is distinct from EOF when a descendant retains the inherited pipe")}
       ensure
+        output.close rescue nil
         cleanup(child, reaped)
       end
     end
@@ -4539,7 +4610,8 @@ module NativeProbe
       child = Process.new(self_exe, ["--child", "spawn-grandchild-and-exit", marker, "220"], output: Process::Redirect::Pipe)
       reaped = false
       reader_done = Atomic(Bool).new(false)
-      reader = nil.as(Thread?)
+      reader = nil.as(ProbeThread?)
+      output = IO::FileDescriptor.new(MacProbePosix.dup(child.output.fd)) # see note on Process#wait above
       begin
         grandchild_pid = wait_file_value(marker).to_i64
         result = with_kqueue do |kq|
@@ -4547,8 +4619,8 @@ module NativeProbe
           raise "registration failed: #{errno}" if rc < 0
           kevent_wait(kq, 2.seconds)
         end
-        reader = Thread.new do
-          child.output.gets_to_end
+        reader = ProbeThread.new("kqueue-pipe-reader") do
+          output.gets_to_end
           reader_done.set(true)
         end
         event_rc, event, event_errno = result
@@ -4563,6 +4635,7 @@ module NativeProbe
            grandchild_pid: grandchild_pid, pipe_still_open: pipe_still_open, eof_after_descendant: eof_after_descendant,
            contract: "EVFILT_PROC child exit is independent of inherited-pipe EOF")}
       ensure
+        output.close rescue nil
         cleanup(child, reaped)
       end
     end
@@ -4578,10 +4651,11 @@ module NativeProbe
     end
 
     test("r9_concurrent_failed_spawn_fd_reuse_stress") do
+      gc_settle
       baseline = fd_count_observation
       failures = Atomic(Int32).new(0)
-      workers = 8.times.map do |i|
-        Thread.new do
+      workers = Array(ProbeThread).new(8) do |i|
+        ProbeThread.new("fd-stress-#{i}") do
           32.times do |j|
             reader, writer = IO.pipe
             begin
@@ -4601,11 +4675,13 @@ module NativeProbe
         end
       end
       workers.each(&.join)
+      after_no_gc = fd_count_observation
+      gc_settle
       after = fd_count_observation
       delta = baseline >= 0 && after >= 0 ? after - baseline : 0
       {failures.get == 0 && (baseline < 0 || after < 0 || delta.abs <= 4),
        details(workers: workers.size, iterations_per_worker: 32, failures: failures.get,
-         fd_before: baseline, fd_after: after, fd_delta: delta,
+         fd_before: baseline, fd_after: after, fd_delta: delta, fd_after_no_gc: after_no_gc,
          contract: "failed concurrent spawns do not close or reuse unrelated pipe descriptors")}
     end
   end
