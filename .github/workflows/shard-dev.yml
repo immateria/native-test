@@ -4,7 +4,8 @@ name: shard-dev
 # the formatter (verify.sh runs `crystal tool format --check`), builds and runs both shards' specs, and returns a patch with
 # the formatting changes (git apply it locally) plus every log. On Linux it also runs the compiled supervision specs in the
 # environments that decide which mechanism is usable: a systemd Delegate=yes unit, the systemd user manager, root, and
-# Docker (default and privileged). Standard hosted runners only.
+# Docker (default and privileged). On a Windows runner it builds both shards' specs and the helper child the Windows
+# standard-stream specs need (spec/support/stdio_child.cr) and runs them natively. Standard hosted runners only.
 
 on:
   # a push registers the workflow (a new file is not dispatchable until GitHub has seen it on a push); touching
@@ -18,7 +19,7 @@ on:
       runner:
         description: "runner"
         type: choice
-        options: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm, macos-15, macos-14, macos-15-intel, macos-26]
+        options: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm, macos-15, macos-14, macos-15-intel, macos-26, windows-2022, windows-2025]
         default: ubuntu-24.04
       scenarios:
         description: "also run the compiled specs in systemd / root / Docker environments (Linux only)"
@@ -33,6 +34,7 @@ env:
 
 jobs:
   shard:
+    if: ${{ !startsWith(inputs.runner || 'ubuntu-24.04', 'windows') }}
     name: shard ${{ inputs.runner || 'ubuntu-24.04' }}
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 45
@@ -143,5 +145,60 @@ jobs:
         with:
           name: shard-patch-${{ inputs.runner || 'ubuntu-24.04' }}
           path: shard-out/shard-format.patch
+          if-no-files-found: warn
+          retention-days: 14
+
+  shard-windows:
+    if: ${{ startsWith(inputs.runner || '', 'windows') }}
+    name: shard ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-crystal-windows
+
+      - name: Build the specs and the stdio helper child
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "shard-out"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $ws = Join-Path $env:GITHUB_WORKSPACE "probes\workspace"
+          $default = ((& crystal env CRYSTAL_PATH) | Out-String).Trim()
+          $env:CRYSTAL_PATH = "$(Join-Path $ws 'process-handle\src');$(Join-Path $ws 'process-supervision\src');$default"
+          foreach ($s in "process-handle", "process-supervision") {
+            $spec = Join-Path $ws "$s\spec\$($s -replace '-', '_')_spec.cr"
+            & crystal build --no-color -o (Join-Path $out "spec-$s.exe") $spec *> (Join-Path $out "build-$s.txt")
+            "build $s exit=$LASTEXITCODE"
+            Get-Content (Join-Path $out "build-$s.txt") -TotalCount 40
+          }
+          & crystal build --no-color -o (Join-Path $out "stdio_child.exe") (Join-Path $ws "process-supervision\spec\support\stdio_child.cr") *> (Join-Path $out "build-stdio-child.txt")
+          "build stdio_child exit=$LASTEXITCODE"
+          Get-Content (Join-Path $out "build-stdio-child.txt") -TotalCount 40
+          exit 0
+
+      - name: Run the specs
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "shard-out"
+          $env:PROCESS_SUPERVISION_STDIO_CHILD = Join-Path $out "stdio_child.exe"
+          foreach ($s in "process-handle", "process-supervision") {
+            $exe = Join-Path $out "spec-$s.exe"
+            if (!(Test-Path $exe)) { "no binary for $s"; continue }
+            Push-Location (Join-Path $env:GITHUB_WORKSPACE "probes\workspace\$s")
+            & $exe --verbose *> (Join-Path $out "run-plain-$s.txt")
+            "== $s plain exit=$LASTEXITCODE"
+            Pop-Location
+            Get-Content (Join-Path $out "run-plain-$s.txt") -Tail 40
+          }
+          exit 0
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ inputs.runner }}
+          path: shard-out/*.txt
           if-no-files-found: warn
           retention-days: 14

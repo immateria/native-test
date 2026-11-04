@@ -77,13 +77,9 @@ module ProcessSupervision
                  output : ::Process::Stdio = ::Process::Redirect::Inherit,
                  error : ::Process::Stdio = ::Process::Redirect::Inherit) : Child
     {% if flag?(:win32) %}
-      unless input.is_a?(::Process::Redirect) && input.inherit? && output.is_a?(::Process::Redirect) && output.inherit? &&
-             error.is_a?(::Process::Redirect) && error.inherit?
-        raise Error::Unsupported.new("redirecting standard streams is not implemented for Windows Jobs yet")
-      end
       job = Windows::Job.new
       begin
-        job.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir)
+        job.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
       rescue ex
         job.close rescue nil
         raise ex

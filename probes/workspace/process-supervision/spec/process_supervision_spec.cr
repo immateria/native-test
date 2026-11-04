@@ -841,3 +841,188 @@ end
     end
   end
 {% end %}
+
+{% if flag?(:win32) %}
+  @[Link("kernel32")]
+  private lib SpecKernel32
+    fun GetCurrentProcess : LibC::HANDLE
+    fun GetProcessHandleCount(process : LibC::HANDLE, count : UInt32*) : LibC::BOOL
+  end
+
+  # spec/support/stdio_child.cr, built by the caller (Windows has no cat or sh to lean on).
+  private def stdio_child : String
+    path = ENV["PROCESS_SUPERVISION_STDIO_CHILD"]?
+    pending!("PROCESS_SUPERVISION_STDIO_CHILD is not set to a build of spec/support/stdio_child.cr") unless path && File.exists?(path)
+    path
+  end
+
+  private def handle_count : UInt32
+    count = 0_u32
+    SpecKernel32.GetProcessHandleCount(SpecKernel32.GetCurrentProcess, pointerof(count)).should_not eq(0)
+    count
+  end
+
+  # Yields a fresh Job and closes it afterwards, which kills anything still in it.
+  private def in_job(&)
+    job = ProcessSupervision.job
+    begin
+      yield job
+    ensure
+      job.close
+    end
+  end
+
+  describe "ProcessSupervision::Windows::Job spawn standard streams" do
+    pipe = Process::Redirect::Pipe
+
+    it "pipes input to output through a child and sees EOF when it exits" do
+      in_job do |job|
+        child = job.spawn(stdio_child, ["cat"], input: pipe, output: pipe)
+        begin
+          child.input.print "hello\nworld\n"
+          child.input.close
+          child.output.gets_to_end.should eq("hello\nworld\n")
+          child.wait(10.seconds).not_nil!.success?.should be_true
+        ensure
+          child.close
+        end
+      end
+    end
+
+    it "keeps standard output and standard error apart" do
+      in_job do |job|
+        child = job.spawn(stdio_child, ["split"], output: pipe, error: pipe)
+        begin
+          child.output.gets_to_end.should eq("out\n")
+          child.error.gets_to_end.should eq("err\n")
+          child.wait(10.seconds).not_nil!.success?.should be_true
+        ensure
+          child.close
+        end
+      end
+    end
+
+    it "hands a closed stream the null device" do
+      in_job do |job|
+        child = job.spawn(stdio_child, ["cat"], input: Process::Redirect::Close, output: pipe)
+        begin
+          child.output.gets_to_end.should eq("")
+          child.wait(10.seconds).not_nil!.success?.should be_true
+        ensure
+          child.close
+        end
+      end
+    end
+
+    it "reads from and writes to files" do
+      dir = File.join(Dir.tempdir, "ps-spec-#{Process.pid}-#{Random.new.hex(4)}")
+      Dir.mkdir_p(dir)
+      begin
+        source = File.join(dir, "in")
+        target = File.join(dir, "out")
+        File.write(source, "from a file\n")
+        in_job do |job|
+          File.open(source) do |reader|
+            File.open(target, "w") do |writer|
+              child = job.spawn(stdio_child, ["cat"], input: reader, output: writer)
+              child.wait(10.seconds).not_nil!.success?.should be_true
+              child.close
+            end
+          end
+        end
+        File.read(target).should eq("from a file\n")
+      ensure
+        FileUtils.rm_rf(dir)
+      end
+    end
+
+    it "moves a megabyte in both directions without deadlock" do
+      data = "0123456789abcdef" * 65_536
+      in_job do |job|
+        child = job.spawn(stdio_child, ["cat"], input: pipe, output: pipe)
+        done = Channel(Nil).new
+        spawn do
+          child.input.print data
+          child.input.close
+          done.send(nil)
+        end
+        begin
+          received = child.output.gets_to_end
+          done.receive
+          received.bytesize.should eq(data.bytesize)
+          (received == data).should be_true
+          child.wait(10.seconds).not_nil!.success?.should be_true
+        ensure
+          child.close
+        end
+      end
+    end
+
+    it "raises for a stream that was not piped, and closes the pipes with the child" do
+      input = nil.as(IO?)
+      in_job do |job|
+        child = job.spawn(stdio_child, ["cat"], input: pipe, output: Process::Redirect::Close)
+        begin
+          expect_raises(NilAssertionError) { child.output }
+          input = child.input
+          child.input.close
+          child.wait(10.seconds).should_not be_nil
+        ensure
+          child.close
+        end
+      end
+      input.not_nil!.closed?.should be_true
+    end
+
+    it "rejects stream objects it cannot hand to a child, before creating anything" do
+      in_job do |job|
+        expect_raises(ArgumentError) { job.spawn(stdio_child, ["cat"], output: IO::Memory.new) }
+        job.empty?.should be_true
+      end
+    end
+
+    it "leaks no handles when the process cannot be created" do
+      in_job do |job|
+        missing = File.join(Dir.tempdir, "ps-spec-missing-#{Random.new.hex(4)}.exe")
+        3.times { expect_raises(Exception) { job.spawn(missing, input: pipe, output: pipe, error: pipe) } }
+        before = handle_count
+        30.times { expect_raises(Exception) { job.spawn(missing, input: pipe, output: pipe, error: pipe) } }
+        # 30 attempts with three pipes each: a leak of even one handle per attempt would show as 30
+        handle_count.should be <= before + 5
+      end
+    end
+
+    it "sees EOF on a pipe a grandchild still held once the Job is killed" do
+      in_job do |job|
+        child = job.spawn(stdio_child, ["tree"], output: pipe)
+        begin
+          child.output.gets.should eq("ready")
+          job.kill
+          rest = Channel(String).new(1)
+          spawn { rest.send(child.output.gets_to_end) }
+          select
+          when text = rest.receive
+            text.should eq("")
+          when timeout(10.seconds)
+            fail "the pipe stayed open after the Job was killed"
+          end
+          job.wait_empty(10.seconds).should be_true
+        ensure
+          child.close
+        end
+      end
+    end
+
+    it "carries the streams through ProcessSupervision.spawn too" do
+      child = ProcessSupervision.spawn(stdio_child, ["split"], output: pipe, error: Process::Redirect::Close)
+      begin
+        child.group.mechanism.job_object?.should be_true
+        child.output.gets_to_end.should eq("out\n")
+        child.wait(10.seconds).not_nil!.success?.should be_true
+        child.group.shutdown
+      ensure
+        child.close
+      end
+    end
+  end
+{% end %}
