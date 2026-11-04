@@ -435,7 +435,7 @@ end
     end
 
     it "has the leader in its own group by the time spawn returns, and shuts the group down" do
-      child = leader("/bin/sleep", ["30"])
+      child = leader("sleep", ["30"])
       group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
       begin
         LibC.getpgid(child.pid.to_i32).should eq(child.pid.to_i32)
@@ -448,9 +448,9 @@ end
     end
 
     it "joins a second child to the group and ends both with one signal" do
-      first = leader("/bin/sleep", ["30"])
+      first = leader("sleep", ["30"])
       group = first.group.as(ProcessSupervision::POSIX::ProcessGroup)
-      second = group.spawn("/bin/sleep", ["30"])
+      second = group.spawn("sleep", ["30"])
       begin
         LibC.getpgid(second.pid.to_i32).should eq(group.pgid.to_i32)
         group.empty?.should be_false
@@ -504,16 +504,18 @@ end
         end
       end
 
-      it "leaves no descriptors and no zombies behind after many instantly exiting children" do
-        before = Dir.children("/proc/self/fd").size
-        50.times do
-          child = leader("/bin/true")
-          finish(child).success?.should be_true
-          child.group.close
-        end
-        Dir.children("/proc/self/fd").size.should eq(before)
-      end
     {% end %}
+
+    it "leaves no descriptors behind after many instantly exiting children" do
+      fd_directory = File.directory?("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd"
+      before = Dir.children(fd_directory).size
+      50.times do
+        child = leader("true")
+        finish(child).success?.should be_true
+        child.group.close
+      end
+      Dir.children(fd_directory).size.should eq(before)
+    end
 
     it "raises the stdlib's exception classes for a bad command, a non-executable file and a bad directory" do
       expect_raises(File::NotFoundError) { leader("definitely-not-a-command-ps-spec") }
@@ -528,24 +530,24 @@ end
     it "validates its input before creating anything" do
       expect_raises(ArgumentError) { leader("") }
       expect_raises(ArgumentError) { leader("/bin/sh\0x") }
-      expect_raises(ArgumentError) { leader("/bin/true", ["a\0b"]) }
-      expect_raises(ArgumentError) { leader("/bin/true", env: {"A=B" => "x"}) }
-      expect_raises(ArgumentError) { leader("/bin/true", env: {"A" => "x\0y"}) }
+      expect_raises(ArgumentError) { leader("true", ["a\0b"]) }
+      expect_raises(ArgumentError) { leader("true", env: {"A=B" => "x"}) }
+      expect_raises(ArgumentError) { leader("true", env: {"A" => "x\0y"}) }
     end
 
     it "refuses to join a group that no longer exists" do
-      first = leader("/bin/true")
+      first = leader("true")
       group = first.group.as(ProcessSupervision::POSIX::ProcessGroup)
       finish(first)
-      expect_raises(ProcessSupervision::Error::Unavailable) { group.spawn("/bin/true") }
+      expect_raises(ProcessSupervision::Error::Unavailable) { group.spawn("true") }
     end
 
     it "rejects spawn after the group controller is closed" do
-      first = leader("/bin/true")
+      first = leader("true")
       group = first.group.as(ProcessSupervision::POSIX::ProcessGroup)
       finish(first)
       group.close
-      expect_raises(ProcessSupervision::Error::Closed) { group.spawn("/bin/true") }
+      expect_raises(ProcessSupervision::Error::Closed) { group.spawn("true") }
     end
   end
 {% end %}
@@ -600,7 +602,7 @@ end
       group = new_cgroup
       begin
         group.kill
-        expect_raises(ProcessSupervision::Error::Killed) { group.spawn("/bin/true") }
+        expect_raises(ProcessSupervision::Error::Killed) { group.spawn("true") }
       ensure
         group.close
       end

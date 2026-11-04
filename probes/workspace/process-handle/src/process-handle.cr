@@ -12,6 +12,7 @@ require "./process-handle/execution"
   require "./process-handle/linux/handle"
 {% elsif flag?(:darwin) %}
   require "./process-handle/darwin/native"
+  require "./process-handle/darwin/kqueue_handle"
 {% elsif flag?(:win32) %}
   require "./process-handle/windows/base"
   require "./process-handle/windows/access"

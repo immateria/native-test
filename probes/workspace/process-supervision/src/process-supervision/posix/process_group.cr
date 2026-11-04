@@ -36,6 +36,15 @@
             end
             ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, self, group)
           end
+        {% elsif flag?(:darwin) %}
+          run_on_execution_context("process-supervision-posix-spawn") do
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            @mutex.synchronize do
+              check_open_locked
+              _, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, @pgid.to_i32)
+              ProcessSupervision::Child.new(process, handle, self)
+            end
+          end
         {% else %}
           raise ProcessSupervision::Error::Unsupported.new("spawning is not implemented for this target yet")
         {% end %}
@@ -52,6 +61,12 @@
             pending = ProcessSupervision::Linux::RawSpawn.create(prepared, pgroup: 0)
             # the group object needs the pid, so build it from the pending child
             ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, new(pending.pid.to_i64), nil)
+          end
+        {% elsif flag?(:darwin) %}
+          run_on_execution_context("process-supervision-posix-spawn-leader") do
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            pid, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, 0)
+            ProcessSupervision::Child.new(process, handle, new(pid.to_i64))
           end
         {% else %}
           raise ProcessSupervision::Error::Unsupported.new("spawning is not implemented for this target yet")

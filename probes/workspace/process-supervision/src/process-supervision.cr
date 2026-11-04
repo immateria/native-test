@@ -11,6 +11,10 @@ require "./process-supervision/child"
   require "./process-supervision/posix/process_group"
 {% end %}
 
+{% if flag?(:darwin) %}
+  require "./process-supervision/posix/darwin_spawn"
+{% end %}
+
 {% if flag?(:linux) %}
   require "./process-supervision/linux/raw_spawn"
   require "./process-supervision/linux/cgroup_v2"
