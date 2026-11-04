@@ -15,20 +15,32 @@
       # prevents the child from creating descendants before membership is
       # confirmed.
       #
-      # Standard streams are inherited explicitly through a HANDLE allow-list;
-      # no unrelated inheritable handles are admitted. Batch files are rejected
+      # Standard streams reach the child through a HANDLE allow-list; no
+      # unrelated inheritable handles are admitted. Each of *input*, *output*
+      # and *error* is `Process::Redirect::Inherit` (the default: the parent's
+      # standard handle, or the null device if it has none), `Close` (the null
+      # device), `Pipe` (read or write it through `Child#input` / `#output` /
+      # `#error`, closed by `Child#close`) or an `IO::FileDescriptor` such as a
+      # `File`. Other `IO` objects are rejected, as is a file opened for
+      # overlapped I/O: pipe and copy instead. Batch files are rejected
       # because direct CreateProcessW execution implicitly invokes cmd.exe.
       def spawn(command : String, args : Enumerable(String) = [] of String, *,
                 env : Process::Env = nil, clear_env : Bool = false,
-                chdir : Path | String? = nil) : ProcessSupervision::Child
+                chdir : Path | String? = nil,
+                input : ::Process::Stdio = ::Process::Redirect::Inherit,
+                output : ::Process::Stdio = ::Process::Redirect::Inherit,
+                error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
         run_on_execution_context("process-supervision-windows-job-spawn") do
-          spawn_on_execution_context(command, args, env: env, clear_env: clear_env, chdir: chdir)
+          spawn_on_execution_context(command, args, env: env, clear_env: clear_env, chdir: chdir,
+            input: input, output: output, error: error)
         end
       end
 
       private def spawn_on_execution_context(command : String, args : Enumerable(String), *,
                                              env : Process::Env, clear_env : Bool,
-                                             chdir : Path | String?) : ProcessSupervision::Child
+                                             chdir : Path | String?,
+                                             input : ::Process::Stdio, output : ::Process::Stdio,
+                                             error : ::Process::Stdio) : ProcessSupervision::Child
         validate_no_nul!(command, "command")
         reject_batch_file(command)
         argv = [command]
@@ -44,9 +56,7 @@
         command_line = Process.quote_windows(argv).to_utf16
         chdir_w = chdir_string.try &.to_utf16
 
-        std_input = LibC::HANDLE.null
-        std_output = LibC::HANDLE.null
-        std_error = LibC::HANDLE.null
+        plumbing = nil.as(Plumbing?)
         attr_storage = nil.as(Bytes?)
         attr_initialized = false
         process_info = LibC::PROCESS_INFORMATION.new
@@ -55,10 +65,8 @@
         stable_handle = nil.as(ProcessHandle?)
 
         begin
-          std_input = Native.standard_handle(Native::STD_INPUT_HANDLE, input: true)
-          std_output = Native.standard_handle(Native::STD_OUTPUT_HANDLE, input: false)
-          std_error = Native.standard_handle(Native::STD_ERROR_HANDLE, input: false)
-          inherited = StaticArray[std_input, std_output, std_error]
+          plumbing = Plumbing.build(input, output, error)
+          inherited = plumbing.handles
 
           attr_bytes = LibC::SizeT.new(0)
           NativeLib.InitializeProcThreadAttributeList(Pointer(Void).null, 2_u32, 0_u32, pointerof(attr_bytes))
@@ -73,9 +81,9 @@
           startup = StartupInfoExW.new
           startup.startup_info.cb = sizeof(StartupInfoExW).to_u32
           startup.startup_info.dwFlags = Native::STARTF_USESTDHANDLES
-          startup.startup_info.hStdInput = std_input
-          startup.startup_info.hStdOutput = std_output
-          startup.startup_info.hStdError = std_error
+          startup.startup_info.hStdInput = inherited[0]
+          startup.startup_info.hStdOutput = inherited[1]
+          startup.startup_info.hStdError = inherited[2]
           startup.attribute_list = attr_list
 
           @mutex.synchronize do
@@ -124,6 +132,11 @@
             end
           end
 
+          # The child holds its own copies now (outside the Job mutex: closing an
+          # IO may yield). The parent must not keep the child's pipe ends open,
+          # or the other side never sees EOF.
+          plumbing.release_child_side
+
           generation = Native.process_creation_time(process_info.hProcess, "GetProcessTimes(supervised child)")
           stable_handle = ProcessHandle.open(process_info.dwProcessId.to_i64)
           unless stable_handle.identity.generation == generation
@@ -139,11 +152,12 @@
           system_process = Crystal::System::Process.new(process_info)
           process_transferred = true
           process = SpawnedProcess.wrap(system_process)
-          ProcessSupervision::Child.new(process, stable_handle, self)
+          ProcessSupervision::Child.new(process, stable_handle, self, plumbing.input, plumbing.output, plumbing.error)
         rescue ex
           stable_handle.try do |handle|
             handle.close rescue nil
           end
+          plumbing.try &.abandon
           if process_created && !process_transferred
             LibC.TerminateProcess(process_info.hProcess, 125_u32) unless process_info.hProcess.null?
           end
@@ -156,9 +170,96 @@
           if attr_initialized && (storage = attr_storage)
             NativeLib.DeleteProcThreadAttributeList(storage.to_unsafe.as(Void*))
           end
-          Native.close_native_handle(std_input)
-          Native.close_native_handle(std_output)
-          Native.close_native_handle(std_error)
+          plumbing.try &.release_child_side
+        end
+      end
+
+      # Standard-stream plumbing for one spawn. `build` makes one inheritable
+      # HANDLE per stream (`handles`, the allow-list and STARTUPINFO entries)
+      # plus, for `Redirect::Pipe`, a pipe whose parent end is exposed as
+      # `input` / `output` / `error`. `release_child_side` closes the
+      # inheritable duplicates and the parent's copies of the child's pipe
+      # ends; it must run once the process exists. `abandon` also closes the
+      # parent's pipe ends.
+      #
+      # As in the stdlib, the child's end of each pipe is synchronous and the
+      # parent's end is overlapped (driven by the event loop). Every stream gets
+      # its own duplicate even when two specs name the same HANDLE, so the
+      # allow-list never holds a value twice.
+      private class Plumbing
+        getter handles = StaticArray(LibC::HANDLE, 3).new(LibC::HANDLE.null)
+        getter input : IO::FileDescriptor? = nil
+        getter output : IO::FileDescriptor? = nil
+        getter error : IO::FileDescriptor? = nil
+
+        @child_ends = [] of IO::FileDescriptor
+
+        def self.build(input : ::Process::Stdio, output : ::Process::Stdio, error : ::Process::Stdio) : Plumbing
+          plumbing = new
+          begin
+            plumbing.add(0, input)
+            plumbing.add(1, output)
+            plumbing.add(2, error)
+          rescue ex
+            plumbing.abandon
+            raise ex
+          end
+          plumbing
+        end
+
+        def add(target : Int32, spec : ::Process::Stdio) : Nil
+          reading = target == 0
+          case spec
+          when ::Process::Redirect
+            case spec
+            when .inherit?
+              kind = {Native::STD_INPUT_HANDLE, Native::STD_OUTPUT_HANDLE, Native::STD_ERROR_HANDLE}[target]
+              @handles[target] = Native.standard_handle(kind, input: reading)
+            when .close?
+              @handles[target] = Native.null_device(input: reading)
+            when .pipe?
+              if reading
+                reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
+                @child_ends << reader
+                @input = writer
+                @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(reader.fd), "DuplicateHandle(stdin pipe)")
+              else
+                reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
+                @child_ends << writer
+                target == 1 ? (@output = reader) : (@error = reader)
+                @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(writer.fd), "DuplicateHandle(#{target == 1 ? "stdout" : "stderr"} pipe)")
+              end
+            end
+          when IO::FileDescriptor
+            raise ArgumentError.new("standard stream #{target} is closed") if spec.closed?
+            # An overlapped regular file cannot serve a child that does
+            # synchronous I/O on it; the stdlib reopens or pipes such files.
+            # Overlapped pipes (an IO.pipe end) are fine.
+            unless spec.system_blocking? || pipe?(spec)
+              raise ArgumentError.new("standard stream #{target}: a file opened for overlapped I/O cannot be handed to a child; open it blocking, or pipe and copy")
+            end
+            @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(spec.fd), "DuplicateHandle(standard stream #{target})")
+          else
+            raise ArgumentError.new("only Process::Redirect and IO::FileDescriptor are supported for standard streams")
+          end
+        end
+
+        def release_child_side : Nil
+          @handles.each { |handle| Native.close_native_handle(handle) }
+          @handles = StaticArray(LibC::HANDLE, 3).new(LibC::HANDLE.null)
+          @child_ends.each { |io| io.close rescue nil }
+          @child_ends.clear
+        end
+
+        def abandon : Nil
+          release_child_side
+          {@input, @output, @error}.each { |io| io.try { |stream| stream.close rescue nil } }
+        end
+
+        private def pipe?(io : IO::FileDescriptor) : Bool
+          io.info.type.pipe?
+        rescue
+          false
         end
       end
 

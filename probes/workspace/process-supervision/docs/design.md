@@ -50,8 +50,12 @@ explicit assignment is retained as a backstop/verification before resume. Job
 close is serialized with the creation transaction so its native HANDLE cannot
 be invalidated while it is embedded in the attribute list.
 
-Only duplicated standard handles are inheritable and listed in the process
-attribute. Hidden Windows per-drive environment entries are preserved when the
+Only the three standard-stream handles are inheritable and listed in the process
+attribute. Each is a fresh duplicate made for this spawn: the parent's standard
+handle (`Inherit`), the null device (`Close`), the child's end of a new pipe
+(`Pipe`) or the caller's `IO::FileDescriptor`. The duplicates and the parent's
+copies of the child's pipe ends are closed once the process exists, so a pipe
+reaches EOF when the child tree's last copy is gone (a Job kill included). Hidden Windows per-drive environment entries are preserved when the
 environment block is rebuilt. Direct batch-file execution is rejected.
 
 Job cleanup follows the later PTY Session cleanup-completion rule. The owner
@@ -132,5 +136,5 @@ semantics remain with `pty`.
    marker scan works, `START_SUSPENDED` works); a macOS descendant tracker is not implemented.
 5. Capability reporting is done by trying (`CgroupV2.usable?`, `delegated_parent`, `ProcessSupervision.strongest_mechanism`);
    adopting an already-running process into a group is still open.
-6. Stdio redirection is done for Linux and macOS (Inherit/Close/Pipe/FileDescriptor); Windows Jobs and arbitrary `IO` targets
+6. Stdio redirection is done for Linux, macOS and Windows Jobs (Inherit/Close/Pipe/FileDescriptor); arbitrary `IO` targets
    are open, as is `posix_spawn` as the Linux engine for process groups.

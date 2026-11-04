@@ -112,7 +112,11 @@
         unless source.null? || source == INVALID_HANDLE_VALUE
           return duplicate_inheritable(source, "DuplicateHandle(standard stream)")
         end
+        null_device(input: input)
+      end
 
+      # An inheritable HANDLE on the null device, opened for reading (a child's stdin) or writing (stdout/stderr).
+      def self.null_device(*, input : Bool) : LibC::HANDLE
         security = LibC::SECURITY_ATTRIBUTES.new(
           nLength: sizeof(LibC::SECURITY_ATTRIBUTES).to_u32,
           lpSecurityDescriptor: Pointer(Void).null,

@@ -98,12 +98,15 @@ Contract, all of it measured natively (explore/FINDINGS.md, "Spawning into conta
 - Detection is by trying: `CgroupV2.available?` only says a hierarchy is mounted (a default container mounts it read-only).
   `usable?(parent)` and `delegated_parent` create and remove a probe cgroup. A refused create (`EACCES`, `EROFS`) is
   `Error::Unavailable`, so `ProcessSupervision.cgroup_v2(path, fallback_pgid:)` falls back.
-- **Standard streams** (`input:`, `output:`, `error:`), on Linux and macOS: `Process::Redirect::Inherit` (the default),
+- **Standard streams** (`input:`, `output:`, `error:`), on Linux, macOS and Windows Jobs: `Process::Redirect::Inherit` (the default),
   `Close` (the null device), `Pipe` (read or write it through `child.input` / `child.output` / `child.error`, closed by
   `child.close`) or an `IO::FileDescriptor` such as a `File`. Arbitrary `IO` objects (`IO::Memory`) are rejected: pipe and
   copy. The parent's pipe ends are non-blocking (fiber-friendly), the child's are blocking, and the child's ends are closed
-  in the parent as soon as the process exists, so EOF arrives when the child exits. Windows Jobs still inherit only.
-- Not yet: stream redirection for Windows Jobs, descendant tracking on macOS (kqueue `NOTE_TRACK` is refused with `ENOTSUP`;
+  in the parent as soon as the process exists, so EOF arrives when the child exits. On Windows each stream is its own
+  inheritable duplicate in the `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` allow-list, the child's pipe ends are synchronous and
+  the parent's overlapped (as in the stdlib), and a file opened for overlapped I/O is rejected (`ArgumentError`): open
+  it blocking, which `File.open` does by default, or pipe and copy.
+- Not yet: descendant tracking on macOS (kqueue `NOTE_TRACK` is refused with `ENOTSUP`;
   an environment marker scan finds reparented descendants), and `posix_spawn` on Linux for supervisors with very large heaps
   (fork copies the page tables: 12-22 ms at a 512 MiB Crystal heap).
 
