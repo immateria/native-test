@@ -1022,6 +1022,53 @@ idle: a race that a test on an idle machine will not show.
   five runners (2 of about 220–340 readable processes carried the marker — the forker and the grandchild) in 3–17 ms
   (one 94.5 ms outlier). Not tested: a program that execs and replaces its environment.
 
+## Where cgroups are usable: delegation, systemd, containers, Alpine (`explore/linux/cgroup_env.c`, `env_run.sh`)
+
+Run `41920365122` on Ubuntu 22.04 (kernel 6.8, systemd 249), 24.04 (7.0, systemd 255) and 24.04 arm64; the outcome classes
+were identical on all three except where noted. Each scenario ran `cgroup_env` (what is possible), `spawn_attrs`,
+`spawn_cgroup` (20 trials per cell) and the kit's `kit_linux` inside it. Hosted runners only; Docker 28 and systemd were
+already on the image. Earlier cgroup results in this file all used a subtree I delegated by hand with `sudo mkdir` +
+`chown` — that was one stand-in for delegation, not a survey of how a supervisor actually finds itself; this is the survey.
+
+| environment | create a cgroup | `clone3` | what the shard did |
+|---|---|---|---|
+| host, unprivileged, nothing delegated (the step's cgroup, `system.slice/hosted-compute-agent.service`, root-owned) | `EACCES` in its own cgroup, its parent and the root | works | `create` → `Error::Unavailable` (correct) |
+| host, root | yes, anywhere | works | all 9 cases pass |
+| systemd service, `User=`, no `Delegate=` | `EACCES` (unit cgroup root-owned) | works | `Unavailable` (correct) |
+| systemd service, `Delegate=yes` | yes, in the unit's cgroup (owned by the service user; `cpuset cpu io memory pids` listed, `subtree_control` empty); not in `system.slice` | works | all 9 pass |
+| … plus `DelegateSubgroup=supervisor` (systemd ≥ 254; on 22.04 systemd 249: `Unknown assignment`) | yes: the main process sits in `<unit>/supervisor`, which lists no controllers; the unit cgroup itself is empty and takes `+pids` | works | all 9 pass |
+| systemd user manager (lingering user, `user@1001.service`) | yes, in the unit under `app.slice` (owned by the user; `memory pids` only); the root `EACCES` | works | all 9 pass |
+| Docker, default, root or non-root | **no: `/sys/fs/cgroup` is a read-only mount** (`EROFS`, non-root `EACCES`) | **`ENOSYS`** (default seccomp profile; `pidfd_open` and `PR_SET_CHILD_SUBREAPER` still work) | see below |
+| Docker, `seccomp=unconfined` | no (`EROFS`) | works | see below |
+| Docker, `--privileged` (private cgroup namespace) | yes, as root; the container's own cgroup is the mount root (`/`) | works | 8 of 9 pass |
+| Docker, `--privileged --cgroupns=host` | yes: own, parent and the host root | works | all 9 pass |
+| Alpine (musl, busybox `sh`), default / privileged | same as Docker default / privileged | `ENOSYS` / works | (C probes only) |
+
+* **Detection must be "try it", not "is cgroup2 mounted".** `CgroupV2.available?` was `true` in every row, including the
+  read-only Docker mount where nothing can be created.
+* **Two refusals escape `Error::Unavailable`**, so `ProcessSupervision.cgroup_v2(path, fallback_pgid:)`, which only
+  rescues `Unavailable`, does not fall back there: (1) `CgroupV2.create` on the read-only mount raises
+  `File::Error: Unable to create directory … Read-only file system`; (2) opening the process's own cgroup raises
+  `ArgumentError: refusing to supervise the cgroup-v2 hierarchy root` in every container with a private cgroup namespace,
+  because there the container's cgroup *is* the root of what it sees — also in the privileged one, where it is writable
+  and `create` under it works and the other 8 kit cases pass. A cgroup v1 named hierarchy handed to the shard gives
+  `ArgumentError: … outside every visible cgroup-v2 mount`. Unprivileged `EACCES` is classified correctly.
+* The kit's three pidfd cases passed in every environment, including default Docker and rootless-style non-root.
+* A default container has neither a usable cgroup nor `clone3`: it needs the process-group/subreaper/pidfd path, and a
+  `clone3` caller must treat `ENOSYS` (not only `EPERM`) as "use the fork path".
+* A `Delegate=yes` service that keeps its main process in the unit cgroup can add `pids` to `subtree_control` but I did
+  not test `memory` (the shard sets no limits, so it did not matter here); `DelegateSubgroup=` is the clean way where
+  systemd allows it.
+* **The earlier spawn results held in every usable row** (20 trials per cell, 7 environments × 3 runners): attach after the
+  exec lost children in 4–18 of 20 trials under CPU load and 0 when idle; `clone3 INTO_CGROUP` and the `sh`/`bash`
+  trampolines 0 of 20 everywhere; a `clone3` into a cgroup that had been written `cgroup.kill` died at once in all of them.
+  The same pattern also appeared on a fourth kernel (6.18, hybrid v1/unified host, as root; 7 of 20 busy trials).
+* **musl and busybox:** `posix_spawn` behaved like glibc for process group, session, signal reset, `chdir` and every error
+  code, **except that musl has no `posix_spawn_file_actions_addclosefrom_np`**, so an inherited descriptor above 2 stayed
+  open in the child (glibc ≥ 2.34 and macOS can close them). Through busybox `sh` the trampoline changed one thing, `SHLVL`
+  (incremented); through bash on Alpine nothing differed. Exit-code behaviour of the trampoline was the same as on dash.
+* `posix_spawn` results were identical in all 33 glibc environment/runner combinations (host, root, systemd, Docker).
+
 ## Still open
 
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time
@@ -1032,6 +1079,8 @@ idle: a race that a test on an idle machine will not show.
   then (exit code 0);
 * why a child cloned with `CLONE_INTO_CGROUP` into a cgroup that has had `cgroup.kill` written dies at once (kernel
   source for 6.8 and 7.0 not read);
+* not testable on hosted runners: WSL, Kubernetes, rootless Docker/Podman, a cgroup-v1-only or hybrid-only host (the
+  runners are unified; one local 6.18 hybrid host showed the same escape and kill behaviour), SELinux-enforcing hosts;
 * macOS descendants: whether the environment marker survives a program that execs and clears or rewrites its environment,
   and whether `START_SUSPENDED` plus a marker is enough in practice; musl/Alpine `posix_spawn` and Docker/systemd cgroup
   delegation were not tested (everything above is the hosted runner images);
