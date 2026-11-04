@@ -131,6 +131,7 @@ jobs:
               ./explore-out/build/crystal_own_spawn explore-out/build/spawn_attrs > "explore-out/$tag-crystal_own_spawn.jsonl" 2> "explore-out/$tag-crystal_own_spawn.err"; echo "crystal_own_spawn exit=$?"
               crystal build --no-color -Dpreview_mt -Dexecution_context explore/posix/crystal_own_spawn.cr -o explore-out/build/crystal_own_spawn_mt > "explore-out/$tag-crystal_own_spawn_mt-build.txt" 2>&1; echo "crystal mt build exit=$?"
               ./explore-out/build/crystal_own_spawn_mt explore-out/build/spawn_attrs > "explore-out/$tag-crystal_own_spawn_mt.jsonl" 2> "explore-out/$tag-crystal_own_spawn_mt.err"; echo "crystal_own_spawn_mt exit=$?"
+              for mib in 0 256 512; do OWN_SPAWN_BENCH_MIB=$mib ./explore-out/build/crystal_own_spawn explore-out/build/spawn_attrs >> "explore-out/$tag-crystal_own_spawn_cost.jsonl" 2>> "explore-out/$tag-crystal_own_spawn_cost.err"; done; echo "crystal cost runs done"
             fi
           fi
           for f in explore-out/$tag-spawn_attrs.jsonl explore-out/$tag-kqueue_track.jsonl explore-out/$tag-crystal_own_spawn*.jsonl; do [ -f "$f" ] && { echo "=== $f"; cut -c1-500 "$f"; }; done
@@ -268,6 +269,8 @@ jobs:
           ./explore-out/build/spawn_attrs > "explore-out/$tag-spawn_attrs.jsonl" 2> "explore-out/$tag-spawn_attrs.err"; echo "spawn_attrs exit=$?"
           [ -x explore-out/build/crystal_own_spawn ] && { timeout 300 ./explore-out/build/crystal_own_spawn ./explore-out/build/spawn_attrs "$D" > "explore-out/$tag-crystal_own_spawn.jsonl" 2> "explore-out/$tag-crystal_own_spawn.err"; echo "crystal_own_spawn exit=$?"; }
           [ -x explore-out/build/crystal_own_spawn_mt ] && { timeout 300 ./explore-out/build/crystal_own_spawn_mt ./explore-out/build/spawn_attrs "$D" > "explore-out/$tag-crystal_own_spawn_mt.jsonl" 2> "explore-out/$tag-crystal_own_spawn_mt.err"; echo "crystal_own_spawn_mt exit=$?"; }
+          # spawn cost against the size of the Crystal heap: one fresh process per size
+          [ -x explore-out/build/crystal_own_spawn ] && for mib in 0 256 512; do OWN_SPAWN_BENCH_MIB=$mib timeout 120 ./explore-out/build/crystal_own_spawn ./explore-out/build/spawn_attrs "$D" >> "explore-out/$tag-crystal_own_spawn_cost.jsonl" 2>> "explore-out/$tag-crystal_own_spawn_cost.err"; done; echo "crystal cost runs done"
           echo "left in $D: $(ls $D | grep -v '\.' | tr '\n' ' ')"
 
       - name: Show results

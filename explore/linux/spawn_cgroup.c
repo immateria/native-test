@@ -525,38 +525,127 @@ static void case_clone3_pids_and_kill(void) {
   finish(&b);
   cg_write(leaf, "pids.max", "max");
 
-  /* a child cloned in right after cgroup.kill: does it live? (delay between the kill and the clone3 varies) */
-  int delays[] = {0, 1, 10, 100, 500};
-  char kout[2000] = "[";
-  for (size_t d = 0; d < sizeof delays / sizeof delays[0]; d++) {
-    cp_t first, second;
-    clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &first);
-    ran(&first, 300);
-    int kw = cg_write(leaf, "cgroup.kill", "1");
-    int st1 = 0;
-    waitpid(first.pid, &st1, 0);
-    char s1[64], populated_txt[16];
-    status_text(st1, s1, sizeof s1);
-    snprintf(populated_txt, sizeof populated_txt, "%lld", cg_key(leaf, "cgroup.events", "populated"));
-    if (delays[d]) sleep_ms(delays[d]);
-    clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &second);
-    int ran2 = second.pid > 0 && ran(&second, 300);
-    int st2 = 0;
-    pid_t w2 = second.pid > 0 ? waitpid(second.pid, &st2, WNOHANG) : -1;
-    char s2[64] = "-";
-    if (w2 > 0) status_text(st2, s2, sizeof s2);
-    size_t l = strlen(kout);
-    snprintf(kout + l, sizeof kout - l, "%s{\"delay_ms\":%d,\"kill_write\":\"%s\",\"first_end\":\"%s\",\"populated_after_kill\":%s,\"second_clone3\":\"%s\",\"second_ran\":%d,\"second_reaped_within_300ms\":%d,\"second_end\":\"%s\"}",
-             l > 1 ? "," : "", delays[d], errno_name(kw), s1, populated_txt, second.pid > 0 ? "OK" : errno_name(second.err), ran2, w2 > 0, s2);
-    finish(&first);
-    finish(&second);
+  close(dfd);
+  leaf_empty_and_remove(leaf);
+}
+
+/* A child cloned into a cgroup right after cgroup.kill was SIGKILLed at once in the first run, even 500 ms after the
+ * kill. What does that depend on? */
+static void fate(char *out, size_t cap, const char *what, cp_t *c, const char *note) {
+  int r = c->pid > 0 && ran(c, 300);
+  int st = 0;
+  pid_t w = c->pid > 0 ? waitpid(c->pid, &st, WNOHANG) : -1;
+  char txt[96];
+  if (c->pid <= 0) snprintf(txt, sizeof txt, "spawn_failed(%s)", errno_name(c->err));
+  else if (w == 0) snprintf(txt, sizeof txt, "alive");
+  else if (w == c->pid) { char t[64]; status_text(st, t, sizeof t); snprintf(txt, sizeof txt, "%s", t); c->pid = -1; }
+  else snprintf(txt, sizeof txt, "waitpid_error");
+  size_t l = strlen(out);
+  snprintf(out + l, cap - l, "%s{\"what\":\"%s\",\"child_ran\":%d,\"child\":\"%s\",\"note\":\"%s\"}", l > 1 ? "," : "", what, r, txt, note);
+}
+
+static void fork_attach_probe(const char *leaf, cp_t *o) {
+  int pp[2];
+  memset(o, 0, sizeof *o);
+  o->pid = -1; o->rfd = -1; o->pidfd = -1;
+  if (pipe2(pp, O_CLOEXEC) != 0) { o->err = errno; return; }
+  pid_t f = fork();
+  if (f == 0) { (void)!write(pp[1], "x", 1); sleep_ms(3000); _exit(0); }
+  close(pp[1]);
+  o->pid = f;
+  o->rfd = pp[0];
+  char num[24];
+  snprintf(num, sizeof num, "%d", (int)f);
+  cg_write(leaf, "cgroup.procs", num);
+}
+
+static void case_kill_stickiness(void) {
+  char leaf[600];
+  if (make_leaf("c3-stick", leaf, sizeof leaf)) return;
+  int dfd = open(leaf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  char out[3500] = "[";
+  cp_t c, m;
+
+  clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &c);
+  fate(out, sizeof out, "never_killed_then_clone3", &c, "baseline");
+  finish(&c);
+
+  /* kill an EMPTY cgroup, then clone3 into it */
+  int kw = cg_write(leaf, "cgroup.kill", "1");
+  clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &c);
+  fate(out, sizeof out, "killed_while_empty_then_clone3", &c, errno_name(kw));
+  finish(&c);
+
+  /* a member, then kill, then (after 0 and 500 ms) clone3 */
+  int delays[] = {0, 500};
+  for (int d = 0; d < 2; d++) {
+    clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &m);
+    ran(&m, 300);
     cg_write(leaf, "cgroup.kill", "1");
-    double e2 = now_ms() + 500;
-    while (now_ms() < e2 && cg_key(leaf, "cgroup.events", "populated") == 1) sleep_ms(1);
+    waitpid(m.pid, NULL, 0);
+    m.pid = -1;
+    finish(&m);
+    if (delays[d]) sleep_ms(delays[d]);
+    clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &c);
+    fate(out, sizeof out, d ? "killed_with_member_then_clone3_after_500ms" : "killed_with_member_then_clone3_at_once", &c, "");
+    finish(&c);
   }
-  size_t kl = strlen(kout);
-  snprintf(kout + kl, sizeof kout - kl, "]");
-  emit(PROBE, "clone3_after_cgroup_kill", "\"results\":%s", kout);
+
+  /* the same cgroup through a second, new descriptor */
+  int dfd2 = open(leaf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  clone_probe(CLONE_INTO_CGROUP, dfd2, sizeof(struct clone_args_v2), 3000, &c);
+  fate(out, sizeof out, "killed_then_clone3_through_a_new_descriptor", &c, "");
+  finish(&c);
+  close(dfd2);
+
+  /* fork + write the pid to cgroup.procs instead */
+  fork_attach_probe(leaf, &c);
+  fate(out, sizeof out, "killed_then_fork_and_attach_by_cgroup_procs", &c, "");
+  finish(&c);
+
+  /* a member of the killed cgroup forks normally (no CLONE_INTO_CGROUP) */
+  {
+    int go[2], rp[2];
+    (void)!pipe2(go, O_CLOEXEC);
+    (void)!pipe2(rp, O_CLOEXEC);
+    pid_t mem = fork();
+    if (mem == 0) {
+      char b;
+      (void)!read(go[0], &b, 1);
+      pid_t g = fork();
+      if (g == 0) { (void)!write(rp[1], "g", 1); sleep_ms(3000); _exit(0); }
+      sleep_ms(3000);
+      _exit(0);
+    }
+    char num[24];
+    snprintf(num, sizeof num, "%d", (int)mem);
+    cg_write(leaf, "cgroup.procs", num);
+    (void)!write(go[1], "x", 1);
+    cp_t g;
+    memset(&g, 0, sizeof g);
+    g.pid = -1;
+    g.rfd = rp[0];
+    char b;
+    int ran_g = read_timeout(rp[0], &b, 1, 300) == 1;
+    size_t l = strlen(out);
+    snprintf(out + l, sizeof out - l, ",{\"what\":\"killed_then_member_forks_normally\",\"grandchild_ran\":%d,\"member_alive\":%d,\"note\":\"fork inside the killed cgroup\"}", ran_g, kill(mem, 0) == 0);
+    kill(mem, SIGKILL);
+    waitpid(mem, NULL, 0);
+    close(go[0]); close(go[1]); close(rp[0]); close(rp[1]);
+  }
+
+  /* remove the cgroup, make a new one with the same name */
+  close(dfd);
+  leaf_empty_and_remove(leaf);
+  make_leaf("c3-stick", leaf, sizeof leaf);
+  dfd = open(leaf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  clone_probe(CLONE_INTO_CGROUP, dfd, sizeof(struct clone_args_v2), 3000, &c);
+  fate(out, sizeof out, "removed_and_recreated_then_clone3", &c, "new cgroup, same path");
+  finish(&c);
+
+  size_t l = strlen(out);
+  snprintf(out + l, sizeof out - l, "]");
+  emit(PROBE, "cgroup_kill_then_new_children", "\"results\":%s", out);
   close(dfd);
   leaf_empty_and_remove(leaf);
 }
@@ -837,6 +926,7 @@ int main(int argc, char **argv) {
   case_clone3_errors();
   case_clone3_frozen();
   case_clone3_pids_and_kill();
+  case_kill_stickiness();
   case_clone3_pidfd();
   case_populated_visibility();
   case_trampoline_fidelity();

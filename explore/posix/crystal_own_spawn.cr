@@ -127,12 +127,6 @@ def status_text(st : Process::Status?) : String
   st.normal_exit? ? "exited(#{st.exit_code})" : "signaled(#{st.exit_signal? || st.system_exit_status})"
 end
 
-def ms(&) : Float64
-  t = Time.monotonic
-  yield
-  (Time.monotonic - t).total_milliseconds
-end
-
 def median(a : Array(Float64)) : Float64
   s = a.sort
   s.empty? ? -1.0 : s[s.size // 2]
@@ -158,6 +152,38 @@ rescue
   -1
 end
 
+{% if flag?(:linux) %}
+  def clone3_spawn(dirfd : Int32, path : String, args : Array(String), out_fd : Int32) : Int32
+    argv = CStrings.new([path] + args)
+    envp = current_env
+    ca = StaticArray(UInt64, 11).new(0_u64)
+    ca[0] = 0x200000000_u64 # CLONE_INTO_CGROUP
+    ca[4] = 17_u64          # exit_signal = SIGCHLD
+    ca[10] = dirfd.to_u64
+    blocked = uninitialized LibC::SigsetT
+    old = uninitialized LibC::SigsetT
+    empty = uninitialized LibC::SigsetT
+    LibC.sigfillset(pointerof(blocked))
+    LibC.sigemptyset(pointerof(empty))
+    LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(blocked), pointerof(old))
+    pid = Crystal::System::Process.lock_write do
+      LibC.syscall(435_i64, pointerof(ca), 88_u64)
+    end
+    if pid == 0
+      # the child: system calls only, no allocation, no runtime
+      LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(empty), nil)
+      LibC.dup2(out_fd, 1)
+      LibC.execve(path, argv.ptrs, envp.ptrs)
+      LibC._exit(127)
+    end
+    e = Errno.value
+    LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(old), nil)
+    raise "clone3 failed: #{e}" if pid < 0
+    pid.to_i32
+  end
+
+{% end %}
+
 # a hung case must not hold the CI job: this fiber ends the probe (it cannot run while a blocking waitpid holds the thread)
 spawn do
   sleep 280.seconds
@@ -175,6 +201,66 @@ emit("_platform") do |j|
   j.field "preview_mt", {{ flag?(:preview_mt) }}
   j.field "execution_context", {{ flag?(:execution_context) }}
 end
+
+# --- cost of a spawn against the size of this process's heap (run once per size, each in a fresh process:
+#     OWN_SPAWN_BENCH_MIB=256 ./crystal_own_spawn <spawn_attrs> [cgroup dir]) --------------------------------------------
+TRUE_BIN = File.exists?("/bin/true") ? "/bin/true" : "/usr/bin/true"
+
+if mib_s = ENV["OWN_SPAWN_BENCH_MIB"]?
+  mib = mib_s.to_i
+  big = mib > 0 ? Bytes.new(mib.to_i64 * 1024 * 1024, 0xA5_u8) : Bytes.empty
+  emit("spawn_cost_heap_#{mib}_MiB") do |j|
+    n = 25
+    stdlib_call = [] of Float64
+    stdlib_total = [] of Float64
+    own_call = [] of Float64
+    own_total = [] of Float64
+    n.times do
+      t0 = Time.instant
+      p = Process.new(TRUE_BIN)
+      stdlib_call << t0.elapsed.total_milliseconds
+      p.wait
+      stdlib_total << t0.elapsed.total_milliseconds
+      t1 = Time.instant
+      rc, pid = own_spawn(TRUE_BIN, [] of String)
+      own_call << t1.elapsed.total_milliseconds
+      wait_within(wrap(pid), 5.seconds)
+      own_total << t1.elapsed.total_milliseconds
+    end
+    j.field "Process.new_call_ms", median(stdlib_call)
+    j.field "Process.new_until_waited_ms", median(stdlib_total)
+    j.field "posix_spawn_call_ms", median(own_call)
+    j.field "posix_spawn_until_waited_ms", median(own_total)
+    {% if flag?(:linux) %}
+      if dir = cgroup_dir
+        leaf = File.join(dir, "crystal-bench")
+        Dir.mkdir(leaf) unless Dir.exists?(leaf)
+        dirfd = LibC.open(leaf, LibC::O_RDONLY | LibC::O_CLOEXEC)
+        calls = [] of Float64
+        totals = [] of Float64
+        n.times do
+          r, w = IO.pipe(write_blocking: true)
+          t0 = Time.instant
+          pid = clone3_spawn(dirfd, TRUE_BIN, [] of String, w.fd)
+          calls << t0.elapsed.total_milliseconds
+          w.close
+          wait_within(wrap(pid), 5.seconds)
+          totals << t0.elapsed.total_milliseconds
+          r.close
+        end
+        j.field "clone3_call_ms", median(calls)
+        j.field "clone3_until_waited_ms", median(totals)
+        LibC.close(dirfd)
+        File.write(File.join(leaf, "cgroup.kill"), "1") rescue nil
+        sleep 50.milliseconds
+        Dir.delete(leaf) rescue nil
+      end
+    {% end %}
+  end
+  big[0] = 1_u8 if mib > 0
+  exit 0
+end
+
 
 # --- wrapping ------------------------------------------------------------------------------------------------------
 emit("posix_spawn_then_wrap_and_wait") do |j|
@@ -317,66 +403,9 @@ emit("concurrent_spawners") do |j|
   j.field "zombies_afterwards", zombie_children
 end
 
-def bench_heap(mib : Int32, n : Int32) : {Float64, Float64, Float64, Float64}
-  big = mib > 0 ? Bytes.new(mib.to_i64 * 1024 * 1024, 0xA5_u8) : Bytes.empty
-  stdlib_call = [] of Float64
-  stdlib_total = [] of Float64
-  own_call = [] of Float64
-  own_total = [] of Float64
-  n.times do
-    t0 = Time.monotonic
-    p = Process.new("/bin/true")
-    stdlib_call << (Time.monotonic - t0).total_milliseconds
-    p.wait
-    stdlib_total << (Time.monotonic - t0).total_milliseconds
-    t1 = Time.monotonic
-    rc, pid = own_spawn("/bin/true", [] of String)
-    own_call << (Time.monotonic - t1).total_milliseconds
-    wait_within(wrap(pid), 5.seconds)
-    own_total << (Time.monotonic - t1).total_milliseconds
-  end
-  big[0] = 1_u8 if mib > 0
-  {median(stdlib_call), median(stdlib_total), median(own_call), median(own_total)}
-end
-
-emit("spawn_cost_vs_crystal_heap") do |j|
-  [0, 256, 512].each do |mib|
-    a, b, c, d = bench_heap(mib, 25)
-    j.field "heap_#{mib}_MiB", JSON.parse(%({"Process.new_call_ms":#{a},"Process.new_until_waited_ms":#{b},"posix_spawn_call_ms":#{c},"posix_spawn_until_waited_ms":#{d}}))
-  end
-end
 
 # --- Linux: clone3(CLONE_INTO_CGROUP) from Crystal ------------------------------------------------------------------
 {% if flag?(:linux) %}
-  def clone3_spawn(dirfd : Int32, path : String, args : Array(String), out_fd : Int32) : Int32
-    argv = CStrings.new([path] + args)
-    envp = current_env
-    ca = StaticArray(UInt64, 11).new(0_u64)
-    ca[0] = 0x200000000_u64 # CLONE_INTO_CGROUP
-    ca[4] = 17_u64          # exit_signal = SIGCHLD
-    ca[10] = dirfd.to_u64
-    blocked = uninitialized LibC::SigsetT
-    old = uninitialized LibC::SigsetT
-    empty = uninitialized LibC::SigsetT
-    LibC.sigfillset(pointerof(blocked))
-    LibC.sigemptyset(pointerof(empty))
-    LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(blocked), pointerof(old))
-    pid = Crystal::System::Process.lock_write do
-      LibC.syscall(435_i64, pointerof(ca), 88_u64)
-    end
-    if pid == 0
-      # the child: system calls only, no allocation, no runtime
-      LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(empty), nil)
-      LibC.dup2(out_fd, 1)
-      LibC.execve(path, argv.ptrs, envp.ptrs)
-      LibC._exit(127)
-    end
-    e = Errno.value
-    LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(old), nil)
-    raise "clone3 failed: #{e}" if pid < 0
-    pid.to_i32
-  end
-
   if dir = cgroup_dir
     leaf = File.join(dir, "crystal-clone3")
     Dir.mkdir(leaf) unless Dir.exists?(leaf)
@@ -420,26 +449,6 @@ end
       j.field "spawns", n
       j.field "exit_0", ok
       j.field "zombies_afterwards", zombie_children
-    end
-
-    emit("clone3_cost_vs_crystal_heap") do |j|
-      [0, 256, 512].each do |mib|
-        big = mib > 0 ? Bytes.new(mib.to_i64 * 1024 * 1024, 0xA5_u8) : Bytes.empty
-        calls = [] of Float64
-        totals = [] of Float64
-        25.times do
-          r, w = IO.pipe(write_blocking: true)
-          t0 = Time.monotonic
-          pid = clone3_spawn(dirfd, "/bin/true", [] of String, w.fd)
-          calls << (Time.monotonic - t0).total_milliseconds
-          w.close
-          wait_within(wrap(pid), 5.seconds)
-          totals << (Time.monotonic - t0).total_milliseconds
-          r.close
-        end
-        big[0] = 1_u8 if mib > 0
-        j.field "heap_#{mib}_MiB", JSON.parse(%({"clone3_call_ms":#{median(calls)},"clone3_until_waited_ms":#{median(totals)}}))
-      end
     end
 
     LibC.close(dirfd)
