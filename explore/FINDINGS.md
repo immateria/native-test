@@ -501,7 +501,8 @@ below then runs **unprivileged** inside that subtree, and was identical on all t
   cgroup reads `populated 0`, and `rmdir` succeeds before the parent reaps.
 * **`CLONE_INTO_CGROUP`** (`clone3` with a cgroup directory fd) works unprivileged in the delegated subtree: the child
   starts in the target cgroup, so there is no window in which it can fork outside it. (Crystal's `Process.new` cannot
-  do this; the kit's `attach` after spawn has that window, as its own comment says.)
+  do this; the kit's `attach` after spawn has that window, as its own comment says — see "Spawning into containment"
+  for how often it leaks, and for the caveat that a cgroup written `cgroup.kill` kills every later `clone3` child.)
 * **Freezer**: `cgroup.freeze 1` reached `frozen 1` within 0.1–1.2 ms; frozen tasks show state `S`, gain no CPU, and
   `waitpid(WUNTRACED)` reports nothing. `SIGKILL` and a default-action `SIGTERM` still kill a frozen task; a `SIGTERM`
   handler runs only after thaw (0.1–1.2 ms after); `SIGCONT` does not thaw. `cgroup.kill` on a frozen cgroup empties
@@ -906,6 +907,121 @@ abandoned critical section). A supervisor needs a deadline after asking a child 
 `TerminateProcess` / `TerminateJobObject` (which do not run DLL detach). The exit code of a child that exited by itself
 says nothing about whether its cleanup ran.
 
+## Spawning into containment: cgroup attach race, `clone3`, `posix_spawn`, Crystal reaping, macOS descendants
+
+(`explore/linux/spawn_cgroup.c`, `explore/posix/spawn_attrs.c`, `explore/posix/crystal_own_spawn.cr`,
+`explore/macos/kqueue_track.c`; runs `41910905753`, `41912692793`, `41914457166`, all eleven Unix runners; the Linux
+numbers were identical in kind on Ubuntu 22.04 (kernel 6.8), 24.04 (7.0) and 24.04 arm64 (7.0), the macOS ones on all five
+macOS runners.) The kit spawns a Windows child into its Job before it runs; on POSIX it can only adopt a group or cgroup
+afterwards. These runs measure what that costs and what the alternatives are.
+
+### Attach after spawn leaks children under load; `clone3(CLONE_INTO_CGROUP)` and an `sh` trampoline did not (verified)
+
+The child program forks 6 children as its first action (a shell starting background jobs does the same); 150 trials per
+cell, counted by looking at each child's `/proc/<pid>/cgroup`. "Busy" = two CPU-spinning processes per CPU.
+
+| how the child gets into the cgroup | idle: trials that lost children | busy: trials that lost children (children outside / 900) |
+|---|---|---|
+| `fork`+`exec`, parent writes the pid to `cgroup.procs` the moment `fork` returns | 1, 1, 1 of 150 | 2, 3, 4 (12, 18, 24) |
+| `fork`+`exec`, parent waits for the exec to finish (CLOEXEC pipe closes — what `Process.new` does before it returns), then writes the pid | 1, 0, 2 | **67, 54, 109 of 150** (400, 324, 654) |
+| `clone3(CLONE_INTO_CGROUP)` then `exec` | 0, 0, 0 | 0, 0, 0 |
+| `sh -c 'echo $$ > cgroup.procs && exec "$@"' …` (dash) | 0, 0, 0 | 0, 0, 0 |
+| the same through `bash` | 0, 0, 0 | 0, 0, 0 |
+
+(columns are Ubuntu 22.04, 24.04, 24.04 arm64.) The one idle loss in the first row is always exactly one trial with all
+six children outside, on every runner — it looks like the cold first spawn, not randomness (inferred). After the exec
+notice the parent's write took a median 30–64 µs idle and 46–569 µs busy. So with the exec-wait that `Process.new` imposes,
+attach-after-spawn lost children in a third to two thirds of trials once the CPUs were contended, and in almost none when
+idle: a race that a test on an idle machine will not show.
+
+* While the pid is not yet attached the cgroup reads `populated 0` (100 of 100 trials) and `populated 1` after the write
+  (100 of 100): a `wait_empty`/`empty?` check in that gap says "drained" although a child exists.
+  `clone3` showed `populated 1`, `pids.current 1` and the pid in `cgroup.procs` at the moment the call returned (100 of 100).
+* The trampoline costs time to the program's first instruction: median +0.4–0.6 ms for dash, +0.9–1.5 ms for bash over
+  0.4–0.65 ms; busy medians 0.96–2.56 ms (dash) and 1.57–4.46 ms (bash), p95 up to 10.5 and 14.4 ms.
+* What the program sees through the trampoline: with dash (`/bin/sh` on Ubuntu) argv (14 awkward arguments: empty,
+  leading/trailing space, `-n`, `--`, `$HOME`, backquotes, newline, backslash, `*`, UTF-8, quotes), environment, open
+  descriptors, ignored and blocked signals, umask and cwd were **identical** to a direct exec. Through bash the only
+  difference was that the `_` variable was missing.
+* Failures through the trampoline lose the errno: a missing program, a non-executable file and a directory give exit
+  127, 126, 126 (indistinguishable from a program that exits that way) with a message on stderr; an unwritable
+  `cgroup.procs` gives exit 2 (dash) / 1 (bash). A direct `fork`+`exec` with a CLOEXEC pipe reports `ENOENT`/`EACCES`.
+
+### `clone3(CLONE_INTO_CGROUP)` details (verified, all three Linux runners)
+
+* Needs `struct clone_args` of at least 88 bytes (64 → `EINVAL`). Refusals: descriptor not open, `/dev/null`, or an
+  ordinary directory → `EBADF`; cgroup removed after the descriptor was opened → `ENOENT`; the hierarchy root →
+  `EACCES`; the delegated cgroup that has controllers in `subtree_control` → `EBUSY`. A directory opened read-only is enough.
+* With `CLONE_PIDFD` in the same call the pidfd is valid, `pidfd_send_signal` and `waitid(P_PIDFD)` work at once
+  (`CLD_KILLED`, 9), and a later `waitpid` gives `ECHILD`.
+* Into a frozen cgroup: the call returns in 0.08 ms and succeeds, the child does not run (state `S`, `frozen 1`,
+  `waitpid(WNOHANG)` 0) and runs 0.18 ms after the thaw. A `Process.new`-style spawn that waits for the exec would block
+  until someone thaws the cgroup. At `pids.max 1` the second `clone3` fails `EAGAIN` and `pids.events` counts `max 1`.
+* **A cgroup that has been written `cgroup.kill` kills every later `clone3(CLONE_INTO_CGROUP)` child at once** (SIGKILL,
+  before it ran; also when the cgroup was empty when killed; also 500 ms later; also through a fresh descriptor).
+  Not affected: a child forked and attached by writing its pid to `cgroup.procs`, a normal `fork` by a member (both
+  lived), and a cgroup removed and recreated under the same name (lived). I have not read these kernel versions' source;
+  the pattern fits a per-cgroup kill sequence number that the `CLONE_INTO_CGROUP` path does not account for, which is a
+  guess. Consequence: after `kill`, a cgroup that is used with `clone3` is single-use.
+* `fork` of the supervisor costs more as its memory grows; `posix_spawn` (glibc, `CLONE_VM|CLONE_VFORK`) does not:
+  with a parent that dirtied 0 / 256 MiB / 1 GiB, the call took 0.04–0.06 / 1.8–3.1 / 6.4–10.9 ms for `fork`+`exec` and
+  `clone3` without `CLONE_VM`, and 0.07–0.20 ms at every size for `posix_spawn`.
+
+### `posix_spawn` attributes (verified, all eight POSIX runners; two result sets: macOS ×5, Linux ×3)
+
+* `POSIX_SPAWN_SETPGROUP` (group 0): the child was **already in its own group when `posix_spawn` returned in 300 of 300
+  trials**; `fork`+`exec` followed by the parent's `setpgid(child, child)` failed `EACCES` in 300 of 300 (the finding
+  for `Process.new` again, now in C). `POSIX_SPAWN_SETSID` makes the child a session leader and group leader.
+* `SETSIGDEF` (all signals) with `SETSIGMASK` (empty) removed the inherited ignored `SIGPIPE`/`SIGHUP` and the blocked
+  `SIGUSR1`; without them all three were inherited. `addchdir_np` works. Closing descriptors: macOS
+  `POSIX_SPAWN_CLOEXEC_DEFAULT` (+ `addinherit_np` for 0–2), glibc ≥ 2.34 `addclosefrom_np(3)`; both left only 0, 1, 2.
+  The umask is inherited either way.
+* Errors come back from the call itself on both OSes (missing program `ENOENT`, directory `EACCES`, missing `chdir`
+  directory `ENOENT`, `dup2` from an unopened descriptor `EBADF`, `addopen` of a missing file `ENOENT`) with no pid
+  written and nothing to reap. One difference: `addclose` of a descriptor that is not open is `EBADF` on macOS but
+  succeeds on glibc 2.35/2.39 (the child ran and exited 0).
+* **macOS `POSIX_SPAWN_START_SUSPENDED`** (all five runners): the child exists but has run nothing — `p_stat` is `SSTOP`,
+  `waitpid(WUNTRACED)` reports "stopped" with signal 0, no output while suspended, already in its own group with
+  `SETPGROUP`. `SIGCONT` starts it (exit 0 after about 3 ms). `SIGKILL` while suspended ends it (`SIGKILL`). **`SIGTERM`
+  also ends it, without it ever running** (unlike a process stopped by `SIGSTOP`, which keeps `SIGTERM` pending).
+  This is the macOS counterpart of `CREATE_SUSPENDED`.
+
+### Crystal 1.21.1: a pid made by `posix_spawn` or `clone3` can be given to `Process` (verified, Linux and macOS, default and `-Dpreview_mt -Dexecution_context` builds)
+
+* The stdlib's SIGCHLD handler reaps every child of the process (`waitpid(-1, WNOHANG)`) and keeps the status of pids it
+  has no waiter for until `Crystal::System::Process.new(pid)` asks (`signal.cr`). `Process.new(Crystal::System::Process.new(pid))`
+  is the public (`:nodoc`) constructor the kit's Windows spawn already uses. Measured: a child wrapped before or after it
+  exited gives the right status (`exited(7)`, and `exited(9)` after the process was already gone and reaped), 100 of 100
+  concurrent spawns from four fibers were correct, and no zombies were left (checked on Linux).
+* **A shard-owned `waitpid` on such a pid steals the status**: after it, `Process#wait` never returned (1.5 s deadline);
+  a `waitpid` after the runtime reaped gives `ECHILD`. Same in the multi-threaded build. Observe exit with a pidfd
+  (`poll`) or `WNOWAIT`, never by reaping.
+* Raw `clone3` from Crystal works: `LibC.syscall(435, …)` with all signals blocked around it and an `execve` of pre-built
+  `argv`/`envp` in the child (no allocation, no runtime calls); the child saw `0::/…/crystal-clone3` in
+  `/proc/self/cgroup`, stdio plumbing through a pipe worked, 100 of 100 spawns exit 0, status kept when the child was
+  gone before wrapping.
+* Child state: a `posix_spawn` child without attributes sees what `Process.run` gives (ignored `SIGHUP` and `SIGPIPE`,
+  fds 0–2); with `SETPGROUP|SETSIGDEF|SETSIGMASK` it is in its own group with nothing ignored.
+* **Spawn cost against the size of the Crystal heap** (a fresh process per size; median call time, 25 spawns):
+  on Linux `Process.new` (fork) took 0.5–0.7 ms with an empty heap, 6.3–10.5 ms with 256 MiB and 12.2–22.3 ms with
+  512 MiB; `posix_spawn` 0.14–0.31 / 0.16–0.40 / 0.30–0.43 ms; raw `clone3` (fork semantics) 0.16–0.26 / 2.4–4.8 /
+  4.5–9.5 ms. On macOS the heap barely mattered: `Process.new` 0.6–1.8 ms (7.6–8.8 on macos-26-intel) and
+  ≤ 5.0 ms at 512 MiB, `posix_spawn` 0.2–0.7 ms (2.0 on macos-26-intel).
+* The macOS START_SUSPENDED path works through `Process`: wrapped while suspended, `SIGCONT` → output and `exited(0)`;
+  `SIGKILL` while suspended → `Process#wait` returned `signaled(KILL)`.
+
+### macOS has no tracking for descendants; an environment marker finds the ones that reparent (verified, five runners)
+
+* `kqueue` `EVFILT_PROC` with `NOTE_TRACK` is refused at registration with `ENOTSUP`. `NOTE_FORK` works but is one
+  coalesced event for 30 forks and does not say which children.
+* `proc_listchildpids` from the supervisor or from the child, recursively, found all 30 children (and 31 in a two-level
+  tree) while their parents were alive.
+* A child that double-forks and calls `setsid` leaves a grandchild with `ppid` 1: neither enumeration from the
+  supervisor nor from the former parent found it (0 found). Reading every same-user process's original environment with
+  `sysctl(KERN_PROCARGS2)` and looking for a variable the supervisor put into the child's environment found it on all
+  five runners (2 of about 220–340 readable processes carried the marker — the forker and the grandchild) in 3–17 ms
+  (one 94.5 ms outlier). Not tested: a program that execs and replaces its environment.
+
 ## Still open
 
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time
@@ -914,5 +1030,10 @@ says nothing about whether its cleanup ran.
 * which code returns `ERROR_INVALID_PARAMETER` for a write when `MaxBandwidth` is not a multiple of 4 KiB;
 * why a hung service STOP handler blocks `ControlService` for 240 s on these runners, and what ends the service process
   then (exit code 0);
+* why a child cloned with `CLONE_INTO_CGROUP` into a cgroup that has had `cgroup.kill` written dies at once (kernel
+  source for 6.8 and 7.0 not read);
+* macOS descendants: whether the environment marker survives a program that execs and clears or rewrites its environment,
+  and whether `START_SUSPENDED` plus a marker is enough in practice; musl/Alpine `posix_spawn` and Docker/systemd cgroup
+  delegation were not tested (everything above is the hosted runner images);
 * not measured: a shared-process (`svchost`-style) service, preshutdown and system shutdown ordering; the macOS
   `posix_spawnattr_setjetsam_ext` limit for grandchildren and after `exec`; GitHub Actions' own cancellation timing.
