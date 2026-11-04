@@ -12,6 +12,50 @@
       def initialize(@pgid : Int64)
         raise ArgumentError.new("pgid must be positive") unless @pgid > 0
         raise ArgumentError.new("pgid exceeds native pid range") if @pgid > Int32::MAX
+        # kill(-1, sig) is not "group 1": it signals every process the caller may signal. Found when the specs ran as
+        # PID 1 of a container, whose process group is 1.
+        if @pgid == 1
+          raise ArgumentError.new("process group 1 cannot be addressed: kill(-1, sig) would signal every process")
+        end
+      end
+
+      # Spawns a direct executable/argv child into this process group, which must still have a live member in the
+      # caller's session. The child starts with default signal dispositions and an empty signal mask, inherits stdio
+      # 0-2 and nothing else, and its executable is resolved in the caller before `chdir` takes effect. A process
+      # group is not a kill-on-close container: a descendant can still leave it (setsid/setpgid).
+      def spawn(command : String, args : Enumerable(String) = [] of String, *,
+                env : ::Process::Env = nil, clear_env : Bool = false,
+                chdir : Path | String? = nil) : ProcessSupervision::Child
+        {% if flag?(:linux) %}
+          run_on_execution_context("process-supervision-posix-spawn") do
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            group = @pgid.to_i32
+            pending = @mutex.synchronize do
+              check_open_locked
+              ProcessSupervision::Linux::RawSpawn.create(prepared, pgroup: group)
+            end
+            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, self, group)
+          end
+        {% else %}
+          raise ProcessSupervision::Error::Unsupported.new("spawning is not implemented for this target yet")
+        {% end %}
+      end
+
+      # Spawns a child that leads a new process group and returns it; `child.group` is that group (pgid == child pid).
+      # Closing or shutting down the group is the caller's job, as for every Child.
+      def self.spawn_leader(command : String, args : Enumerable(String) = [] of String, *,
+                            env : ::Process::Env = nil, clear_env : Bool = false,
+                            chdir : Path | String? = nil) : ProcessSupervision::Child
+        {% if flag?(:linux) %}
+          run_on_execution_context("process-supervision-posix-spawn-leader") do
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+            pending = ProcessSupervision::Linux::RawSpawn.create(prepared, pgroup: 0)
+            # the group object needs the pid, so build it from the pending child
+            ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, new(pending.pid.to_i64), nil)
+          end
+        {% else %}
+          raise ProcessSupervision::Error::Unsupported.new("spawning is not implemented for this target yet")
+        {% end %}
       end
 
       def mechanism : ProcessSupervision::Mechanism

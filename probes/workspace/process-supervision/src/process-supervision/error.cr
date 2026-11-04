@@ -9,6 +9,11 @@ module ProcessSupervision
     class Busy < Error
     end
 
+    # The group was killed and cannot take new children (a cgroup written cgroup.kill kills every process later cloned
+    # into it, measured on kernels 6.8, 7.0 and 6.18). Create a new group.
+    class Killed < Error
+    end
+
     class Unavailable < Error
     end
 

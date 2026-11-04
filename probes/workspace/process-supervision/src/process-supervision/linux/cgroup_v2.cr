@@ -14,9 +14,45 @@
 
       @mutex = Thread::Mutex.new
       @closed = false
+      @killed = false
 
+      # Whether a cgroup-v2 hierarchy is mounted. This says nothing about whether this process may create or enter a
+      # cgroup there: a default Docker container mounts it read-only. Use `usable?` or `delegated_parent` for that.
       def self.available? : Bool
         !mount_entries.empty?
+      end
+
+      # Whether `parent` accepts a new child cgroup right now (creates and removes a probe). Detection by trying is the
+      # only reliable test: measured natively, the same mount was writable for a systemd `Delegate=yes` unit and a user
+      # manager's units, read-only in a default Docker container and `EACCES` for an ordinary service or user.
+      def self.usable?(parent : Path | String) : Bool
+        probe = create(parent, ".process-supervision-probe-#{::Process.pid}-#{Random.new.hex(4)}")
+        probe.close
+        true
+      rescue ProcessSupervision::Error | ArgumentError | File::Error
+        false
+      end
+
+      # The first directory, starting with this process's own cgroup and going up to (not including) the machine's
+      # hierarchy root, in which a child cgroup can be created: where a service manager delegated one to this process
+      # (systemd Delegate=yes, a user manager's units, a privileged container's cgroup namespace root). nil when nothing
+      # is delegated; the caller then falls back to a process group.
+      def self.delegated_parent : Path?
+        current = current_path
+        mount = mountpoint
+        return unless current && mount
+        initial = initial_cgroup_namespace?
+        path = current
+        loop do
+          at_mount = path == mount
+          break if at_mount && initial
+          return path if usable?(path)
+          break if at_mount
+          parent = path.parent
+          break if parent == path || !within_mount?(parent.to_s, mount.to_s)
+          path = parent
+        end
+        nil
       end
 
       # Finds the cgroup-v2 mount that exposes the current process. If the
@@ -51,7 +87,10 @@
           raise ArgumentError.new("cgroup path #{resolved} is outside every visible cgroup-v2 mount")
         end
         resolved_mount = File.realpath(entry[0])
-        if resolved == resolved_mount && entry[1] == "/"
+        # The machine's hierarchy root is never a supervision target. Inside a private cgroup namespace (a container) the
+        # mount root is only the container's own cgroup, which is an ordinary cgroup on the host; killing it kills the
+        # caller too, as for any cgroup the caller is in.
+        if resolved == resolved_mount && entry[1] == "/" && initial_cgroup_namespace?
           raise ArgumentError.new("refusing to supervise the cgroup-v2 hierarchy root")
         end
 
@@ -89,6 +128,12 @@
         raise ProcessSupervision::Error::Unavailable.new("cgroup parent is not delegated/writable: #{ex.message}")
       rescue ex : File::NotFoundError
         raise ProcessSupervision::Error::Unavailable.new("cgroup parent is unavailable: #{ex.message}")
+      rescue ex : File::Error
+        # a read-only cgroup mount (a default Docker container) is EROFS, which the stdlib maps to a plain File::Error
+        if ex.os_error == Errno::EROFS || ex.os_error == Errno::EPERM
+          raise ProcessSupervision::Error::Unavailable.new("cgroup parent is read-only or not permitted: #{ex.message}")
+        end
+        raise ex
       end
 
       private def initialize(@path : Path, @owned : Bool)
@@ -125,6 +170,29 @@
         raise ProcessSupervision::Error::Native.new("write(cgroup.procs)", ex.message || "cgroup migration failed")
       end
 
+      # Spawns a direct executable/argv child that is in this cgroup before it executes a single instruction, so none of
+      # its descendants can be created outside it (clone3 with CLONE_INTO_CGROUP; where clone3 is refused, a fork whose
+      # child enters the cgroup itself before exec). The child starts with default signal dispositions and an empty
+      # signal mask, inherits stdio 0-2 and nothing else, and its executable is resolved in the caller before `chdir`.
+      #
+      # A cgroup that has been killed accepts no further children: every later clone3 into it is killed at once
+      # (measured on kernels 6.8, 7.0 and 6.18), so `spawn` raises `Error::Killed`; create a new cgroup instead.
+      def spawn(command : String, args : Enumerable(String) = [] of String, *,
+                env : ::Process::Env = nil, clear_env : Bool = false,
+                chdir : Path | String? = nil) : ProcessSupervision::Child
+        run_on_execution_context("process-supervision-cgroup-spawn") do
+          prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
+          pending = @mutex.synchronize do
+            check_open_locked
+            if @killed
+              raise ProcessSupervision::Error::Killed.new("cgroup #{@path} was killed and cannot take new children")
+            end
+            ProcessSupervision::Linux::RawSpawn.create(prepared, cgroup: @path)
+          end
+          ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, self)
+        end
+      end
+
       def empty? : Bool
         @mutex.synchronize do
           check_open_locked
@@ -148,6 +216,7 @@
         @mutex.synchronize do
           check_open_locked
           File.write(@path / "cgroup.kill", "1\n", mode: "w")
+          @killed = true
         end
       rescue ex : File::AccessDeniedError
         raise ProcessSupervision::Error::Unavailable.new("cgroup.kill is not writable: #{ex.message}")
@@ -221,6 +290,14 @@
         nil
       rescue File::Error
         nil
+      end
+
+      # The initial cgroup namespace has a fixed inode (PROC_CGROUP_INIT_INO). Unreadable means unknown: assume initial,
+      # which is the conservative answer for "is this mount root the machine's root".
+      private def self.initial_cgroup_namespace? : Bool
+        File.readlink("/proc/self/ns/cgroup") == "cgroup:[4026531835]"
+      rescue File::Error
+        true
       end
 
       private def self.active_mount_entry : Tuple(Path, String)?

@@ -7,10 +7,12 @@ require "./process-supervision/group"
 require "./process-supervision/child"
 
 {% if flag?(:unix) %}
+  require "./process-supervision/posix/spawn"
   require "./process-supervision/posix/process_group"
 {% end %}
 
 {% if flag?(:linux) %}
+  require "./process-supervision/linux/raw_spawn"
   require "./process-supervision/linux/cgroup_v2"
 {% end %}
 

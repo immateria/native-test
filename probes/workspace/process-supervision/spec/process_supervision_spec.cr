@@ -1,4 +1,13 @@
 require "./spec_helper"
+require "file_utils"
+
+# Several examples use the spec process's own group as a stand-in group. Inside a container the spec binary is
+# commonly PID 1 and leads process group 1, which ProcessGroup refuses to address (kill(-1, sig) is a broadcast).
+private def spec_pgid : Int32
+  pgid = Process.pgid
+  pending!("this process leads process group 1 (PID 1 of a container)") if pgid == 1
+  pgid
+end
 
 private class ShutdownFailureGroup < ProcessSupervision::Group
   getter close_calls = 0
@@ -71,7 +80,7 @@ end
 {% if flag?(:unix) %}
   describe ProcessSupervision::POSIX::ProcessGroup do
     it "observes an existing process group without claiming kill-on-close" do
-      group = ProcessSupervision.process_group(Process.pgid)
+      group = ProcessSupervision.process_group(spec_pgid)
       group.mechanism.should eq(ProcessSupervision::Mechanism::ProcessGroup)
       group.kill_on_close?.should be_false
       group.soft_termination?.should be_true
@@ -119,7 +128,7 @@ end
 
     it "makes a weaker process-group fallback observable" do
       missing = Path["/definitely-missing-process-supervision-cgroup"]
-      group = ProcessSupervision.cgroup_v2(missing, fallback_pgid: Process.pgid)
+      group = ProcessSupervision.cgroup_v2(missing, fallback_pgid: spec_pgid)
       group.mechanism.should eq(ProcessSupervision::Mechanism::ProcessGroup)
       group.kill_on_close?.should be_false
       group.close
@@ -137,7 +146,7 @@ end
         error: Process::Redirect::Close
       )
       handle = ProcessHandle.open(process.pid)
-      group = ProcessSupervision.process_group(Process.pgid)
+      group = ProcessSupervision.process_group(spec_pgid)
       child = ProcessSupervision::Child.new(process, handle, group)
 
       status = child.wait(2.seconds)
@@ -186,7 +195,7 @@ end
         error: Process::Redirect::Close
       )
       handle = ProcessHandle.open(process.pid)
-      group = ProcessSupervision.process_group(Process.pgid)
+      group = ProcessSupervision.process_group(spec_pgid)
       child = ProcessSupervision::Child.new(process, handle, group)
 
       count = 12
@@ -227,7 +236,7 @@ end
         error: Process::Redirect::Close
       )
       handle = ProcessHandle.open(process.pid)
-      group = ProcessSupervision.process_group(Process.pgid)
+      group = ProcessSupervision.process_group(spec_pgid)
       child = ProcessSupervision::Child.new(process, handle, group)
       handle.close
 
@@ -266,7 +275,7 @@ end
         error: Process::Redirect::Close
       )
       handle = ProcessHandle.open(process.pid)
-      group = ProcessSupervision.process_group(Process.pgid)
+      group = ProcessSupervision.process_group(spec_pgid)
       child = ProcessSupervision::Child.new(process, handle, group)
       result = Channel(Int64 | Exception | Nil).new(1)
 
@@ -295,7 +304,7 @@ end
     end
 
     it "runs process-group wait_empty from a raw Thread and rejects effects after close" do
-      group = ProcessSupervision.process_group(Process.pgid)
+      group = ProcessSupervision.process_group(spec_pgid)
       empty = Atomic(Int32).new(-1)
       waiter = Thread.new do
         begin
@@ -378,3 +387,277 @@ describe "Windows Job event-reader thread cleanup source contract" do
     events.should_not contain("@thread.join")
   end
 end
+
+{% if flag?(:unix) %}
+  private def with_temp_dir(&)
+    dir = File.join(Dir.tempdir, "ps-spec-#{Process.pid}-#{Random.new.hex(4)}")
+    Dir.mkdir_p(dir)
+    begin
+      yield dir
+    ensure
+      FileUtils.rm_rf(dir)
+    end
+  end
+
+  private def leader(command : String, args = [] of String, **options) : ProcessSupervision::Child
+    ProcessSupervision::POSIX::ProcessGroup.spawn_leader(command, args, **options)
+  end
+
+  # A child's group, wait result and local resources, released in one place.
+  private def finish(child : ProcessSupervision::Child, *, timeout : Time::Span = 10.seconds) : Process::Status
+    child.wait(timeout).should_not be_nil
+    status = child.wait.not_nil!
+    child.close
+    status
+  end
+
+  describe "ProcessSupervision::POSIX::ProcessGroup spawn" do
+    it "refuses process group 1, which kill(-1, sig) would turn into a broadcast" do
+      expect_raises(ArgumentError, /group 1/) { ProcessSupervision.process_group(1) }
+    end
+
+    it "spawns a group leader and reports exit status, identity and its group" do
+      child = leader("/bin/sh", ["-c", "exit 7"])
+      group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      group.pgid.should eq(child.pid)
+      child.identity.pid.should eq(child.pid)
+      status = finish(child)
+      status.exit_code.should eq(7)
+      child.wait.should eq(status)
+      group.empty?.should be_true
+      group.close
+    end
+
+    it "has the leader in its own group by the time spawn returns, and shuts the group down" do
+      child = leader("/bin/sleep", ["30"])
+      group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      begin
+        LibC.getpgid(child.pid.to_i32).should eq(child.pid.to_i32)
+        result = group.shutdown(grace: 5.seconds, kill_after: 5.seconds)
+        result.drained?.should be_true
+        child.wait(10.seconds).not_nil!.exit_signal?.should eq(Signal::TERM)
+      ensure
+        child.close
+      end
+    end
+
+    it "joins a second child to the group and ends both with one signal" do
+      first = leader("/bin/sleep", ["30"])
+      group = first.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      second = group.spawn("/bin/sleep", ["30"])
+      begin
+        LibC.getpgid(second.pid.to_i32).should eq(group.pgid.to_i32)
+        group.empty?.should be_false
+        group.shutdown(grace: 5.seconds, kill_after: 5.seconds).drained?.should be_true
+        first.wait(10.seconds).should_not be_nil
+        second.wait(10.seconds).should_not be_nil
+      ensure
+        first.close
+        second.close
+      end
+    end
+
+    it "passes arguments, environment and working directory to the child exactly" do
+      with_temp_dir do |dir|
+        output = File.join(dir, "out")
+        script = %q(printf '%s|%s|%s|%s' "$1" "$2" "$FOO" "$(pwd)" > "$3")
+        finish(leader("/bin/sh", ["-c", script, "sh", "a b", "", output], env: {"FOO" => "bar baz"}, chdir: dir)).success?.should be_true
+        File.read(output).should eq("a b||bar baz|#{File.realpath(dir)}")
+      end
+    end
+
+    it "can remove a variable and can start from an empty environment" do
+      with_temp_dir do |dir|
+        removed = File.join(dir, "removed")
+        cleared = File.join(dir, "cleared")
+        ENV["PS_SPEC_REMOVE"] = "present"
+        begin
+          finish(leader("/bin/sh", ["-c", %q(/usr/bin/env > "$1"), "sh", removed], env: {"PS_SPEC_REMOVE" => nil})).success?.should be_true
+          finish(leader("/bin/sh", ["-c", %q(/usr/bin/env > "$1"), "sh", cleared], env: {"ONLY_THIS" => "1"}, clear_env: true)).success?.should be_true
+        ensure
+          ENV.delete("PS_SPEC_REMOVE")
+        end
+        File.read(removed).lines.none?(&.starts_with?("PS_SPEC_REMOVE=")).should be_true
+        File.read(removed).lines.any?(&.starts_with?("PATH=")).should be_true
+        cleared_lines = File.read(cleared).lines
+        cleared_lines.should contain("ONLY_THIS=1")
+        cleared_lines.none?(&.starts_with?("PATH=")).should be_true
+      end
+    end
+
+    {% if flag?(:linux) %}
+      it "starts the child with default signal dispositions although the runtime ignores SIGPIPE" do
+        sigpipe_bit = 1_u64 << (Signal::PIPE.value - 1)
+        own = File.read("/proc/self/status").lines.find!(&.starts_with?("SigIgn:")).split(':')[1].strip.to_u64(16)
+        (own & sigpipe_bit).should_not eq(0) # the premise: Process.new would hand this on
+        with_temp_dir do |dir|
+          output = File.join(dir, "sig")
+          finish(leader("/bin/sh", ["-c", %q(grep '^SigIgn:' /proc/self/status > "$1"), "sh", output])).success?.should be_true
+          child_mask = File.read(output).split(':')[1].strip.to_u64(16)
+          (child_mask & sigpipe_bit).should eq(0)
+        end
+      end
+
+      it "leaves no descriptors and no zombies behind after many instantly exiting children" do
+        before = Dir.children("/proc/self/fd").size
+        50.times do
+          child = leader("/bin/true")
+          finish(child).success?.should be_true
+          child.group.close
+        end
+        Dir.children("/proc/self/fd").size.should eq(before)
+      end
+    {% end %}
+
+    it "raises the stdlib's exception classes for a bad command, a non-executable file and a bad directory" do
+      expect_raises(File::NotFoundError) { leader("definitely-not-a-command-ps-spec") }
+      expect_raises(File::NotFoundError) { leader("/bin/sh", ["-c", "true"], chdir: "/nonexistent-directory-ps-spec") }
+      with_temp_dir do |dir|
+        plain = File.join(dir, "plain")
+        File.write(plain, "not a program")
+        expect_raises(File::AccessDeniedError) { leader(plain) }
+      end
+    end
+
+    it "validates its input before creating anything" do
+      expect_raises(ArgumentError) { leader("") }
+      expect_raises(ArgumentError) { leader("/bin/sh\0x") }
+      expect_raises(ArgumentError) { leader("/bin/true", ["a\0b"]) }
+      expect_raises(ArgumentError) { leader("/bin/true", env: {"A=B" => "x"}) }
+      expect_raises(ArgumentError) { leader("/bin/true", env: {"A" => "x\0y"}) }
+    end
+
+    it "refuses to join a group that no longer exists" do
+      first = leader("/bin/true")
+      group = first.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      finish(first)
+      expect_raises(ProcessSupervision::Error::Unavailable) { group.spawn("/bin/true") }
+    end
+
+    it "rejects spawn after the group controller is closed" do
+      first = leader("/bin/true")
+      group = first.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      finish(first)
+      group.close
+      expect_raises(ProcessSupervision::Error::Closed) { group.spawn("/bin/true") }
+    end
+  end
+{% end %}
+
+{% if flag?(:linux) %}
+  private def delegated_parent_or_pending : Path
+    parent = ProcessSupervision::Linux::CgroupV2.delegated_parent
+    pending!("no cgroup is delegated to this process in this environment") unless parent
+    parent.not_nil!
+  end
+
+  private def new_cgroup : ProcessSupervision::Linux::CgroupV2
+    ProcessSupervision::Linux::CgroupV2.create(delegated_parent_or_pending, "ps-spec-#{Process.pid}-#{Random.new.hex(4)}")
+  end
+
+  private def environment_holders(token : String) : Array(Int32)
+    holders = [] of Int32
+    Dir.each_child("/proc") do |entry|
+      next unless entry[0]?.try(&.ascii_number?)
+      begin
+        holders << entry.to_i if File.read("/proc/#{entry}/environ").includes?("PS_SPEC_TOKEN=#{token}")
+      rescue File::Error
+      end
+    end
+    holders
+  end
+
+  describe "ProcessSupervision::Linux::CgroupV2 spawn" do
+    it "puts the child in the cgroup before it runs and sees its descendants" do
+      group = new_cgroup
+      child = group.spawn("/bin/sh", ["-c", "sleep 30 & sleep 30 & wait"])
+      begin
+        File.read("/proc/#{child.pid}/cgroup").should contain(File.basename(group.path.to_s))
+        deadline = Time.instant + 5.seconds
+        until File.read(group.path / "cgroup.procs").lines.size >= 3 || Time.instant > deadline
+          sleep 10.milliseconds
+        end
+        File.read(group.path / "cgroup.procs").lines.size.should eq(3)
+        group.empty?.should be_false
+        group.kill
+        group.wait_empty(10.seconds).should be_true
+        child.wait(10.seconds).not_nil!.exit_signal?.should eq(Signal::KILL)
+      ensure
+        child.close
+        group.kill rescue nil
+        group.wait_empty(5.seconds)
+        group.close
+      end
+    end
+
+    it "refuses new children once the cgroup was killed" do
+      group = new_cgroup
+      begin
+        group.kill
+        expect_raises(ProcessSupervision::Error::Killed) { group.spawn("/bin/true") }
+      ensure
+        group.close
+      end
+    end
+
+    it "uses the fork path, entering the cgroup before exec, when clone3 is refused" do
+      group = new_cgroup
+      ProcessSupervision::Linux::RawSpawn.clone3_disabled = true
+      begin
+        with_temp_dir do |dir|
+          output = File.join(dir, "cgroup")
+          child = group.spawn("/bin/sh", ["-c", %q(cat /proc/self/cgroup > "$1"), "sh", output])
+          finish(child).success?.should be_true
+          File.read(output).should contain(File.basename(group.path.to_s))
+        end
+      ensure
+        ProcessSupervision::Linux::RawSpawn.clone3_disabled = false
+        group.close
+      end
+    end
+
+    it "loses no descendant: nothing survives a kill after a burst of spawns" do
+      group = new_cgroup
+      token = "#{Process.pid}-#{Random.new.hex(6)}"
+      children = [] of ProcessSupervision::Child
+      begin
+        30.times do
+          children << group.spawn("/bin/sh", ["-c", "sleep 60 & sleep 60 & sleep 60 & wait"], env: {"PS_SPEC_TOKEN" => token})
+        end
+        sleep 300.milliseconds
+        group.kill
+        group.wait_empty(10.seconds).should be_true
+        children.each { |child| child.wait(10.seconds).should_not be_nil }
+        sleep 200.milliseconds
+        survivors = environment_holders(token)
+        survivors.each { |pid| LibC.kill(pid, Signal::KILL.value) }
+        survivors.should be_empty # a survivor was created outside the cgroup
+      ensure
+        children.each(&.close)
+        group.close
+      end
+    end
+
+    it "classifies an unusable parent as Unavailable instead of leaking a raw error" do
+      expect_raises(ProcessSupervision::Error::Unavailable) do
+        ProcessSupervision::Linux::CgroupV2.create("/nonexistent-cgroup-parent-ps-spec", "x")
+      end
+      mount = ProcessSupervision::Linux::CgroupV2.mountpoint
+      pending!("no cgroup-v2 mount") unless mount
+      pending!("a cgroup can be created in this environment") if ProcessSupervision::Linux::CgroupV2.delegated_parent
+      # EACCES for an ordinary user, EROFS for a default container: both Unavailable, so a fallback_pgid is honoured
+      expect_raises(ProcessSupervision::Error::Unavailable) do
+        ProcessSupervision::Linux::CgroupV2.create(mount.not_nil!, "ps-spec-unwritable")
+      end
+    end
+
+    it "reports delegated_parent consistently with usable?" do
+      parent = ProcessSupervision::Linux::CgroupV2.delegated_parent
+      if parent
+        ProcessSupervision::Linux::CgroupV2.usable?(parent).should be_true
+      else
+        ProcessSupervision::Linux::CgroupV2.usable?("/nonexistent-cgroup-parent-ps-spec").should be_false
+      end
+    end
+  end
+{% end %}

@@ -47,6 +47,28 @@
       raise ProcessHandle::Error::NoSuchProcess.new(pid)
     end
 
+    # Adopts a direct child that the caller has just created. Unlike `open`, a child that has already exited is
+    # accepted: a pidfd names its process until the process is reaped, zombie included, so a command that finishes at
+    # once can still be supervised (`alive?` is false and `wait` returns immediately). `pidfd` is taken over when given
+    # (clone3 with CLONE_PIDFD returns one atomically with the creation); otherwise one is opened here, which can only
+    # fail if the child was already reaped.
+    def self.adopt_child(pid : Int64, pidfd : Int32? = nil) : self
+      raise ArgumentError.new("pid must be positive") unless pid > 0
+
+      descriptor = pidfd ? IO::FileDescriptor.new(pidfd) : Native.open_pidfd(pid)
+      begin
+        identity = begin
+          Native.lookup_identity(pid)
+        rescue ProcessHandle::Error::AccessDenied
+          nil
+        end
+        new(identity || ProcessHandle::Identity.new(pid, nil), descriptor)
+      rescue ex
+        descriptor.close rescue nil
+        raise ex
+      end
+    end
+
     private def initialize(identity : ProcessHandle::Identity, @pidfd : IO::FileDescriptor)
       super(identity)
     end

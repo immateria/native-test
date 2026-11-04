@@ -1,6 +1,7 @@
 module ProcessSupervision
   abstract class Group
     include ExecutionBridge
+    extend ExecutionBridge
 
     struct ShutdownResult
       getter terminate_requested : Bool
