@@ -64,6 +64,12 @@ child = ProcessSupervision.spawn("worker", ["--serve"], env: {"MODE" => "x"}, ch
 child.group.shutdown(grace: 2.seconds)   # ends the whole tree and releases the group
 child.close
 
+# Talking to a child
+child = ProcessSupervision.spawn("sort", input: Process::Redirect::Pipe, output: Process::Redirect::Pipe)
+child.input.puts "b\na"
+child.input.close
+child.output.gets_to_end                 # => "a\nb\n"
+
 # Explicitly
 cg = ProcessSupervision::Linux::CgroupV2.create(parent, "job-1")
 child = cg.spawn("worker")               # in the cgroup before it runs one instruction
@@ -92,9 +98,14 @@ Contract, all of it measured natively (explore/FINDINGS.md, "Spawning into conta
 - Detection is by trying: `CgroupV2.available?` only says a hierarchy is mounted (a default container mounts it read-only).
   `usable?(parent)` and `delegated_parent` create and remove a probe cgroup. A refused create (`EACCES`, `EROFS`) is
   `Error::Unavailable`, so `ProcessSupervision.cgroup_v2(path, fallback_pgid:)` falls back.
-- Not yet: redirecting stdio, descendant tracking on macOS (kqueue `NOTE_TRACK` is refused with `ENOTSUP`; an environment
-  marker scan finds reparented descendants), and `posix_spawn` on Linux for supervisors with very large heaps (fork copies
-  the page tables: 12-22 ms at a 512 MiB Crystal heap).
+- **Standard streams** (`input:`, `output:`, `error:`), on Linux and macOS: `Process::Redirect::Inherit` (the default),
+  `Close` (the null device), `Pipe` (read or write it through `child.input` / `child.output` / `child.error`, closed by
+  `child.close`) or an `IO::FileDescriptor` such as a `File`. Arbitrary `IO` objects (`IO::Memory`) are rejected: pipe and
+  copy. The parent's pipe ends are non-blocking (fiber-friendly), the child's are blocking, and the child's ends are closed
+  in the parent as soon as the process exists, so EOF arrives when the child exits. Windows Jobs still inherit only.
+- Not yet: stream redirection for Windows Jobs, descendant tracking on macOS (kqueue `NOTE_TRACK` is refused with `ENOTSUP`;
+  an environment marker scan finds reparented descendants), and `posix_spawn` on Linux for supervisors with very large heaps
+  (fork copies the page tables: 12-22 ms at a 512 MiB Crystal heap).
 
 ## PTY-derived lifecycle semantics
 

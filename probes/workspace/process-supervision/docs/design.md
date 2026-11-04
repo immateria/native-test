@@ -132,4 +132,5 @@ semantics remain with `pty`.
    marker scan works, `START_SUSPENDED` works); a macOS descendant tracker is not implemented.
 5. Capability reporting is done by trying (`CgroupV2.usable?`, `delegated_parent`, `ProcessSupervision.strongest_mechanism`);
    adopting an already-running process into a group is still open.
-6. Stdio redirection for supervised children; `posix_spawn` as the Linux engine for process groups.
+6. Stdio redirection is done for Linux and macOS (Inherit/Close/Pipe/FileDescriptor); Windows Jobs and arbitrary `IO` targets
+   are open, as is `posix_spawn` as the Linux engine for process groups.
