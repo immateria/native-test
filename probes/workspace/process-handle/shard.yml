@@ -1,0 +1,7 @@
+name: process-handle
+version: 0.7.0
+
+crystal: ">= 1.21.0, < 2.0"
+license: MIT
+
+description: Stable native process identity, waiting, and control primitives for Crystal

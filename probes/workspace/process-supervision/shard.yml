@@ -1,0 +1,11 @@
+name: process-supervision
+version: 0.7.0
+
+crystal: ">= 1.21.0, < 2.0"
+license: MIT
+
+description: Native process-group and process-tree supervision primitives for Crystal
+
+dependencies:
+  process-handle:
+    path: ../process-handle

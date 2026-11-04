@@ -1,0 +1,297 @@
+{% if flag?(:linux) %}
+  module ProcessSupervision::Linux
+    # Controller for one non-root cgroup-v2 subtree.
+    #
+    # This is stronger than a POSIX process group: descendants inherit cgroup
+    # membership, `cgroup.events` reports recursive population, and
+    # `cgroup.kill` atomically kills the subtree while accounting for
+    # concurrent forks/migrations. Creating or opening a cgroup requires an
+    # already-mounted v2 hierarchy; creating one also requires a delegated or
+    # otherwise writable parent.
+    class CgroupV2 < ProcessSupervision::Group
+      getter path : Path
+      getter owned : Bool
+
+      @mutex = Thread::Mutex.new
+      @closed = false
+
+      def self.available? : Bool
+        !mount_entries.empty?
+      end
+
+      # Finds the cgroup-v2 mount that exposes the current process. If the
+      # process path cannot be mapped, returns the first visible v2 mount.
+      def self.mountpoint : Path?
+        active_mount_entry.try(&.[0]) || mount_entries.first?.try(&.[0])
+      end
+
+      # Returns the current process's directory in the visible cgroup-v2 mount.
+      # mountinfo may expose only a subtree of the hierarchy, so account for the
+      # mount's cgroup root instead of blindly appending /proc/self/cgroup.
+      def self.current_path : Path?
+        cgroup_path = current_cgroup_path
+        return unless cgroup_path
+        entry = best_mount_entry(cgroup_path)
+        return unless entry
+        mount, hierarchy_root = entry
+        relative = relative_to_mount_root(cgroup_path, hierarchy_root)
+        return unless relative
+        relative.empty? ? mount : mount / relative
+      end
+
+      # Opens an existing cgroup. Root cgroups are rejected deliberately: a
+      # supervision object must never make the hierarchy root a kill target.
+      def self.open(path : Path | String, *, owned : Bool = false) : self
+        mount = mountpoint
+        raise ProcessSupervision::Error::Unavailable.new("cgroup v2 is not mounted") unless mount
+
+        resolved = File.realpath(path)
+        entry = mount_entry_for(resolved)
+        unless entry
+          raise ArgumentError.new("cgroup path #{resolved} is outside every visible cgroup-v2 mount")
+        end
+        resolved_mount = File.realpath(entry[0])
+        if resolved == resolved_mount && entry[1] == "/"
+          raise ArgumentError.new("refusing to supervise the cgroup-v2 hierarchy root")
+        end
+
+        validate_interface!(resolved)
+        new(Path[resolved], owned)
+      rescue ex : File::NotFoundError
+        raise ProcessSupervision::Error::Unavailable.new("cgroup v2 path is unavailable: #{ex.message}")
+      rescue ex : File::AccessDeniedError
+        raise ProcessSupervision::Error::Unavailable.new("cgroup v2 path is inaccessible: #{ex.message}")
+      end
+
+      # Creates a single child cgroup below an explicitly supplied parent. The
+      # caller is responsible for choosing a parent delegated to it by the host
+      # or service manager. This method never changes subtree controller policy.
+      def self.create(parent : Path | String, name : String) : self
+        validate_name!(name)
+        mount = mountpoint
+        raise ProcessSupervision::Error::Unavailable.new("cgroup v2 is not mounted") unless mount
+
+        resolved_parent = File.realpath(parent)
+        unless mount_entry_for(resolved_parent)
+          raise ArgumentError.new("cgroup parent #{resolved_parent} is outside every visible cgroup-v2 mount")
+        end
+
+        child = Path[resolved_parent] / name
+        Dir.mkdir(child)
+        begin
+          validate_interface!(child.to_s)
+          new(child, true)
+        rescue ex
+          Dir.delete(child) rescue nil
+          raise ex
+        end
+      rescue ex : File::AccessDeniedError
+        raise ProcessSupervision::Error::Unavailable.new("cgroup parent is not delegated/writable: #{ex.message}")
+      rescue ex : File::NotFoundError
+        raise ProcessSupervision::Error::Unavailable.new("cgroup parent is unavailable: #{ex.message}")
+      end
+
+      private def initialize(@path : Path, @owned : Bool)
+      end
+
+      def mechanism : ProcessSupervision::Mechanism
+        ProcessSupervision::Mechanism::CgroupV2
+      end
+
+      def kill_on_close? : Bool
+        false
+      end
+
+      # cgroup v2 has a strong recursive SIGKILL primitive but no equivalent
+      # recursive cooperative-termination primitive.
+      def soft_termination? : Bool
+        false
+      end
+
+      # Numeric cgroup migration is deliberately explicit. `cgroup.procs` names
+      # a process by PID, not a pidfd; callers needing race-free initial
+      # containment should use a spawn mechanism that enters the cgroup before
+      # the target is allowed to execute rather than calling this after the fact.
+      def attach(pid : Int) : Nil
+        value = pid.to_i64
+        raise ArgumentError.new("pid must be positive") unless value > 0
+        @mutex.synchronize do
+          check_open_locked
+          File.write(@path / "cgroup.procs", "#{value}\n", mode: "w")
+        end
+      rescue ex : File::AccessDeniedError
+        raise ProcessSupervision::Error::Unavailable.new("cgroup.procs is not delegated/writable: #{ex.message}")
+      rescue ex : File::Error
+        raise ProcessSupervision::Error::Native.new("write(cgroup.procs)", ex.message || "cgroup migration failed")
+      end
+
+      def empty? : Bool
+        @mutex.synchronize do
+          check_open_locked
+          !read_populated(@path / "cgroup.events")
+        end
+      end
+
+      def wait_empty(timeout : Time::Span? = nil) : Bool
+        run_on_execution_context("process-supervision-cgroup-wait-empty") do
+          wait_empty_on_execution_context(timeout)
+        end
+      end
+
+      def terminate : Nil
+        raise ProcessSupervision::Error::Unsupported.new(
+          "cgroup v2 has no atomic cooperative tree-termination primitive"
+        )
+      end
+
+      def kill : Nil
+        @mutex.synchronize do
+          check_open_locked
+          File.write(@path / "cgroup.kill", "1\n", mode: "w")
+        end
+      rescue ex : File::AccessDeniedError
+        raise ProcessSupervision::Error::Unavailable.new("cgroup.kill is not writable: #{ex.message}")
+      rescue ex : File::Error
+        raise ProcessSupervision::Error::Native.new("write(cgroup.kill)", ex.message || "cgroup kill failed")
+      end
+
+      def close : Nil
+        @mutex.synchronize do
+          return if @closed
+
+          if @owned
+            if read_populated(@path / "cgroup.events")
+              raise ProcessSupervision::Error::Busy.new("cannot remove a populated cgroup")
+            end
+            Dir.delete(@path)
+          end
+
+          @closed = true
+        end
+      rescue ex : ProcessSupervision::Error
+        raise ex
+      rescue ex : File::Error
+        raise ProcessSupervision::Error::Native.new("rmdir(cgroup)", ex.message || "cgroup removal failed")
+      end
+
+      def closed? : Bool
+        @mutex.synchronize { @closed }
+      end
+
+      private def wait_empty_on_execution_context(timeout : Time::Span?) : Bool
+        validate_timeout(timeout)
+        deadline = timeout.try { |span| Time.instant + span }
+        loop do
+          return true if empty?
+          if deadline
+            remaining = deadline - Time.instant
+            return false if remaining <= Time::Span.zero
+            sleep({remaining, 10.milliseconds}.min)
+          else
+            sleep 10.milliseconds
+          end
+        end
+      end
+
+      private def check_open_locked : Nil
+        raise ProcessSupervision::Error::Closed.new("cgroup controller is closed") if @closed
+      end
+
+      private def self.mount_entries : Array(Tuple(Path, String))
+        entries = [] of Tuple(Path, String)
+        File.each_line("/proc/self/mountinfo") do |line|
+          left, separator, right = line.partition(" - ")
+          next if separator.empty?
+          next unless right.starts_with?("cgroup2 ")
+          fields = left.split
+          next unless encoded_root = fields[3]?
+          next unless encoded_mount = fields[4]?
+          entries << {Path[decode_mount_field(encoded_mount)], decode_mount_field(encoded_root)}
+        end
+        entries
+      rescue File::Error
+        [] of Tuple(Path, String)
+      end
+
+      private def self.current_cgroup_path : String?
+        File.each_line("/proc/self/cgroup") do |line|
+          hierarchy, controllers, path = line.rstrip.split(':', 3)
+          return path if hierarchy == "0" && controllers.empty?
+        end
+        nil
+      rescue File::Error
+        nil
+      end
+
+      private def self.active_mount_entry : Tuple(Path, String)?
+        path = current_cgroup_path
+        path ? best_mount_entry(path) : nil
+      end
+
+      private def self.best_mount_entry(cgroup_path : String) : Tuple(Path, String)?
+        mount_entries
+          .select { |(_, root)| !relative_to_mount_root(cgroup_path, root).nil? }
+          .max_by? { |(_, root)| root.size }
+      end
+
+      private def self.relative_to_mount_root(cgroup_path : String, root : String) : String?
+        return cgroup_path.lchop('/') if root == "/"
+        return "" if cgroup_path == root
+        return cgroup_path[root.size..].lchop('/') if cgroup_path.starts_with?("#{root}/")
+        nil
+      end
+
+      private def self.mount_entry_for(path : String) : Tuple(Path, String)?
+        mount_entries
+          .select do |(mount, _)|
+            begin
+              within_mount?(path, File.realpath(mount))
+            rescue File::Error
+              false
+            end
+          end
+          .max_by? { |(mount, _)| mount.to_s.size }
+      end
+
+      private def self.validate_interface!(path : String) : Nil
+        %w[cgroup.procs cgroup.events cgroup.kill].each do |name|
+          file = Path[path] / name
+          unless File.file?(file)
+            raise ProcessSupervision::Error::Unavailable.new("#{path} does not expose #{name}")
+          end
+        end
+      end
+
+      private def self.validate_name!(name : String) : Nil
+        if name.empty? || name == "." || name == ".." || name.includes?('/') || name.includes?('\0')
+          raise ArgumentError.new("cgroup name must be one non-empty path component")
+        end
+      end
+
+      private def self.within_mount?(path : String, mount : String) : Bool
+        path == mount || path.starts_with?(mount.ends_with?('/') ? mount : "#{mount}/")
+      end
+
+      private def self.decode_mount_field(value : String) : String
+        value.gsub(/\\(040|011|012|134)/) do |match|
+          case match[1]
+          when "040" then " "
+          when "011" then "\t"
+          when "012" then "\n"
+          else            "\\"
+          end
+        end
+      end
+
+      private def read_populated(events : Path) : Bool
+        File.each_line(events) do |line|
+          fields = line.split(' ', 2)
+          next unless fields.size == 2
+          key, value = fields
+          return value == "1" if key == "populated"
+        end
+        raise ProcessSupervision::Error::Native.new("read(cgroup.events)", "missing populated field")
+      end
+    end
+  end
+{% end %}

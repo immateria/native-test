@@ -1,0 +1,3 @@
+# The probe kit is verified byte-for-byte against probes/MANIFEST.sha256.
+# Stop git from rewriting line endings (e.g. autocrlf on Windows runners).
+probes/** -text
