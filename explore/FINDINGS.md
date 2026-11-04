@@ -832,7 +832,7 @@ The test service is an own-process service running this executable as LocalSyste
 | access violation in the service | `ControlService` returned `ERROR_BROKEN_PIPE` (109) when the process died, **161–942 ms after the crash** (WER, below); with the restart action (1000 ms delay) the new instance was ready 1.004–1.032 s after the old one exited, **while the old instance's worker was still running** |
 | `ExitProcess(3)` without reporting `STOPPED` | treated as a failure: restarted after the delay |
 | reports `STOPPED` with `ERROR_SERVICE_SPECIFIC_ERROR` | not restarted — unless `FailureActionsOnNonCrashFailures` is set, then restarted after the delay |
-| a session-0 worker assigned to a job created by this session-2 process | **into an empty job: succeeded** (with `PROCESS_SET_QUOTA`; a first attempt without it gave error 5). **Into a job that already holds a session-2 process: `ERROR_ACCESS_DENIED` (5)** — the worker in no job before, so only the session rule refused it (run `41891670151`). A job takes the session of its first process |
+| a session-0 worker assigned to a job created by this session-2 process | **into an empty job: succeeded** (with `PROCESS_SET_QUOTA`; a first attempt without it gave error 5). **Into a job that already holds a session-2 process: `ERROR_ACCESS_DENIED` (5)** — the worker in no job before, so only the session rule refused it (runs `41891670151`, `41894086301`, all three builds). A job takes the session of its first process |
 
 **Crash reporting, and why the runner's own crashes are fast.** A crashing *service* goes through WER: 161–942 ms
 between the fault and the process exit, and with a per-program `LocalDumps` key a minidump (0.6–0.9 MiB) or a full
@@ -842,10 +842,10 @@ nothing (169–307 ms). But a child crashing in the runner's session 2 also exit
 with `LocalDumps` set, and the runner's job does *not* have that flag. **The cause is the inherited error mode**: the
 step's processes run with `GetErrorMode()` = `0x8003` (`SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
 SEM_NOOPENFILEERRORBOX`), which children inherit, while the test service had `0x8001`. With `SEM_NOGPFAULTERRORBOX` the
-unhandled-exception path does not call WER at all. Measured in the runner's session (run `41894086301`, arm64): a child
+unhandled-exception path does not call WER at all. Measured in the runner's session (run `41894086301`, all three builds): a child
 that crashed with the inherited `0x8003` — or with `SetErrorMode(SEM_NOGPFAULTERRORBOX)` alone — exited in 0 ms, no
-`WerFault`, no dump; the same child after `SetErrorMode(0)` took **298–303 ms**, `WerFault` ran (in sessions 0 and 2)
-and `LocalDumps` wrote a 0.9 MiB minidump. So "a crash does not wait for WER on the hosted runner" is a property of
+`WerFault`, no dump; the same child after `SetErrorMode(0)` took **214–361 ms**, `WerFault` ran (in sessions 0 and 2)
+and `LocalDumps` wrote a minidump. So "a crash does not wait for WER on the hosted runner" is a property of
 the runner's error mode, not of Windows: a supervisor whose children run with error mode 0 (any service, any process
 whose parent did not set the flag) waits ~0.2–0.9 s per crash, longer with full dumps. A supervisor can make crashes
 immediate and dump-free for its children with `SetErrorMode(SEM_NOGPFAULTERRORBOX)` before creating them (inherited) or
