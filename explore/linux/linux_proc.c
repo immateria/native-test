@@ -276,11 +276,13 @@ static void exp_pidns(void) {
     gid_t gid = getgid();
     int u = unshare(CLONE_NEWUSER | CLONE_NEWPID);
     int ue = u < 0 ? errno : 0;
+    int uidmap_errno = -1;
     if (u == 0) {
       char m[64];
       int fd = open("/proc/self/uid_map", O_WRONLY);
       int n = snprintf(m, sizeof m, "0 %d 1\n", (int)uid);
-      if (fd >= 0) { (void)!write(fd, m, (size_t)n); close(fd); }
+      uidmap_errno = fd < 0 ? errno : (write(fd, m, (size_t)n) < 0 ? errno : 0);
+      if (fd >= 0) close(fd);
       fd = open("/proc/self/setgroups", O_WRONLY);
       if (fd >= 0) { (void)!write(fd, "deny", 4); close(fd); }
       fd = open("/proc/self/gid_map", O_WRONLY);
@@ -300,7 +302,7 @@ static void exp_pidns(void) {
       pid_t k = fork();
       if (k == 0) { for (;;) pause(); }
       sleep_ms(100);
-      int n = snprintf(b, sizeof b, "unshare=OK init_sees_itself_as=%d\n", (int)getpid());
+      int n = snprintf(b, sizeof b, "unshare=OK uid_map_write=%s init_sees_itself_as=%d\n", errno_name(uidmap_errno), (int)getpid());
       (void)!write(p[1], b, (size_t)n);
       for (;;) pause();
     }

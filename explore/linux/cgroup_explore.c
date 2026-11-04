@@ -594,11 +594,17 @@ static void exp_escape(void) {
   gated_t h;
   spawn_in(w2, body_sleep, NULL, &h, &me);
   sleep_ms(50);
-  int ip = cg_write(w2, "cgroup.subtree_control", "+pids");
+  int ip = cg_write(w2, "cgroup.subtree_control", "+pids");     /* pids is a threaded controller */
+  int ip_mem = cg_write(w2, "cgroup.subtree_control", "+memory"); /* domain controllers */
+  int ip_cpu = cg_write(w2, "cgroup.subtree_control", "+cpu");
+  char sc[128] = "";
+  cg_read(w2, "cgroup.subtree_control", sc, sizeof sc);
+  flat(sc);
   emit(PROBE, "delegated_child_escape",
        "\"move_self_to_hierarchy_root\":\"%s\",\"move_self_to_parent_of_delegation\":\"%s\",\"move_self_to_sibling_inside_delegation\":\"%s\","
-       "\"child_cgroup_afterwards\":\"%s\",\"leaf_now_empty\":%s,\"mkdir_in_hierarchy_root\":\"%s\",\"enable_controller_in_populated_leaf\":\"%s\"",
-       r1, r2, r3, cg, bstr(left_leaf), mk, errno_name(ip));
+       "\"child_cgroup_afterwards\":\"%s\",\"leaf_now_empty\":%s,\"mkdir_in_hierarchy_root\":\"%s\",\"enable_pids_in_populated_leaf\":\"%s\","
+       "\"enable_memory_in_populated_leaf\":\"%s\",\"enable_cpu_in_populated_leaf\":\"%s\",\"populated_leaf_subtree_control\":\"%s\"",
+       r1, r2, r3, cg, bstr(left_leaf), mk, errno_name(ip), errno_name(ip_mem), errno_name(ip_cpu), sc);
   kill(g.pid, SIGKILL); kill(h.pid, SIGKILL);
   char st[64];
   reap_blocking(g.pid, 2000, st, sizeof st); reap_blocking(h.pid, 2000, st, sizeof st);
