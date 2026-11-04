@@ -376,6 +376,29 @@ module NativeProbe
       privileges: privileges.join(",")))
   end
 
+  # In-process bisection of a rejected job priority request: the same priority class asked through the
+  # raw API with one variable changed at a time. Result per variant is "ok" or the Win32 error.
+  def self.raw_priority_variants(priority : UInt32) : String
+    variants = [] of String
+    {% for spec in [{"basic", 2, 0_u32}, {"extended", 9, 0_u32}, {"extended+kill_on_close", 9, 0x2000_u32}] %}
+      begin
+        job = LibC.CreateJobObjectW(Pointer(LibC::SECURITY_ATTRIBUTES).null, Pointer(UInt16).null)
+        if job.null?
+          variants << "{{ spec[0].id }}=create_failed:#{LibC.GetLastError}"
+        else
+          info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
+          info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | {{ spec[2] }}
+          info.basicLimitInformation.priorityClass = priority
+          size = {{ spec[1] }} == 2 ? sizeof(LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION) : sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+          rc = LibC.SetInformationJobObject(job, LibC::JOBOBJECTINFOCLASS.new({{ spec[1] }}), pointerof(info).as(Void*), size.to_u32)
+          variants << "{{ spec[0].id }}=#{rc != 0 ? "ok" : LibC.GetLastError.to_s}"
+          LibC.CloseHandle(job)
+        end
+      end
+    {% end %}
+    variants.join(" ")
+  end
+
   def self.wait_until(timeout : Time::Span, interval : Time::Span = 10.milliseconds, & : -> Bool) : Bool
     deadline = Time.instant + timeout
     loop do
@@ -2526,8 +2549,9 @@ module NativeProbe
       rescue ex : ProcessSupervision::Error::Native
         outcome = "native_rejected:#{ex.native_code}"
       end
+      raw = raw_priority_variants(ProcessSupervision::Windows::Job::PriorityClass::High.value)
       {outcome.starts_with?("native_rejected") || priority == ProcessSupervision::Windows::Job::PriorityClass::High.value,
-       details(outcome: outcome, priority: priority, note: "elevation-sensitive outcome recorded")}
+       details(outcome: outcome, priority: priority, raw_same_process: raw, note: "elevation-sensitive outcome recorded")}
     end
 
     test("limits_ui_single_flags_configuration_query") do
