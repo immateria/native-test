@@ -105,13 +105,20 @@ and read back (9 with the privilege enabled); its effect on quantum length was n
 * It also has to set the token's **owner and default DACL to the user** (as a real UAC-filtered token does). Left as
   the elevated token's Administrators-only values, the unelevated process cannot open the child processes and jobs it
   creates itself (`AccessDenied` in `adopt`, six kit cases).
-* `pwsh` cannot be run under this token on the hosted runner: every native command it starts fails (`Access is
-  denied`, then PowerShell's "StandardOutputEncoding is only supported when standard output is redirected").
-  File ACLs are not the cause (`crystal.exe` grants Users RX). Giving the child its own console
-  (`CREATE_NO_WINDOW`) makes even a Crystal executable die with `STATUS_DLL_INIT_FAILED` (0xC0000142). So only the
-  probe **executable** is run filtered (`PROCESS_PROBE_LAUNCHER`); the wrapper and the build stay elevated.
-  Why pwsh fails was not isolated (inferred: console / desktop access for a restricted token on a non-interactive
-  runner).
+* **`pwsh` works under this token** (corrects an earlier claim). The first attempts (run `41771599247`) failed every
+  captured native command with `Access is denied`, then PowerShell's "StandardOutputEncoding is only supported when
+  standard output is redirected" (its retry clears the redirection but keeps the encoding, which hides the first
+  error), and a child given its own console or `CREATE_NO_WINDOW` died with `STATUS_DLL_INIT_FAILED` (0xC0000142).
+  **Both happened before the owner/default-DACL fix above** (`10a8f97`, 23 minutes later), and neither was tried again
+  until now. With the fixed token (`pwsh_native.ps1`, run `41888597722`, Server 2022 and 2025): all 11 launch shapes
+  work — uncaptured and captured native commands, `whoami`, `Process.Start` with redirected stdout/stderr/stdin and
+  without, `CreateNoWindow`, `Start-Process -NoNewWindow` (PowerShell 7.6.9 on .NET 10.0.14, Administrators role not
+  active). In C (`win_more desktop`), under the same token: `CreatePipe` + a non-inheritable `DuplicateHandle` + a
+  redirected `CreateProcess` work, and children start and exit normally with `CREATE_NEW_CONSOLE`, `CREATE_NO_WINDOW`
+  and `DETACHED_PROCESS` (no 0xC0000142). The token: Medium integrity, Administrators and the local-account SID
+  deny-only (`0x10`), owner = the user, default DACL `D:(A;;GA;;;LA)(A;;GA;;;SY)`, same logon SID as the elevated
+  token. The window station `WinSta0` and desktop `Default` grant that logon SID full access, so every access right
+  tried opened. The probe-only launcher (`PROCESS_PROBE_LAUNCHER`) is therefore no longer required; it was kept.
 
 ---
 
@@ -309,6 +316,15 @@ the same in all five configurations unless a difference is stated.
     150 × 64 KiB per second) but **about once per second one write fails with `ERROR_INVALID_PARAMETER` (87)**, usually
     the first at about 1.0 s, with or without `MaxIops` as well. Only one 4 KiB run (Server 2022, elevated) had no failure. An
     IOPS-only limit never failed a write. A bandwidth-limited child therefore sees spurious write errors.
+  * **What the error-87 writes are, and how to avoid them** (`proc_explore iobw`, runs `41886046710`, `41888597722`,
+    all three builds, elevated and de-elevated; each write carries a unique header at an explicit offset, and the
+    parent reads the file back outside the job): **the failed write did not happen** — `n` = 0 and the block on disk
+    still held its previous content, 6 of 6 per run. **Retrying the same write at the same offset succeeded on the
+    first retry**, 6 of 6, and the whole file verified. And **the failures depend on the limit's value**: 1,000,000
+    bytes/s failed about once a second with 4 KiB and 64 KiB writes, while every limit that is a multiple of 4 KiB never
+    failed — 1,003,520 (245 × 4 KiB, not a multiple of 8 KiB), 1,007,616, 1,015,808, 1,048,576, 10,485,760. So: set
+    `MaxBandwidth` to a multiple of 4096, or treat 87 from a write as retryable. The code that returns it was not found
+    (Microsoft names `IORate.sys` as the driver that holds rate-controlled I/O).
 * Creating a silo through `NtSetInformationJobObject(JobObjectCreateSilo)` returned `STATUS_INVALID_PARAMETER`
   everywhere, and the extended limit `JOB_OBJECT_LIMIT_SILO_READY` was rejected (87). Not pursued.
 
@@ -792,6 +808,38 @@ ACL already allowed it; not checked).
   three. Nothing the kit relies on behaves differently for emulated children.
 
 ---
+
+## Windows services, session 0 and crash reporting (verified on Server 2022, Server 2025, Windows 11 arm64)
+
+`win_more services`, runs `41886046710`, `41888597722`, elevated (de-elevated, `OpenSCManager` with create rights is
+denied, error 5). How the hosted runner itself runs: the Task Scheduler service (`svchost`, session 0) starts
+`hosted-compute-agent` in session 2, which starts `Runner.Listener` → `Runner.Worker` → the step's shell. Session 2 is
+the console session of the auto-logged-on `runneradmin` (`AutoAdminLogon 1`), with `explorer.exe` running. The runner's
+own job has **no limit flags** (`0x0`, no breakaway). Registry: WER `DontShowUI 1`, `ForceQueue 1`, no global
+`LocalDumps` (only Service Fabric's per-program keys), `WaitToKillServiceTimeout 5000`, **`ServicesPipeTimeout
+120000`**.
+
+The test service is an own-process service running this executable as LocalSystem. It reached `RUNNING` 14–25 ms after
+`StartService`, in session 0 and in no job, and started a worker child.
+
+| case | what happened |
+|---|---|
+| `SERVICE_CONTROL_STOP`, worker not in a job | `ControlService` returned in 0–1 ms, `STOPPED`, the service process exited 1–2 ms later — **the worker kept running**. The SCM does not touch a service's children. |
+| the same, worker in the service's kill-on-close job | the worker was gone 3 ms after the service process |
+| a STOP handler that never returns | `ControlService` **blocked for 240 s** and failed with `ERROR_SERVICE_REQUEST_TIMEOUT` (1053); the state stayed `RUNNING` all along; at 240 s the service process was gone (exit code 0) and the state `STOPPED`. Not the documented 30 s; on these runners `ServicesPipeTimeout` is 120 s (that 240 s = 2 × 120 s is a guess) |
+| access violation in the service | `ControlService` returned `ERROR_BROKEN_PIPE` (109) when the process died, **161–942 ms after the crash** (WER, below); with the restart action (1000 ms delay) the new instance was ready 1.004–1.032 s after the old one exited, **while the old instance's worker was still running** |
+| `ExitProcess(3)` without reporting `STOPPED` | treated as a failure: restarted after the delay |
+| reports `STOPPED` with `ERROR_SERVICE_SPECIFIC_ERROR` | not restarted — unless `FailureActionsOnNonCrashFailures` is set, then restarted after the delay |
+| a session-0 worker assigned to a job created by this session-2 process | **succeeded** (with `PROCESS_SET_QUOTA`; a first attempt without it gave error 5) |
+
+**Crash reporting, and why the runner's own crashes are fast.** A crashing *service* goes through WER: 161–942 ms
+between the fault and the process exit, and with a per-program `LocalDumps` key a minidump (0.6–0.9 MiB) or a full
+dump (26–49 MiB) appears. Children of the service behave the same — 161–323 ms, with dumps — and **in a job with
+`JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` they exit at once (0 ms) with no dump**; a job without that flag changes
+nothing (169–307 ms). But a child crashing in the runner's session 2 also exits at once (0 ms) and writes no dump even
+with `LocalDumps` set, and the runner's job does *not* have that flag (see the next section for the cause).
+A supervisor must not count on a crash dump, or on a fixed crash-to-exit time, without knowing which of these applies;
+its own job with `DIE_ON_UNHANDLED_EXCEPTION` makes crashes immediate and dump-free.
 
 ## A Mach exception handler holds a crashing thread (macOS, verified on all five runners)
 
