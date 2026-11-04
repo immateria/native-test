@@ -81,6 +81,7 @@ jobs:
             probes/windows-probe-handback.zip
             explore-out/*.jsonl
             explore-out/*.err
+            explore-out/*.txt
           if-no-files-found: warn
           retention-days: 30
 
@@ -152,6 +153,7 @@ jobs:
             probes/windows-probe-handback.zip
             explore-out/*.jsonl
             explore-out/*.err
+            explore-out/*.txt
           if-no-files-found: warn
           retention-days: 30
 
