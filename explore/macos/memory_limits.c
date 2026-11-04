@@ -354,8 +354,9 @@ static void jetsam_spawn_case(const char *kase, int limit_mb, short flags) {
   if (pipe(p) != 0) return;
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
-  posix_spawn_file_actions_adddup2(&fa, p[1], 3);
+  /* close the read end first: when it is fd 3 itself, closing it after the dup2 would close the dup */
   posix_spawn_file_actions_addclose(&fa, p[0]);
+  posix_spawn_file_actions_adddup2(&fa, p[1], 3);
   posix_spawnattr_t at;
   posix_spawnattr_init(&at);
   int set_rc = limit_mb ? fn(&at, flags, -1, limit_mb, limit_mb) : 0;
