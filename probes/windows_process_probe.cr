@@ -241,6 +241,30 @@ class ProbeThread
   end
 end
 
+# A fiber on the default execution context with ProbeThread's join semantics. Use it where file
+# descriptors are counted: every ProbeThread owns an event loop whose descriptors are not released
+# until the process exits (Linux: 3 per context, macOS: 1), which would show up as a leak.
+class ProbeFiber
+  def initialize(name : String = "probe", &block : ->)
+    @done = Channel(Exception?).new(1)
+    spawn(name: name) do
+      error = nil.as(Exception?)
+      begin
+        block.call
+      rescue ex
+        error = ex
+      end
+      @done.send(error)
+    end
+  end
+
+  def join : Nil
+    if error = @done.receive
+      raise error
+    end
+  end
+end
+
 # Fixed-size integer slots shared between threads. `Array(Atomic(Int32))` does
 # not work: Atomic is a struct, so `slots[i].set(x)` mutates a copy of the slot.
 class ProbeSlots
@@ -690,7 +714,7 @@ module NativeProbe
       code = (ARGV[2]? || "0").to_u32
       WindowsProbeExtra.ExitProcess(code)
     when "cpu-spin"
-      ms = (ARGV[2]? || "800").to_i.clamp(1, 5000)
+      ms = (ARGV[2]? || "800").to_i.clamp(1, 20000)
       marker = ARGV[3]?
       deadline = Time.instant + ms.milliseconds
       value = 0x1234_5678_u64
@@ -4206,9 +4230,12 @@ module NativeProbe
     job = ProcessSupervision.job(limits)
     child = nil.as(ProcessSupervision::Child?)
     begin
-      child = job.spawn(self_exe, ["--child", "cpu-spin", "4000"])
-      status = child.wait(7.seconds)
-      event = wait_for_limit_kind(job, expected_kind, 2.seconds)
+      # Windows evaluates job CPU-time limits in a periodic system-wide pass of about 7 s, not when the
+      # limit is crossed (native evidence: explore/windows cpu-time + cpu-period). Spin and wait for
+      # two periods so enforcement is observed rather than depending on where the tick lands.
+      child = job.spawn(self_exe, ["--child", "cpu-spin", "15000"])
+      status = child.wait(18.seconds)
+      event = wait_for_limit_kind(job, expected_kind, 3.seconds)
       {status != nil && status.try(&.system_exit_status) != 0_u32,
        details(kind: kind, configured_ms: milliseconds, exit: status.try(&.system_exit_status), event: event.try(&.kind))}
     ensure
@@ -5479,7 +5506,9 @@ module NativeProbe
         raise "notification limit configuration failed: #{set[:error]}" unless set[:ok]
         child = job.spawn(self_exe, ["--child", "io-work", marker, path])
         messages = [] of UInt32
-        deadline = Time.instant + 5.seconds
+        # Notification limits are evaluated in the same ~7 s periodic pass as CPU-time limits; the message
+        # arrived 0.6-4.7 s after the write in native runs, even when the child had already exited.
+        deadline = Time.instant + 12.seconds
         while Time.instant < deadline && !messages.includes?(JOB_OBJECT_MSG_NOTIFICATION_LIMIT)
           event = next_raw_completion(port, 250_u32)
           messages << event[:message] if event[:ok]

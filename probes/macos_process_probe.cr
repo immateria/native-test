@@ -81,6 +81,30 @@ class ProbeThread
   end
 end
 
+# A fiber on the default execution context with ProbeThread's join semantics. Use it where file
+# descriptors are counted: every ProbeThread owns an event loop whose descriptors are not released
+# until the process exits (Linux: 3 per context, macOS: 1), which would show up as a leak.
+class ProbeFiber
+  def initialize(name : String = "probe", &block : ->)
+    @done = Channel(Exception?).new(1)
+    spawn(name: name) do
+      error = nil.as(Exception?)
+      begin
+        block.call
+      rescue ex
+        error = ex
+      end
+      @done.send(error)
+    end
+  end
+
+  def join : Nil
+    if error = @done.receive
+      raise error
+    end
+  end
+end
+
 # Fixed-size integer slots shared between threads. `Array(Atomic(Int32))` does
 # not work: Atomic is a struct, so `slots[i].set(x)` mutates a copy of the slot.
 class ProbeSlots
@@ -463,7 +487,9 @@ module NativeProbe
     when "spawn-grandchild-and-exit"
       marker = ARGV[2]? || raise "missing marker"
       delay_ms = ARGV[3]?.try(&.to_i?) || 80
-      grandchild = Process.new(self_exe, ["--child", "sleep", "1200"])
+      # Process.new closes stdio by default; the grandchild must inherit our stdout (the pipe the parent
+      # is reading) or EOF arrives the moment this process exits and the case tests nothing.
+      grandchild = Process.new(self_exe, ["--child", "sleep", "1200"], output: Process::Redirect::Inherit)
       File.write(marker, grandchild.pid.to_s)
       sleep delay_ms.milliseconds
       exit 0
@@ -4640,6 +4666,35 @@ module NativeProbe
       end
     end
 
+    test("r13_group_signal_zombie_only_group_is_not_fatal") do
+      # Darwin returns EPERM (not ESRCH, and not success as Linux does) from kill(-pgid, sig) once every
+      # process left in the group is a zombie. Native evidence: explore/macos/signal_matrix.c.
+      child, pgid, _ = spawn_group_child(3000, "zombie-only")
+      group = ProcessSupervision.process_group(pgid)
+      reaped = false
+      begin
+        group.kill
+        gone = wait_until(2.seconds) { !ProcessHandle.observe(child.pid).state.live? }
+        second = begin
+          group.kill
+          "returned"
+        rescue ex
+          probe_failure_text(ex)
+        end
+        empty_with_zombie = group.empty?
+        status = child.wait
+        reaped = true
+        drained = group.wait_empty(1.second)
+        {gone && second == "returned" && empty_with_zombie && drained,
+         details(not_live_before_reap: gone, second_kill: second, empty_while_zombie: empty_with_zombie,
+           drained_after_reap: drained, signal: status.exit_signal?,
+           contract: "a group with no live member is empty and signalling it is a no-op, not an error")}
+      ensure
+        group.close
+        cleanup(child, reaped)
+      end
+    end
+
     test("r9_kqueue_huge_timeout_86400s") do
       r9_kqueue_huge_timeout_case(86_400_i64)
     end
@@ -4654,8 +4709,8 @@ module NativeProbe
       gc_settle
       baseline = fd_count_observation
       failures = Atomic(Int32).new(0)
-      workers = Array(ProbeThread).new(8) do |i|
-        ProbeThread.new("fd-stress-#{i}") do
+      workers = Array(ProbeFiber).new(8) do |i|
+        ProbeFiber.new("fd-stress-#{i}") do
           32.times do |j|
             reader, writer = IO.pipe
             begin

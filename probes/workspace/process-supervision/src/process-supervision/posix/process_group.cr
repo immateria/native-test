@@ -79,6 +79,7 @@
           return if rc == 0
           errno = Errno.value
           return if errno == Errno::ESRCH
+          return if no_live_member?(errno)
           raise ProcessSupervision::Error::Native.new("killpg(#{signal})", errno.message, errno.value.to_i64)
         end
       end
@@ -87,9 +88,23 @@
         rc = LibC.kill(-@pgid.to_i32, 0)
         return false if rc == 0
         errno = Errno.value
-        return false if errno == Errno::EPERM
         return true if errno == Errno::ESRCH
+        return no_live_member?(errno) if errno == Errno::EPERM
         raise ProcessSupervision::Error::Native.new("killpg(0)", errno.message, errno.value.to_i64)
+      end
+
+      # Darwin returns EPERM, not ESRCH, from kill(-pgid, sig) once every process left in the group is a
+      # zombie (exited, not yet reaped): nothing remains that can receive the signal. It does so for
+      # signal 0, TERM and KILL alike, while Linux keeps delivering to zombies (rc 0) and reports ESRCH
+      # only after reaping. Treating that EPERM as fatal made TERM -> grace -> KILL escalation raise
+      # whenever the group died during the grace period. Measured natively (macOS 15 arm64):
+      # explore/macos/signal_matrix.c, 100% EPERM for a KILL sent >= 1 ms after TERM.
+      private def no_live_member?(errno : Errno) : Bool
+        {% if flag?(:darwin) %}
+          errno == Errno::EPERM
+        {% else %}
+          false
+        {% end %}
       end
 
       private def check_open_locked : Nil

@@ -110,6 +110,7 @@ module Explore
   JOB_OBJECT_LIMIT_PROCESS_TIME     = 0x00000002_u32
   JOB_OBJECT_LIMIT_JOB_TIME         = 0x00000004_u32
   JOB_OBJECT_LIMIT_PRIORITY_CLASS   = 0x00000020_u32
+  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000_u32
   JOB_OBJECT_LIMIT_JOB_READ_BYTES   = 0x00010000_u32
   JOB_OBJECT_LIMIT_JOB_WRITE_BYTES  = 0x00020000_u32
 
@@ -376,35 +377,47 @@ module Explore
         emit("priority_enable_privilege") { |j| j.field "adjusted", ok; j.field "last_error", err }
       end
       PRIORITY_CLASSES.each do |name, value|
-        {CLASS_BASIC_LIMIT, CLASS_EXTENDED_LIMIT}.each do |info_class|
+        # {info class, extra limit flags}: basic, extended, and extended + KILL_ON_JOB_CLOSE (what the kit sends)
+        [{CLASS_BASIC_LIMIT, 0_u32}, {CLASS_EXTENDED_LIMIT, 0_u32}, {CLASS_EXTENDED_LIMIT, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE}].each do |info_class, extra|
           job = new_job
           process = nil.as(LibC::HANDLE?)
           begin
             if info_class == CLASS_BASIC_LIMIT
               info = LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION.new
-              info.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS
+              info.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | extra
               info.priorityClass = value
               ok, err = set_job_info(job, info_class, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION))
             else
               info = LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION.new
-              info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS
+              info.basicLimitInformation.limitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS | extra
               info.basicLimitInformation.priorityClass = value
               ok, err = set_job_info(job, info_class, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_EXTENDED_LIMIT_INFORMATION))
             end
+            before = -1_i64
+            after_assign = -1_i64
             applied = -1_i64
             if ok
-              proc, _ = start_in_job(job, [exe, "child-sleep", "400"])
+              proc, thread, _pid = spawn_suspended([exe, "child-sleep", "400"])
               process = proc
+              before = WX.GetPriorityClass(proc).to_i64
+              raise "assign failed: #{LibC.GetLastError}" if LibC.AssignProcessToJobObject(job, proc) == 0
+              after_assign = WX.GetPriorityClass(proc).to_i64
+              LibC.ResumeThread(thread)
+              LibC.CloseHandle(thread)
               sleep 50.milliseconds
               applied = WX.GetPriorityClass(proc).to_i64
             end
+            hex = ->(v : Int64) { v < 0 ? "none" : "0x#{v.to_s(16)}" }
             emit("priority_job") do |j|
               j.field "phase", phase
               j.field "class", name
               j.field "info_class", info_class
+              j.field "extra_flags_hex", "0x#{extra.to_s(16)}"
               j.field "set_ok", ok
               j.field "set_error", err
-              j.field "child_priority_hex", applied < 0 ? "none" : "0x#{applied.to_s(16)}"
+              j.field "child_before_assign_hex", hex.call(before)
+              j.field "child_after_assign_hex", hex.call(after_assign)
+              j.field "child_priority_hex", hex.call(applied)
             end
           rescue ex
             emit("priority_job_error") { |j| j.field "phase", phase; j.field "class", name; j.field "error", ex.message || ex.class.name }
@@ -499,6 +512,75 @@ module Explore
         trials.times { |trial| cpu_trial(kind, limit_ms, trial) }
       end
     end
+  end
+
+  # --- cpu-time period ----------------------------------------------------------
+
+  def self.start_spinner(limit_ms : Int32, max_ms : Int32) : {LibC::HANDLE, LibC::HANDLE, LibC::HANDLE}
+    job = new_job
+    port = associate_port(job, 0x99_u64)
+    info = LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION.new
+    info.limitFlags = JOB_OBJECT_LIMIT_JOB_TIME
+    info.perJobUserTimeLimit = limit_ms.to_i64 * 10_000_i64
+    ok, err = set_job_info(job, CLASS_BASIC_LIMIT, pointerof(info).as(Void*), sizeof(LibC::JOBOBJECT_BASIC_LIMIT_INFORMATION))
+    raise "set limit failed: #{err}" unless ok
+    proc, _ = start_in_job(job, [exe, "child-spin", max_ms.to_s])
+    {job, port, proc}
+  end
+
+  # Hypothesis from the cpu-time runs: Windows checks job CPU-time (and notification) limits in a
+  # periodic system-wide pass, not when the limit is crossed. Measure that period directly:
+  #   sequential - each spinner is killed at the next pass, so successive kills are one period apart
+  #   concurrent - two jobs started 2.5 s apart; a global pass kills both at the same instant,
+  #                a per-job timer would not
+  def self.exp_cpu_period : Nil
+    program_start = Time.instant
+    ms = ->(t : Time::Instant) { (t - program_start).total_milliseconds.round(1) }
+
+    6.times do |i|
+      started = Time.instant
+      job, port, proc = start_spinner(100, 20_000)
+      begin
+        while !process_done?(proc) && (Time.instant - started) < 25.seconds
+          sleep 5.milliseconds
+        end
+        ended = Time.instant
+        code = process_done?(proc) ? exit_code(proc) : 0xffff_ffff_u32
+        emit("cpu_period_sequential") do |j|
+          j.field "trial", i
+          j.field "started_at_ms", ms.call(started)
+          j.field "ended_at_ms", ms.call(ended)
+          j.field "lived_ms", (ended - started).total_milliseconds.round(1)
+          j.field "exit_code_hex", "0x#{code.to_s(16)}"
+        end
+      ensure
+        cleanup(proc, job, port)
+      end
+    end
+
+    a_job, a_port, a_proc = start_spinner(100, 20_000)
+    a_start = Time.instant
+    sleep 2500.milliseconds
+    b_job, b_port, b_proc = start_spinner(100, 20_000)
+    b_start = Time.instant
+    a_end = nil.as(Time::Instant?)
+    b_end = nil.as(Time::Instant?)
+    deadline = Time.instant + 25.seconds
+    while Time.instant < deadline && (a_end.nil? || b_end.nil?)
+      a_end = Time.instant if a_end.nil? && process_done?(a_proc)
+      b_end = Time.instant if b_end.nil? && process_done?(b_proc)
+      sleep 5.milliseconds
+    end
+    emit("cpu_period_concurrent") do |j|
+      j.field "a_started_at_ms", ms.call(a_start)
+      j.field "b_started_at_ms", ms.call(b_start)
+      j.field "a_ended_at_ms", a_end ? ms.call(a_end.not_nil!) : -1.0
+      j.field "b_ended_at_ms", b_end ? ms.call(b_end.not_nil!) : -1.0
+      j.field "a_exit_code_hex", "0x#{(process_done?(a_proc) ? exit_code(a_proc) : 0xffff_ffff_u32).to_s(16)}"
+      j.field "b_exit_code_hex", "0x#{(process_done?(b_proc) ? exit_code(b_proc) : 0xffff_ffff_u32).to_s(16)}"
+    end
+    cleanup(a_proc, a_job, a_port)
+    cleanup(b_proc, b_job, b_port)
   end
 
   # --- notification limits ---------------------------------------------------
@@ -617,7 +699,7 @@ module Explore
   # become deny-only, privileges are stripped, integrity is lowered to Medium. This is
   # what a UAC-unelevated process of an administrator account looks like.
   def self.launch_unelevated(args : Array(String)) : Int32
-    base = open_token(0x00ac_u32) # DUPLICATE | QUERY | ASSIGN_PRIMARY | ADJUST_DEFAULT
+    base = open_token(0x008b_u32) # ASSIGN_PRIMARY 0x1 | DUPLICATE 0x2 | QUERY 0x8 | ADJUST_DEFAULT 0x80
     restricted = LibC::HANDLE.null
     # DISABLE_MAX_PRIVILEGE (0x1) | LUA_TOKEN (0x4)
     if WX.CreateRestrictedToken(base, 0x5_u32, 0_u32, Pointer(Void).null, 0_u32, Pointer(Void).null, 0_u32, Pointer(Void).null, pointerof(restricted)) == 0
@@ -706,11 +788,13 @@ module Explore
     when "token"    then exp_token
     when "priority" then exp_priority
     when "cpu-time" then exp_cpu_time
+    when "cpu-period" then exp_cpu_period
     when "notify"   then exp_notify
     when "all"
       exp_token
       exp_priority
       exp_notify
+      exp_cpu_period
       exp_cpu_time
     when "launch-unelevated"
       split = ARGV.index("--") || raise "usage: launch-unelevated -- <command...>"

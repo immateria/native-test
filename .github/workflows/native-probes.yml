@@ -54,9 +54,11 @@ jobs:
 
       - name: Explore job-object behaviour
         if: always()
+        env:
+          EXPLORE_CPU_TRIALS: "6"
         run: |
           $exe = (Resolve-Path explore-out\job_explore.exe).Path
-          foreach ($e in "token", "priority", "notify", "cpu-time") {
+          foreach ($e in "token", "priority", "notify", "cpu-period", "cpu-time") {
             & $exe $e > "explore-out\windows-elevated-$e.jsonl" 2> "explore-out\windows-elevated-$e.err"
             "$e exit=$LASTEXITCODE"
           }
@@ -115,9 +117,11 @@ jobs:
 
       - name: Explore job-object behaviour (unelevated)
         if: always() && steps.selfcheck.outcome == 'success'
+        env:
+          EXPLORE_CPU_TRIALS: "6"
         run: |
           $exe = (Resolve-Path explore-out\job_explore.exe).Path
-          foreach ($e in "priority", "notify", "cpu-time") {
+          foreach ($e in "priority", "notify", "cpu-period", "cpu-time") {
             & $exe launch-unelevated -- $exe $e > "explore-out\windows-unelevated-$e.jsonl" 2> "explore-out\windows-unelevated-$e.err"
             "$e exit=$LASTEXITCODE"
           }

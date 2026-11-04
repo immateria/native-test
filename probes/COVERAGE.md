@@ -1,6 +1,6 @@
 # Revision 12 literal coverage ledger
 
-Revision 12 is bound to Crystal Process Development **checkpoint 0009** and contains **889 individually named behavioral checks**: **459 Windows Crystal**, **385 macOS Crystal**, and **45 independent macOS C/SDK** checks. The names below are the qualification authority used by the handback validator; a current-revision handback is incomplete if any expected name is absent.
+Revision 12 is bound to Crystal Process Development **checkpoint 0009** and contains **890 individually named behavioral checks**: **459 Windows Crystal**, **386 macOS Crystal**, and **45 independent macOS C/SDK** checks. The names below are the qualification authority used by the handback validator; a current-revision handback is incomplete if any expected name is absent.
 
 ## Windows Crystal — 459 cases
 
@@ -464,7 +464,7 @@ Revision 12 is bound to Crystal Process Development **checkpoint 0009** and cont
 - `r7_finite_wait_sequence_30ms_x8`
 - `r7_parent_immediate_job_limit_snapshot`
 
-## macOS Crystal — 385 cases
+## macOS Crystal — 386 cases
 
 - `identity_generation_equality_and_pid_reuse_model`
 - `pid_input_rejection_zero_negative_and_overflow`
@@ -851,6 +851,7 @@ Revision 12 is bound to Crystal Process Development **checkpoint 0009** and cont
 - `r8_native_c_zombie_holder_produces_signal_visible_unreaped_child`
 - `r7_unreaped_zombie_presence_is_not_false_dead`
 - `r7_kinfo_fallback_recovers_unreaped_zombie_and_generation`
+- `r13_group_signal_zombie_only_group_is_not_fatal`
 
 ## macOS independent SDK/C — 45 cases
 
