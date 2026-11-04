@@ -313,8 +313,10 @@ jobs:
           }
           pwsh -NoProfile -NonInteractive -File explore\windows\pwsh_native.ps1 -Probe $exe > "explore-out\$tag-pwsh_native.jsonl" 2> "explore-out\$tag-pwsh_native.err"
           "pwsh_native exit=$LASTEXITCODE"
+          exit 0
 
       - name: Session, runner service and crash-reporting settings
+        continue-on-error: true   # diagnostics only; must never skip the unelevated steps below
         run: |
           $out = "explore-out\windows-${{ matrix.runner }}-environment.txt"
           & {
@@ -339,6 +341,7 @@ jobs:
             "== service timeouts"; Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" | Select-Object WaitToKillServiceTimeout, ServicesPipeTimeout | Format-List | Out-String
           } *> $out
           Get-Content $out
+          exit 0   # pwsh steps end with the last native exit code (query session returns 1)
 
       # Windows on Arm runs x64 and x86 programs under emulation: build the same probe for both and compare
       # how jobs, limits and accounting treat an emulated child.
@@ -382,6 +385,7 @@ jobs:
           "elevated exit=$LASTEXITCODE"
           & $je launch-unelevated -- $je priority > "explore-out\windows-${{ matrix.runner }}-unelevated-job_explore_priority.jsonl" 2> "explore-out\windows-${{ matrix.runner }}-unelevated-job_explore_priority.err"
           "unelevated exit=$LASTEXITCODE"
+          exit 0
 
       # pwsh under the fixed de-elevated token (the first attempts predate the token owner/default-DACL fix).
       - name: pwsh native commands under the de-elevated token
@@ -395,6 +399,7 @@ jobs:
           & $je launch-unelevated -- $pwsh -NoProfile -NonInteractive -File $script -Probe $probe > "explore-out\windows-${{ matrix.runner }}-unelevated-pwsh_native.jsonl" 2> "explore-out\windows-${{ matrix.runner }}-unelevated-pwsh_native.err"
           "pwsh_native unelevated exit=$LASTEXITCODE"
           Get-Content "explore-out\windows-${{ matrix.runner }}-unelevated-pwsh_native.jsonl"
+          exit 0
 
       - name: Crystal Process on Windows (crystal_spawn_win)
         if: matrix.unelevated

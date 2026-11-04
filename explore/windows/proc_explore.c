@@ -1229,6 +1229,11 @@ static void probe_iobw(void) {
   iobw_case("iobw_4k_1048576_exactly_256_writes_per_s", 4096, 1048576, 2048, 0, setio);
   iobw_case("iobw_4k_1000000_retry", 4096, 1000000, 2048, 1, setio);
   iobw_case("iobw_64k_10485760_exactly_160_writes_per_s", 65536, 10485760, 1024, 0, setio);
+  /* which granularity matters: 1003520 = 245 x 4 KiB (not a multiple of 8 KiB), 1007616 = 123 x 8 KiB */
+  iobw_case("iobw_64k_1003520_multiple_of_4k_not_8k", 65536, 1003520, 256, 0, setio);
+  iobw_case("iobw_64k_1007616_multiple_of_8k", 65536, 1007616, 256, 0, setio);
+  iobw_case("iobw_4k_1003520_multiple_of_4k_not_8k", 4096, 1003520, 2048, 0, setio);
+  iobw_case("iobw_4k_1000000_noretry", 4096, 1000000, 2048, 0, setio);
 }
 
 /* ------------------------------------------------------------------ child-process policy */

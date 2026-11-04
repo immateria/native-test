@@ -574,6 +574,43 @@ static DWORD WINAPI svc_handler(DWORD ctl, DWORD type, LPVOID data, LPVOID ctx) 
   }
 }
 
+static wchar_t g_svc_dir[MAX_PATH * 2];
+
+/* In the service (session 0, outside the runner's job): crash a child plain, in a job with
+ * JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, and in a job without it; how long until each child is gone? */
+static void svc_crash_lab(void) {
+  for (int v = 0; v < 3; v++) {
+    wchar_t lp[MAX_PATH * 2], args[MAX_PATH * 3];
+    swprintf(lp, MAX_PATH * 2, L"%ls\\lab-%d.log", g_svc_dir, v);
+    swprintf(args, MAX_PATH * 3, L"--crash-now \"%ls\"", lp);
+    HANDLE job = NULL;
+    if (v > 0) {
+      job = CreateJobObjectW(NULL, NULL);
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION x;
+      memset(&x, 0, sizeof x);
+      x.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | (v == 1 ? JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION : 0);
+      SetInformationJobObject(job, JobObjectExtendedLimitInformation, &x, sizeof x);
+    }
+    PROCESS_INFORMATION pi;
+    DWORD e = 0;
+    if (!spawn_self(args, CREATE_SUSPENDED, NULL, &pi, &e)) { log_to(g_svc_log, "lab variant=%d spawn_err=%lu\n", v, (unsigned long)e); continue; }
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    WaitForSingleObject(pi.hProcess, 60000);
+    char b[256] = "";
+    read_text(lp, b, sizeof b);
+    double tc = -1;
+    char *q = strstr(b, "crash_at=");
+    if (q) sscanf(q + 9, "%lf", &tc);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    log_to(g_svc_log, "lab variant=%d exit_after_crash_ms=%.0f code=0x%08lx\n", v, tc > 0 ? exit_after(pi.hProcess, tc) : -1.0, (unsigned long)code);
+    kill_close(&pi);
+    if (job) CloseHandle(job);
+  }
+  log_to(g_svc_log, "lab_done t=%.3f\n", abs_ms());
+}
+
 static void WINAPI svc_main(DWORD argc, LPWSTR *argv) {
   (void)argc; (void)argv;
   g_ssh = RegisterServiceCtrlHandlerExW(L"probe", svc_handler, NULL);
@@ -605,6 +642,7 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv) {
   log_to(g_svc_log, "ready pid=%lu worker=%lu session=%lu worker_session=%lu in_job=%d worker_in_job=%d spawn_err=%lu t=%.3f\n", (unsigned long)GetCurrentProcessId(),
          (unsigned long)pi.dwProcessId, (unsigned long)sess, (unsigned long)wsess, (int)in_job, (int)w_in_job, (unsigned long)e, abs_ms());
   svc_status(SERVICE_RUNNING, 0);
+  if (wcscmp(g_svc_mode, L"crashlab") == 0) svc_crash_lab();
   WaitForSingleObject(g_svc_stop, INFINITE);
   log_to(g_svc_log, "stopped_reported t=%.3f\n", abs_ms());
   svc_status(SERVICE_STOPPED, 0);
@@ -612,6 +650,7 @@ static void WINAPI svc_main(DWORD argc, LPWSTR *argv) {
 
 static int service_entry(const wchar_t *mode, const wchar_t *dir) {
   wcsncpy(g_svc_mode, mode, 31);
+  wcsncpy(g_svc_dir, dir, MAX_PATH * 2 - 1);
   wchar_t lp[MAX_PATH * 2];
   swprintf(lp, MAX_PATH * 2, L"%ls\\svc.log", dir);
   g_svc_log = open_log(lp);
@@ -743,6 +782,18 @@ static int svc_start_ready(tsvc_t *s, const char *kase, ready_t *r, double *t_st
   return 1;
 }
 
+typedef struct { SC_HANDLE svc; DWORD ctl; BOOL ok; DWORD err; double t_ret; volatile LONG done; } ctl_call_t;
+static DWORD WINAPI ctl_thread(LPVOID p) {
+  ctl_call_t *c = (ctl_call_t *)p;
+  SERVICE_STATUS ss;
+  double t0 = abs_ms();
+  c->ok = ControlService(c->svc, c->ctl, &ss);
+  c->err = c->ok ? 0 : GetLastError();
+  c->t_ret = abs_ms() - t0;
+  InterlockedExchange(&c->done, 1);
+  return 0;
+}
+
 static void svc_case_stop(SC_HANDLE scm, const char *kase, const wchar_t *mode, int try_cross_session) {
   tsvc_t s;
   DWORD err;
@@ -753,17 +804,45 @@ static void svc_case_stop(SC_HANDLE scm, const char *kase, const wchar_t *mode, 
   double start_to_ready = r.t - t_start;
   HANDLE hs = open_proc(r.pid), hw = open_proc(r.worker);
   char cross[256] = "null";
-  if (try_cross_session && hw) {
+  if (try_cross_session) {
+    /* AssignProcessToJobObject needs PROCESS_SET_QUOTA | PROCESS_TERMINATE on the process */
+    HANDLE ha = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, r.worker);
+    DWORD oe = ha ? 0 : GetLastError();
     HANDLE j = CreateJobObjectW(NULL, NULL);
-    BOOL ok = AssignProcessToJobObject(j, hw);
-    snprintf(cross, sizeof cross, "{\"assign_worker_to_a_job_of_this_controller_ok\":%s,\"error\":%lu}", bstr(ok), ok ? 0UL : (unsigned long)GetLastError());
+    BOOL ok = ha && AssignProcessToJobObject(j, ha);
+    DWORD ae = ok ? 0 : GetLastError();
+    BOOL inj = FALSE;
+    if (ok) IsProcessInJob(ha, j, &inj);
+    snprintf(cross, sizeof cross, "{\"open_with_set_quota_error\":%lu,\"assign_session0_worker_to_session2_job_ok\":%s,\"error\":%lu,\"in_that_job_after\":%s}",
+             (unsigned long)oe, bstr(ok), (unsigned long)ae, bstr(inj));
     CloseHandle(j);
+    if (ha) CloseHandle(ha);
   }
   double t0 = abs_ms();
-  SERVICE_STATUS ss;
-  BOOL cok = ControlService(s.svc, SERVICE_CONTROL_STOP, &ss);
-  DWORD cerr = cok ? 0 : GetLastError();
-  double t_ret = abs_ms() - t0;
+  /* the control runs on a thread; meanwhile record every change of (service state, process alive) */
+  ctl_call_t cc;
+  memset(&cc, 0, sizeof cc);
+  cc.svc = s.svc;
+  cc.ctl = SERVICE_CONTROL_STOP;
+  HANDLE th = CreateThread(NULL, 0, ctl_thread, &cc, 0, NULL);
+  char timeline[1500] = "";
+  size_t tl = 0;
+  DWORD last_state = 0xFFFF;
+  int last_alive = -1;
+  while (!cc.done && abs_ms() - t0 < 400000) {
+    DWORD stn = svc_state(&s, NULL);
+    int alive = hs && WaitForSingleObject(hs, 0) != WAIT_OBJECT_0;
+    if ((stn != last_state || alive != last_alive) && tl < sizeof timeline - 64)
+      tl += (size_t)snprintf(timeline + tl, sizeof timeline - tl, "%s%.0fms:state%lu:%s", tl ? "," : "", abs_ms() - t0, (unsigned long)stn, alive ? "alive" : "gone");
+    last_state = stn;
+    last_alive = alive;
+    WaitForSingleObject(th, 100);
+  }
+  WaitForSingleObject(th, 30000);
+  CloseHandle(th);
+  BOOL cok = cc.ok;
+  DWORD cerr = cc.err;
+  double t_ret = cc.done ? cc.t_ret : -1;
   DWORD st_after_ret = svc_state(&s, NULL);
   double t_stopped = -1;
   for (int i = 0; i < 1000; i++) { if (svc_state(&s, NULL) == SERVICE_STOPPED) { t_stopped = abs_ms() - t0; break; } Sleep(10); }
@@ -781,15 +860,17 @@ static void svc_case_stop(SC_HANDLE scm, const char *kase, const wchar_t *mode, 
   }
   if (hs) WaitForSingleObject(hs, 10000);
   double svc_exit = exit_after(hs, t0);
+  DWORD svc_code = 0;
+  if (hs) GetExitCodeProcess(hs, &svc_code);
   Sleep(1000);
   int worker_alive = hw && WaitForSingleObject(hw, 0) != WAIT_OBJECT_0;
   double worker_exit = exit_after(hw, t0);
   emit(kase,
        "\"start_to_ready_ms\":%.0f,\"service_session\":%lu,\"worker_session\":%lu,\"service_in_job\":%d,\"worker_in_job\":%d,\"cross_session_assignment\":%s,"
        "\"control_stop_ok\":%s,\"control_error\":%lu,\"control_returned_after_ms\":%.0f,\"state_when_control_returned\":%lu,\"stopped_after_ms\":%.0f,"
-       "\"service_process_exit_after_ms\":%.0f,\"hung_process_alive_5s_after_timeout\":%d,\"terminate_to_stopped_ms\":%.0f,\"worker_alive_1s_after_service_exit\":%s,\"worker_exit_after_ms\":%.0f",
+       "\"service_process_exit_after_ms\":%.0f,\"service_exit_code\":\"0x%08lx\",\"timeline_while_control_pending\":\"%s\",\"hung_process_alive_5s_after_timeout\":%d,\"terminate_to_stopped_ms\":%.0f,\"worker_alive_1s_after_service_exit\":%s,\"worker_exit_after_ms\":%.0f",
        start_to_ready, (unsigned long)r.sess, (unsigned long)r.wsess, r.in_job, r.w_in_job, cross, bstr(cok), (unsigned long)cerr, t_ret, (unsigned long)st_after_ret, t_stopped,
-       svc_exit, alive_5s_after, term_to_stopped, bstr(worker_alive), worker_exit);
+       svc_exit, (unsigned long)svc_code, timeline, alive_5s_after, term_to_stopped, bstr(worker_alive), worker_exit);
   if (hs) CloseHandle(hs);
   if (hw) CloseHandle(hw);
   svc_cleanup(&s);
@@ -907,7 +988,9 @@ static int crash_now(const wchar_t *logpath) {
 }
 
 /* the same crash in an ordinary child in this (interactive) session, for comparison */
-static void plain_crash_case(const char *kase, int dumptype) {
+static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags);
+static void plain_crash_case(const char *kase, int dumptype) { plain_crash_case_flags(kase, dumptype, 0); }
+static void plain_crash_case_flags(const char *kase, int dumptype, DWORD flags) {
   wchar_t dir[MAX_PATH * 2], logp[MAX_PATH * 2], args[MAX_PATH * 3];
   swprintf(dir, MAX_PATH * 2, L"%ls\\plain-crash-%d", g_tmp, dumptype + 1);
   CreateDirectoryW(dir, NULL);
@@ -916,7 +999,9 @@ static void plain_crash_case(const char *kase, int dumptype) {
   swprintf(args, MAX_PATH * 3, L"--crash-now \"%ls\"", logp);
   PROCESS_INFORMATION pi;
   DWORD e;
-  if (!spawn_self(args, 0, NULL, &pi, &e)) { emit(kase, "\"spawn_error\":%lu", (unsigned long)e); set_local_dumps(-1, NULL); return; }
+  if (!spawn_self(args, flags, NULL, &pi, &e)) { emit(kase, "\"spawn_error\":%lu", (unsigned long)e); set_local_dumps(-1, NULL); return; }
+  BOOL child_in_job = FALSE;
+  IsProcessInJob(pi.hProcess, NULL, &child_in_job);
   int wer_max = 0;
   DWORD wer_sess = 0;
   wait_watching_wer(pi.hProcess, 60000, &wer_max, &wer_sess);
@@ -933,10 +1018,52 @@ static void plain_crash_case(const char *kase, int dumptype) {
   dumps_in(dir, &dumps, &mib);
   DWORD sess = 0;
   ProcessIdToSessionId(GetCurrentProcessId(), &sess);
-  emit(kase, "\"session\":%lu,\"local_dumps_type\":%d,\"process_exit_after_crash_ms\":%.0f,\"exit_code\":\"0x%08lx\",\"werfault_processes_seen\":%d,\"werfault_session_mask\":\"0x%lx\",\"dumps\":%d,\"dump_MiB\":%.1f",
-       (unsigned long)sess, dumptype, ex, (unsigned long)code, wer_max, (unsigned long)wer_sess, dumps, mib);
+  emit(kase, "\"session\":%lu,\"child_in_a_job\":%s,\"local_dumps_type\":%d,\"process_exit_after_crash_ms\":%.0f,\"exit_code\":\"0x%08lx\",\"werfault_processes_seen\":%d,\"werfault_session_mask\":\"0x%lx\",\"dumps\":%d,\"dump_MiB\":%.1f",
+       (unsigned long)sess, bstr(child_in_job), dumptype, ex, (unsigned long)code, wer_max, (unsigned long)wer_sess, dumps, mib);
   kill_close(&pi);
   set_local_dumps(-1, NULL);
+}
+
+static void svc_case_crashlab(SC_HANDLE scm, const char *kase, int dumptype) {
+  tsvc_t s;
+  DWORD err;
+  if (!svc_create(scm, &s, L"crashlab", &err)) { emit(kase, "\"create_error\":%lu", (unsigned long)err); return; }
+  set_local_dumps(dumptype, s.dir);
+  ready_t r;
+  double t_start;
+  if (!svc_start_ready(&s, kase, &r, &t_start)) { set_local_dumps(-1, NULL); return; }
+  static char buf[32768];
+  double end = abs_ms() + 120000;
+  while (abs_ms() < end) { if (read_text(s.log, buf, sizeof buf) > 0 && strstr(buf, "lab_done")) break; Sleep(100); }
+  char res[600] = "";
+  size_t l = 0;
+  static const char *names[] = {"no_job", "job_with_DIE_ON_UNHANDLED_EXCEPTION", "job_without_it"};
+  for (int v = 0; v < 3; v++) {
+    char key[32];
+    snprintf(key, sizeof key, "lab variant=%d ", v);
+    char *q = strstr(buf, key);
+    double ms = -1;
+    unsigned long code = 0;
+    if (q) sscanf(q + strlen(key), "exit_after_crash_ms=%lf code=0x%lx", &ms, &code);
+    l += (size_t)snprintf(res + l, sizeof res - l, "%s\"%s\":{\"exit_after_crash_ms\":%.0f,\"exit_code\":\"0x%08lx\"}", v ? "," : "", names[v], ms, code);
+  }
+  int dumps = 0;
+  double mib = 0;
+  dumps_in(s.dir, &dumps, &mib);
+  emit(kase, "\"where\":\"children of a session-0 service, outside the runner's job\",\"local_dumps_type\":%d,%s,\"dumps\":%d,\"dump_MiB\":%.1f", dumptype, res, dumps, mib);
+  svc_cleanup(&s);
+  set_local_dumps(-1, NULL);
+}
+
+static void runner_job(void) {
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION x;
+  memset(&x, 0, sizeof x);
+  BOOL ok = QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation, &x, sizeof x, NULL); /* NULL = the caller's job */
+  DWORD e = ok ? 0 : GetLastError();
+  DWORD f = x.BasicLimitInformation.LimitFlags;
+  emit("runner_job_of_this_process", "\"query_ok\":%s,\"error\":%lu,\"limit_flags\":\"0x%lx\",\"die_on_unhandled_exception\":%s,\"breakaway_ok\":%s,\"silent_breakaway_ok\":%s,\"kill_on_job_close\":%s",
+       bstr(ok), (unsigned long)e, (unsigned long)f, bstr((f & JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION) != 0), bstr((f & JOB_OBJECT_LIMIT_BREAKAWAY_OK) != 0),
+       bstr((f & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) != 0), bstr((f & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0));
 }
 
 static void reg_dword(HKEY root, const wchar_t *path, const wchar_t *name, char *out, size_t n) {
@@ -964,6 +1091,7 @@ static void probe_services(void) {
   reg_dword(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\Consent", L"DefaultConsent", f, sizeof f);
   emit("services_context", "\"elevated\":%s,\"wer_disabled\":%s,\"wer_dont_show_ui\":%s,\"wer_consent_default\":%s,\"global_local_dumps_type\":%s,\"WaitToKillServiceTimeout\":%s,\"ServicesPipeTimeout\":%s",
        bstr(is_elevated()), a, b, f, c, d, e2);
+  runner_job();
   int dbg = enable_privilege(L"SeDebugPrivilege");
   SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT);
   if (!scm) { emit("services_unavailable", "\"open_scm_error\":%lu,\"debug_privilege\":%d", (unsigned long)GetLastError(), dbg); return; }
@@ -976,10 +1104,13 @@ static void probe_services(void) {
   svc_case_failure(scm, "service_exitprocess_without_reporting_stopped", SVC_CTL_EXIT, 0, -1);
   svc_case_failure(scm, "service_reports_stopped_with_error_noncrash_flag_off", SVC_CTL_FAILSTOP, 0, -1);
   svc_case_failure(scm, "service_reports_stopped_with_error_noncrash_flag_on", SVC_CTL_FAILSTOP, 1, -1);
+  svc_case_crashlab(scm, "crash_lab_no_local_dumps", -1);
+  svc_case_crashlab(scm, "crash_lab_minidump", 1);
   CloseServiceHandle(scm);
   plain_crash_case("interactive_child_crash_no_local_dumps", -1);
   plain_crash_case("interactive_child_crash_minidump", 1);
   plain_crash_case("interactive_child_crash_full_dump", 2);
+  plain_crash_case_flags("interactive_child_crash_breakaway_from_runner_job_minidump", 1, CREATE_BREAKAWAY_FROM_JOB);
 }
 
 /* ================================================================== exitproc */
