@@ -605,9 +605,30 @@ The probe builds `probe -> A -> {A1, X -> D}` where `X` exits at once (`D` is re
 
 Only the environment tag finds a daemonized orphan without a cgroup. It works only for programs that were `exec`ed
 with the tag (a bare `fork` keeps the parent's original environment area) and only for processes of the same user
-(`EACCES` for other users' on Linux; macOS returned an error for ~half of the process list, mostly other users' and
-zombies). Start times are available for pid-reuse checks: microseconds on macOS (`pbi_start_tvsec/usec`), 10 ms ticks on
+(`EACCES` for the other users' processes on Linux, 158–164 of ~170; on macOS `KERN_PROCARGS2` failed with `EINVAL` — never
+`EPERM` — for 190–260 of the 410–510 listed processes). Start times are available for pid-reuse checks: microseconds on macOS (`pbi_start_tvsec/usec`), 10 ms ticks on
 Linux (`/proc/<pid>/stat` field 22).
+
+### Memory limits on macOS (verified; macOS 14, 15 Intel, 26 — macOS 15 arm64's upload failed)
+
+(The first CI run of this probe measured nothing: the compiler removed `malloc` + `memset` of memory that was never read,
+so the child never used the 256 MiB it reported. The pointers are now kept in a volatile array. Worth remembering for any
+memory test.)
+
+* **`RLIMIT_RSS` cannot be set**: `setrlimit` fails `EINVAL` (hard limit is infinity); a child that wanted 64 MiB
+  then touched 256 MiB and stayed resident. `RLIMIT_AS`/`DATA` were already known to be rejected below current usage.
+* **The footprint is honest**: `proc_pid_rusage(RUSAGE_INFO_CURRENT).ri_phys_footprint` counted a 128 MiB `memset` of one
+  repeated byte in full (128.3–128.9 MiB) and still did 1.5 s later — no compressor shortcut — and 257 MiB after a second
+  128 MiB of random data; resident size agrees.
+* **Polling works fine as a memory cap.** A supervisor polling every millisecond (0.007–0.019 ms per call, ~100 polls)
+  saw a child cross 256 MiB (8 MiB steps every 3 ms) **0.6–4.6 ms after the step that crossed it**, killed it, and had it
+  reaped 3.6–13 ms later; the child had reached 256 MiB, i.e. overshoot of one step.
+* **The kernel's own limit needs root.** `memorystatus_control` (private, found with `dlsym`) as the runner user:
+  `EPERM` for `SET_MEMLIMIT_PROPERTIES` and even for `GET_MEMLIMIT_PROPERTIES` on the process itself. **As root (the
+  runners allow `sudo`) setting a fatal 64 MB limit on itself worked and the kernel killed the process with `SIGKILL`**
+  after it had reported 56 MiB (the next 8 MiB step crossed the limit), 55–142 ms after the start. `SET_JETSAM_TASK_LIMIT`
+  (command 6, flags = MB) failed `EINVAL` for root; the arguments may be wrong. A supervisor that is not root has to poll
+  and kill; one that runs as root can also let the kernel do it.
 
 ### Process creation at scale (verified)
 
