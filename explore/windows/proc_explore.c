@@ -840,6 +840,35 @@ static int child_io(const wchar_t *mode, const wchar_t *path, int size, int flag
 
 typedef struct { const char *name; const wchar_t *mode; int size, flags; LONG64 max_iops, max_bw; ULONG base; } io_case_t;
 
+/* overwrite in place and keep going after failures; one log line per elapsed second */
+static int child_io_log(const wchar_t *path, int size, const wchar_t *logpath) {
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 2;
+  HANDLE log = open_log(logpath);
+  void *buf = VirtualAlloc(NULL, (SIZE_T)size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  memset(buf, 'w', (size_t)size);
+  LARGE_INTEGER fsz;
+  GetFileSizeEx(h, &fsz);
+  LONGLONG pos = 0;
+  double t0 = abs_ms(), next = t0 + 1000, first_fail = -1;
+  unsigned long ok = 0, fail = 0, last_err = 0;
+  for (;;) {
+    if (pos + size > fsz.QuadPart) pos = 0;
+    LARGE_INTEGER li;
+    li.QuadPart = pos;
+    SetFilePointerEx(h, li, NULL, FILE_BEGIN);
+    pos += size;
+    DWORD n;
+    if (WriteFile(h, buf, (DWORD)size, &n, NULL)) ok++;
+    else { fail++; last_err = GetLastError(); if (first_fail < 0) first_fail = abs_ms() - t0; }
+    double now = abs_ms();
+    if (now >= next) {
+      log_to(log, "t=%.0f ok=%lu fail=%lu last_err=%lu first_fail=%.0f\n", now - t0, ok, fail, last_err, first_fail);
+      next += 1000;
+    }
+  }
+}
+
 static void prefill(const wchar_t *path, LONGLONG bytes) {
   HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return;
@@ -973,6 +1002,42 @@ static void probe_iorate(void) {
     io_run(c, 0, setio, path, 1500, free_, sizeof free_);
     emit(c->name, "\"max_iops\":%lld,\"max_bandwidth\":%lld,\"base_io_size\":%lu,\"io_size\":%d,\"limited\":{%s},\"unlimited\":{%s}", (long long)c->max_iops, (long long)c->max_bw,
          (unsigned long)c->base, c->size, lim, free_);
+  }
+
+  /* bandwidth limits: does the write after the first second's budget fail once, or keep failing? */
+  struct { const char *name; int size; LONG64 iops, bw; } bws[] = {
+    {"iorate_bandwidth_1MB_64k_timeline", 65536, 0, 1000000},
+    {"iorate_bandwidth_1MB_with_iops_1000_64k_timeline", 65536, 1000, 1000000},
+    {"iorate_bandwidth_10MB_64k_timeline", 65536, 0, 10000000},
+    {"iorate_bandwidth_1MB_4k_timeline", 4096, 0, 1000000},
+  };
+  for (size_t i = 0; i < sizeof bws / sizeof bws[0]; i++) {
+    HANDLE j = CreateJobObjectW(NULL, NULL);
+    MY_IO_RATE r;
+    memset(&r, 0, sizeof r);
+    r.MaxIops = bws[i].iops;
+    r.MaxBandwidth = bws[i].bw;
+    r.ControlFlags = 1;
+    DWORD sret = setio(j, &r);
+    wchar_t lg[MAX_PATH * 2], ln[64], args[1024];
+    swprintf(ln, 64, L"iobw-%d.log", (int)i);
+    tmp_file(lg, MAX_PATH * 2, ln);
+    DeleteFileW(lg);
+    swprintf(args, 1024, L"--child-io-log \"%ls\" %d \"%ls\"", fpre, bws[i].size, lg);
+    PROCESS_INFORMATION pi;
+    DWORD e = 0;
+    if (!spawn_self(args, CREATE_SUSPENDED, NULL, &pi, &e)) { emit(bws[i].name, "\"spawn_error\":%lu", (unsigned long)e); CloseHandle(j); continue; }
+    AssignProcessToJobObject(j, pi.hProcess);
+    ResumeThread(pi.hThread);
+    Sleep(6500);
+    int ended = WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0;
+    char b[2048] = "";
+    read_text(lg, b, sizeof b);
+    for (char *q = b; *q; q++) if (*q == '\n') *q = '|'; else if (*q == '\r') *q = ' ';
+    emit(bws[i].name, "\"max_iops\":%lld,\"max_bandwidth\":%lld,\"io_size\":%d,\"set_return\":%lu,\"child_ended\":%s,\"per_second_cumulative\":\"%s\"",
+         (long long)bws[i].iops, (long long)bws[i].bw, bws[i].size, (unsigned long)sret, bstr(ended), b);
+    kill_close(&pi);
+    CloseHandle(j);
   }
   DeleteFileW(fpre);
   DeleteFileW(fapp);
@@ -1269,6 +1334,7 @@ int main(void) {
   if (argc >= 3 && wcscmp(argv[1], L"--child-crash") == 0) return child_crash(_wtoi(argv[2]));
   if (argc >= 4 && wcscmp(argv[1], L"--child-write") == 0) return child_write(argv[2], _wtoi(argv[3]));
   if (argc >= 6 && wcscmp(argv[1], L"--child-io") == 0) return child_io(argv[2], argv[3], _wtoi(argv[4]), _wtoi(argv[5]));
+  if (argc >= 5 && wcscmp(argv[1], L"--child-io-log") == 0) return child_io_log(argv[2], _wtoi(argv[3]), argv[4]);
   if (argc >= 3 && wcscmp(argv[1], L"--child-spawn-try") == 0) return child_spawn_try(argv[2]);
   if (argc >= 5 && wcscmp(argv[1], L"--sender") == 0) return child_sender(argv[2], (DWORD)_wtoi(argv[3]), argv[4]);
   if (argc >= 4 && wcscmp(argv[1], L"--child-debugger") == 0) return child_debugger(argv[2], _wtoi(argv[3]));
