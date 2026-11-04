@@ -67,6 +67,10 @@ r12's validator accepts the lane). Native exploration (`explore/`) then explaine
   resuming, terminating). `r6_priority_applied_high` enables the privilege when the token holds it, verifies the
   state by reading the token, restores it afterwards, and expects success; a token that does not hold it (the
   unelevated run) is expected to get 1314. Its details record `privilege_before`/`privilege_during`.
+* The fault-injection helpers (`job_checked_close_failure_surfaces` and siblings) close a handle behind the library's
+  back so its own `CloseHandle` fails; Windows reuses handle values at once, so another thread can take the number
+  first and the library's close then succeeds (`unexpected_success`, seen once in ten runs, only in the unelevated
+  run). `run_fault_helper` now retries up to five times and records `attempts`.
 * `handle_allowlist_blocks_unrelated_inheritable_event` passed elevated and failed unelevated with
   `wrongly_inherited: true`, but only because the check treated "some valid handle has this number in the child" as
   inheritance, and a filtered-token child owns different handles. The event is now created signaled and the child

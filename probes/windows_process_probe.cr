@@ -452,14 +452,14 @@ module NativeProbe
     state
   end
 
-  # Enables or disables SeIncreaseBasePriorityPrivilege on the process token. Returns true when the adjustment
-  # took effect (false when the token does not hold the privilege: ERROR_NOT_ALL_ASSIGNED).
-  def self.set_se_increase_base_priority(enabled : Bool) : Bool
+  # Enables or disables SeIncreaseBasePriorityPrivilege on the process token and reports what the OS said:
+  # "adjust_rc=<BOOL> err=<GetLastError, 1300 = ERROR_NOT_ALL_ASSIGNED> state=<absent|disabled|enabled>".
+  def self.set_se_increase_base_priority(enabled : Bool) : String
     token = LibC::HANDLE.null
-    return false if WindowsProbeExtra.OpenProcessToken(WindowsProbeNative.GetCurrentProcess, 0x28_u32, pointerof(token)) == 0 # ADJUST_PRIVILEGES | QUERY
+    return "open_failed:#{LibC.GetLastError}" if WindowsProbeExtra.OpenProcessToken(WindowsProbeNative.GetCurrentProcess, 0x28_u32, pointerof(token)) == 0 # ADJUST_PRIVILEGES | QUERY
     luid = 0_u64
     name = "SeIncreaseBasePriorityPrivilege".to_utf16
-    ok = false
+    result = "lookup_failed"
     if WindowsProbeExtra.LookupPrivilegeValueW(Pointer(UInt16).null, name.to_unsafe, pointerof(luid)) != 0
       state = uninitialized UInt8[16] # TOKEN_PRIVILEGES with one entry: u32 count, u32 luid low, i32 luid high, u32 attributes
       pointer = state.to_unsafe
@@ -467,10 +467,13 @@ module NativeProbe
       (pointer + 4).as(Pointer(UInt32)).value = (luid & 0xffff_ffff_u64).to_u32
       (pointer + 8).as(Pointer(Int32)).value = (luid >> 32).to_i32
       (pointer + 12).as(Pointer(UInt32)).value = enabled ? 0x2_u32 : 0_u32
-      WindowsProbeExtra.AdjustTokenPrivileges(token, 0, pointer.as(Void*), 0_u32, Pointer(Void).null, Pointer(UInt32).null)
+      rc = WindowsProbeExtra.AdjustTokenPrivileges(token, 0, pointer.as(Void*), 0_u32, Pointer(Void).null, Pointer(UInt32).null)
+      result = "adjust_rc=#{rc} err=#{LibC.GetLastError}"
+    else
+      result = "lookup_failed:#{LibC.GetLastError}"
     end
     LibC.CloseHandle(token)
-    se_increase_base_priority_state == (enabled ? "enabled" : "disabled")
+    "#{result} state=#{se_increase_base_priority_state}"
   end
 
   def self.priority_checkpoint(label : String) : Nil
@@ -598,7 +601,22 @@ module NativeProbe
      write_bytes: info.io_write_bytes, write_limit: info.io_write_bytes_limit}
   end
 
+  # The fault helpers inject a failure by closing a handle behind the library's back, so the library's own
+  # CloseHandle fails. Windows reuses handle values at once: if another thread of the helper takes the number
+  # first, that close succeeds and the helper reports "unexpected_success". That is a race in the injection,
+  # not a library result, so retry (observed once in ten native runs).
   def self.run_fault_helper(kind : String) : Hash(String, JSON::Any)
+    payload = run_fault_helper_once(kind)
+    attempts = 1
+    while payload["result"]?.try(&.as_s?) == "unexpected_success" && attempts < 6
+      payload = run_fault_helper_once(kind)
+      attempts += 1
+    end
+    payload["attempts"] = JSON::Any.new(attempts.to_i64)
+    payload
+  end
+
+  def self.run_fault_helper_once(kind : String) : Hash(String, JSON::Any)
     marker = File.join(workdir, "win-fault-#{kind}-#{Process.pid}-#{Random.rand(1_000_000)}.json")
     child = Process.new(self_exe, ["--child", "fault-case", kind, marker])
     reaped = false
@@ -5284,14 +5302,15 @@ module NativeProbe
       # the caller enables it first (measured: a fresh process fails with 1314 for all three request shapes).
       # A token that does not hold it at all (unelevated / standard user) is rejected regardless.
       before = se_increase_base_priority_state
-      enabled = before == "disabled" && set_se_increase_base_priority(true)
+      adjust = before == "disabled" ? set_se_increase_base_priority(true) : "not_attempted"
+      enabled = adjust.includes?("state=enabled")
       during = se_increase_base_priority_state
       begin
         passed, data = probe_priority_applied(ProcessSupervision::Windows::Job::PriorityClass::High, "r6_high")
-        {passed, data.merge(details(privilege_before: before, privilege_during: during))}
+        {passed, data.merge(details(privilege_before: before, privilege_during: during, privilege_adjust: adjust))}
       rescue ex : ProcessSupervision::Error::Native
         {ex.native_code == 1314 && before == "absent",
-         details(outcome: "native_rejected:#{ex.native_code}", privilege_before: before, privilege_during: during,
+         details(outcome: "native_rejected:#{ex.native_code}", privilege_before: before, privilege_during: during, privilege_adjust: adjust,
            note: before == "absent" ? "token does not hold the privilege: 1314 is expected" : "token holds the privilege but the request was rejected")}
       ensure
         set_se_increase_base_priority(false) if enabled

@@ -388,6 +388,7 @@ module Explore
         emit("priority_enable_privilege") { |j| j.field "adjusted", ok; j.field "last_error", err }
       end
       PRIORITY_CLASSES.each do |name, value|
+        emit("priority_trace") { |j| j.field "phase", phase; j.field "before_class", name; j.field "high_job_request", high_request_outcome }
         # {info class, extra limit flags}: basic, extended, and extended + KILL_ON_JOB_CLOSE (what the kit sends)
         [{CLASS_BASIC_LIMIT, 0_u32}, {CLASS_EXTENDED_LIMIT, 0_u32}, {CLASS_EXTENDED_LIMIT, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE}].each do |info_class, extra|
           job = new_job
@@ -442,6 +443,7 @@ module Explore
         err = rc == 0 ? LibC.GetLastError : 0_u32
         WX.SetPriorityClass(WX.GetCurrentProcess, original)
         emit("priority_self") { |j| j.field "phase", phase; j.field "class", name; j.field "set_ok", rc != 0; j.field "set_error", err }
+        emit("priority_trace") { |j| j.field "phase", phase; j.field "after_class", name; j.field "high_job_request", high_request_outcome }
       end
     end
     exp_priority_caller
