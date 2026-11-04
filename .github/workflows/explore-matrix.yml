@@ -83,6 +83,15 @@ jobs:
           ./explore-out/build/kqueue_zombie > "explore-out/$tag-kqueue_zombie.jsonl"
           wc -l explore-out/*.jsonl
 
+      - name: macOS memory limits (as the runner user, then as root)
+        if: runner.os == 'macOS'
+        run: |
+          tag="posix-$(uname -s)-$(uname -m)"
+          cc -O1 -Wall -Wextra -o explore-out/build/memory_limits explore/macos/memory_limits.c
+          ./explore-out/build/memory_limits > "explore-out/$tag-memory_limits.jsonl" || true
+          sudo -n ./explore-out/build/memory_limits > "explore-out/$tag-memory_limits-root.jsonl" || true
+          wc -l explore-out/*memory_limits*.jsonl
+
       # Ubuntu 22.04 (glibc 2.35, kernel 6.8) gave EPERM from posix_spawn under RLIMIT_NPROC, 24.04 (glibc 2.39,
       # kernel 7.0) EAGAIN. Run the case with both releases' glibc on this runner's kernel to see which one matters.
       # seccomp is unconfined because Docker's default profile changes how glibc can create the child (clone3).
