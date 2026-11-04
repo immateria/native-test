@@ -74,7 +74,8 @@ static pid_t spawn_writer(long total, int out_fd, int ignore_sigpipe, int close_
   pid_t p = fork();
   if (p == 0) {
     if (close_fd >= 0) close(close_fd);
-    if (ignore_sigpipe) signal(SIGPIPE, SIG_IGN);
+    /* explicit both ways: CI runners start every step with SIGPIPE already ignored */
+    signal(SIGPIPE, ignore_sigpipe ? SIG_IGN : SIG_DFL);
     dup2(out_fd, 1);
     char t[32];
     snprintf(t, sizeof t, "%ld", total);
@@ -243,6 +244,9 @@ int main(int argc, char **argv) {
   if (argc > 2 && strcmp(argv[1], "--closed-stdio") == 0) return child_closed_stdio(argv[2]);
   watchdog(60);
   emit_header(PROBE);
+  struct sigaction cur;
+  sigaction(SIGPIPE, NULL, &cur);
+  emit(PROBE, "inherited_sigpipe_disposition", "\"sigpipe\":\"%s\"", cur.sa_handler == SIG_IGN ? "ignored" : cur.sa_handler == SIG_DFL ? "default" : "handler");
   exp_capacity();
   exp_blocked_writer_and_deadlock();
   exp_reader_closes(0, 0);

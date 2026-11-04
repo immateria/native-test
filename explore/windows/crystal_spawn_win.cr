@@ -58,6 +58,7 @@ rescue ex
   j.field "is_File_BadExecutableError", ex.is_a?(File::BadExecutableError)
   j.field "is_File_Error", ex.is_a?(File::Error)
   j.field "message", ex.message
+  j.field "os_error", ex.as?(IO::Error).try(&.os_error).try { |e| "#{e} (#{e.value})" }
 end
 
 # ---- child modes -------------------------------------------------------------------------------------------------
