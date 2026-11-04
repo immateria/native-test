@@ -57,16 +57,36 @@ Not when a limit is crossed. Microsoft only says the system "periodically checks
   REALTIME give 1314 there from every caller priority class, while ABOVE_NORMAL and below are accepted.
 * Microsoft's docs say "must enable"; a Stack Overflow report fixed the same 1314 by enabling it. The caller's own
   priority class is irrelevant.
-* **Unexplained:** inside my exploration program, HIGH requests in one loop iteration reported success while
-  `priority_trace` calls bracketing that iteration reported 1314. It sits in the tool, not the kit, and I did not find
-  the cause.
+* **The "in-loop HIGH success" was a bug in my exploration tool** (explained; the earlier text called it
+  unexplained). In `job_explore.cr` one local variable was assigned a `JOBOBJECT_BASIC_LIMIT_INFORMATION` in one branch
+  and a `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` in the other, so Crystal typed it as a union, and `pointerof` on a
+  local binds to the variable's full type (`semantic/main_visitor.cr`, `pointerof_var`). A Crystal union of two structs
+  is stored as a 4-byte type id, padding, then the value at offset 8 (`codegen/unions.cr`), so `SetInformationJobObject`
+  received everything shifted by 8 bytes and read `LimitFlags` from the zeroed `PerJobUserTimeLimit`: it installed no
+  limit at all and "succeeded" for every class, HIGH included. **Reproduced in C on all three Windows builds**
+  (`win_more priority`, run `41886046710`): the same HIGH request shifted by 8 bytes returns success and the job reads
+  back `LimitFlags 0x0`, while the correct request fails with 1314 until the privilege is enabled and then installs
+  `0x20` / `0x80`. The kit and its probe do not contain the pattern (every `pointerof` site was checked); the tool now
+  uses two differently named locals. Lesson for Crystal FFI: never take `pointerof` of a variable that is assigned
+  more than one type in its method.
 
-### A job priority class is applied to a process created *into* the job, not to one assigned afterwards (verified, once)
+### A job priority class and affinity apply at assignment and when set on a populated job (verified; corrects an earlier claim)
 
-The kit creates its child inside the job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) and the class applies (idle `0x40`, normal
-`0x20`, above-normal `0x8000` as set). The exploration created a suspended child and called
-`AssignProcessToJobObject`: the class read `0x4000` before assignment, right after it, and while running, for every
-class and every flag combination.
+An earlier version of this file said the class applied only to a process created *into* the job. That came from the
+buggy loop above, which never installed a limit, so it is withdrawn. Measured with C (`win_more priority`, run
+`41886046710`, Server 2022, Server 2025 and Windows 11 arm64, elevated), for idle, below-normal, normal, above-normal and
+high (high with the privilege enabled), each with an affinity limit of CPU 0:
+
+| how the child joins | class and affinity |
+|---|---|
+| created inside the job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`), read before it resumes | the job's, from creation |
+| created suspended, then `AssignProcessToJobObject` | inherited `0x4000` / `0xf` before; **the job's immediately after the call**, still suspended |
+| running in a job without limits, then the limit is set on the job | **the job's immediately after `SetInformationJobObject`** |
+
+The values stayed the same 100 ms and 1.1 s later. This matches the Windows Research Kernel, whose assignment path calls
+`PspApplyJobLimitsToProcess` and whose setter walks the existing members (`PspApplyJobLimitsToProcessSet`). Unlike the CPU
+time limits, these are not deferred to the 7-second pass. `JOB_OBJECT_LIMIT_SCHEDULING_CLASS` 0, 5 and 9 were accepted
+and read back (9 with the privilege enabled); its effect on quantum length was not observed.
 
 ### Hosted runner facts (verified)
 
@@ -561,6 +581,16 @@ Eight POSIX runners (runs `41805839970`, `41807338781`, `41808488438`). Identica
   not on macOS**: the already-pending signal stayed undelivered for a full second after the worker unblocked it; a
   *new* signal sent afterwards was delivered to that worker (and counted once). A macOS program that blocks a signal
   everywhere and later enables it on a worker only can lose the wake-up it was waiting for.
+* **Why (explained from XNU, confirmed by measurement):** XNU keeps pending signals per thread (`uu_siglist`). For a
+  process-directed signal, `get_signalthread()` looks for a thread that does not block it; when every thread blocks it,
+  `get_signalact()` picks the first thread of the task and the signal is parked in **that thread's** pending set
+  (`bsd/kern/kern_sig.c`, `osfmk/kern/bsd_kern.c`). `__pthread_sigmask(SIG_UNBLOCK)` only re-checks the calling
+  thread, and `sigpending()` returns only the caller's set. Measured on all five macOS runners (run `41886046710`,
+  `parked_signal_collected_by_worker_sigwait`): the main thread's `sigpending` shows the signal, a worker's does not.
+  **But `sigwait()` scans every thread's set** (`__sigwait_nocancel` walks `p_uthlist`): a worker calling `sigwait`
+  received the parked signal at once (0.0 ms, no second signal needed) and the main thread's pending bit was cleared.
+  On Linux the signal sits in the process-wide set and both threads see it. So on macOS a dedicated signal thread must
+  use `sigwait` (or kqueue `EVFILT_SIGNAL` / `EVFILT_PROC`), not unblock-and-wait-for-the-handler.
 * **A blocking `read` is interrupted only if the thread that blocks in it takes the signal**: main unblocked, workers
   blocked: `EINTR` after 100 ms; main blocked and a worker unblocked: the handler ran in the worker and `read` kept
   waiting (returned the data 300 ms later). With `SA_RESTART` the read restarts. Identical on both.
@@ -583,12 +613,30 @@ The child wrote a timestamp and then faulted; the table is the time until the pi
 | status | `signaled(SIGSEGV)` | `signaled(SIGSEGV,core)` — the core flag is set although `RLIMIT_CORE` was 0 |
 | crash reports | `ReportCrash` wrote 4–5 `.ips` reports under `~/Library/Logs/DiagnosticReports` within 3 s, **asynchronously: it did not delay the exit** | none |
 
-So on the Ubuntu runners a core-dumping signal (measured: a `SIGSEGV` fault, `SIGSEGV` sent with `kill`, `abort`, the
-trap instruction; the others on the default-core list, `QUIT`, `FPE`, `BUS`, `XCPU`, were not measured) keeps the process
-alive for tens of milliseconds while `systemd-coredump` reads the dump, even with a core limit of zero; `SIGKILL` is not
-affected. A supervisor that stops a child with `SIGQUIT` would pay that delay, and tests that assert on the instant a
-crashed child disappears must allow ~200 ms. The `__builtin_trap`
-instruction raises `SIGTRAP` on arm64 (macOS, Linux) and `SIGILL` on x86.
+So on the Ubuntu runners a core-dumping signal keeps the process alive for tens of milliseconds while
+`systemd-coredump` reads the dump, even with a core limit of zero; `SIGKILL` is not affected. Tests that assert on the
+instant a crashed child disappears must allow ~200 ms. The `__builtin_trap` instruction raises `SIGTRAP` on arm64
+(macOS, Linux) and `SIGILL` on x86.
+
+**Why a core limit of 0 does not help, and what does** (run `41886046710`, all three Ubuntu runners, 3–5 trials each):
+
+* The runners' `core_pattern` is `|/usr/lib/systemd/systemd-coredump %P %u %g %s %t 9223372036854775808 %h %d`: the
+  sixth argument, where upstream systemd passes `%c` (the crashing process's core limit), is the **literal 2^63**
+  (Debian/Ubuntu packaging). For a piped pattern the kernel runs the helper whatever `RLIMIT_CORE` is (it uses
+  `RLIM_INFINITY` for the pipe writer, `fs/coredump.c`), and the collector never learns that the limit was 0.
+  `core_pipe_limit` is **16** on all three images (not 0), so the kernel also waits for the helper to close the pipe.
+* **Every core-dumping signal pays it:** `SIGQUIT` (raised), `SIGFPE` (integer division by zero on x86; raised on
+  arm64, where division by zero does not trap), `SIGBUS` (touching a mapping after `ftruncate`), `SIGXCPU`
+  (`RLIMIT_CPU` 1 s), `SIGSYS`: 93–113 ms (22.04, 24.04 x64) and 57–62 ms (24.04 arm64), the same as `SIGSEGV`. A
+  supervisor that stops children with `SIGQUIT` pays it on every stop.
+* **Two per-child opt-outs skip the helper entirely:** soft `RLIMIT_CORE` of **exactly 1 byte** (the kernel's
+  recursion guard for the helper itself: "has RLIMIT_CORE set to 1 / Aborting core", one such pair in the kernel log
+  per crash, 8 lines for 8 crashes), and `prctl(PR_SET_DUMPABLE, 0)` in the child: 0.1–1.5 ms, status without the
+  core flag. The `RLIMIT_CORE=1` setting survives `exec`; **dumpability does not** — `linux_extras` set it to 0 before
+  `execve` and the new program read back 1 (`fs/exec.c` resets it), so only a child that sets it itself can use it.
+* **A large core takes long, and `SIGKILL` cuts it short:** with 384 MiB dirtied, the crash took 605–887 ms to reach
+  `waitpid`; `SIGKILL` sent 20 ms after the fault ended it at 42–51 ms (status `SIGKILL`; `coredumpctl` kept a 4 KiB
+  truncated core). The interrupt checks are `dump_interrupted()` / `fatal_signal_pending()` in `fs/coredump.c`.
 
 ### Finding the descendants of a process without groups or cgroups (verified, identical on all eight)
 
@@ -615,8 +663,14 @@ Linux (`/proc/<pid>/stat` field 22).
 so the child never used the 256 MiB it reported. The pointers are now kept in a volatile array. Worth remembering for any
 memory test.)
 
-* **`RLIMIT_RSS` cannot be set**: `setrlimit` fails `EINVAL` (hard limit is infinity); a child that wanted 64 MiB
-  then touched 256 MiB and stayed resident. `RLIMIT_AS`/`DATA` were already known to be rejected below current usage.
+* **`RLIMIT_RSS` is not a resident-size limit on Darwin: it is an alias of `RLIMIT_AS`** (`bsd/sys/resource.h`:
+  `#define RLIMIT_RSS RLIMIT_AS /* source compatibility alias */`). The earlier "cannot be set" was the address-space
+  limit refusing a value below the current virtual size: `setrlimit` fails `EINVAL` for 64 MiB, and for half the virtual
+  size. A process's virtual size is **~392–415 GiB on arm64** and ~33 GiB on Intel (shared cache and reservations), so
+  `RLIMIT_AS` = current virtual size + 256 MiB **is accepted** and then refuses address space: within it a 128 MiB
+  `malloc` worked, a 512 MiB `malloc` and a 512 MiB `PROT_NONE` reservation failed with `ENOMEM` (all five runners,
+  user and root, run `41886046710`). It caps reservations, not footprint, and only relative to a virtual size the
+  supervisor cannot know for an exec'd program.
 * **The footprint is honest**: `proc_pid_rusage(RUSAGE_INFO_CURRENT).ri_phys_footprint` counted a 128 MiB `memset` of one
   repeated byte in full (128.3–128.9 MiB) and still did 1.5 s later — no compressor shortcut — and 257 MiB after a second
   128 MiB of random data; resident size agrees.
@@ -627,8 +681,19 @@ memory test.)
   `EPERM` for `SET_MEMLIMIT_PROPERTIES` and even for `GET_MEMLIMIT_PROPERTIES` on the process itself. **As root (the
   runners allow `sudo`) setting a fatal 64 MB limit on itself worked and the kernel killed the process with `SIGKILL`**
   after it had reported 56 MiB (the next 8 MiB step crossed the limit), 55–180 ms after the start. `SET_JETSAM_TASK_LIMIT`
-  (command 6, flags = MB) failed `EINVAL` for root; the arguments may be wrong. A supervisor that is not root has to poll
-  and kill; one that runs as root can also let the kernel do it.
+  (command 6, flags = MB) fails `EINVAL` for root because the command does not exist in macOS kernels: it is compiled only
+  `#if CONFIG_JETSAM` (`kern_memorystatus.c`), which `config/MASTER` describes as "used on embedded" and the macOS
+  configurations do not enable, so it falls to the `default: error = EINVAL` case. `SET_MEMLIMIT_PROPERTIES` is the
+  macOS route.
+* **Correction: a supervisor that is not root *can* have the kernel enforce the limit**, by installing it at creation
+  with the private `posix_spawnattr_setjetsam_ext(attr, flags, priority, active_MB, inactive_MB)` (looked up with
+  `dlsym`; flags `0x04 | 0x08` = active- and inactive-fatal, priority -1 = default band). XNU's exec path applies the
+  spawn attributes with `memorystatus_set_memlimits` and no privilege check (`kern_exec.c`), unlike the
+  `memorystatus_control` system call. As the ordinary runner user on all five macOS runners (run `41886046710`) a child
+  allocating 8 MiB steps was **killed with `SIGKILL` under a 64 MB and a 128 MB fatal limit**, while the control (no
+  attribute) and a non-fatal 64 MB limit kept running to 512 MiB. As root, `GET_MEMLIMIT_PROPERTIES` on the child read
+  back exactly the requested limits (64/128 MB, attribute 1 = fatal; non-fatal: attribute 0). It is private SPI (no
+  public header, no stability promise) and works only for children created with `posix_spawn`, not `fork`.
 
 ### Process creation at scale (verified)
 
@@ -648,9 +713,12 @@ memory test.)
 * **`RLIMIT_NPROC` counts tasks, including unreaped zombies.** With the limit set to the current count plus 20,
   `fork` of children that exit at once started failing with `EAGAIN` after 21 children on Linux and macOS, and
   worked again after reaping one (21–26 children; the macOS 14 estimate of the baseline was a few off). Linux counts every thread of the user (the probe counted `/proc/*/task/*`: 47–54 for
-  an idle runner). **On macOS the kernel's count is about half of what `sysctl KERN_PROC_UID` lists** (kernel
-  ~209–269 against 414–519 listed on the five runners; found by seeing how many children fit under a known limit) — I
-  do not know what the listing includes that the kernel does not charge. Defaults: macOS `kern.maxproc` 2000 (arm64) /
+  an idle runner). On macOS the kernel's per-user count matches the user's processes. (An earlier version said it was
+  "about half of what `sysctl KERN_PROC_UID` lists". That was a bug in the probe: it took the size XNU reports for a
+  NULL buffer, and `sysdoproc_callback` applies the uid filter only when a buffer is supplied, so the "listing" was every
+  process on the machine plus `KERN_PROCSLOP` (5). Read into a real buffer, run `41886046710`: 215 / 244 / 293 / 226 /
+  271 processes of the runner user against kernel counts of 209 / 238 / 286 / 221 / 262, found by seeing how many
+  children fit under a known limit; the real-uid listing is identical.) Defaults: macOS `kern.maxproc` 2000 (arm64) /
   3132 (Intel), `maxprocperuid` 1333 / 2088; Linux soft = hard = 58 000–64 000.
 
 ---
@@ -721,6 +789,61 @@ ACL already allowed it; not checked).
   three. Nothing the kit relies on behaves differently for emulated children.
 
 ---
+
+## A Mach exception handler holds a crashing thread (macOS, verified on all five runners)
+
+`explore/macos/mach_exc.c`, run `41886046710`. The child sets its own task exception port for `EXC_BAD_ACCESS`
+(`EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`, message id 2405), runs a handler thread, writes a timestamp and dereferences
+NULL. Medians after the fault:
+
+| case | handler received | process reaped | status |
+|---|---|---|---|
+| no handler | — | 0.2–0.8 ms | `SIGSEGV` |
+| handler replies `KERN_FAILURE` at once | 0.1–1.3 ms | 0.7–4.3 ms | `SIGSEGV` (the kernel falls back to the Unix signal) |
+| handler holds 500 ms, then `KERN_FAILURE` | 0.1–0.5 ms | 502–563 ms | `SIGSEGV` |
+| handler never replies, `SIGTERM` after 300 ms | 0.1–0.2 ms | 5 ms after the `SIGTERM` | **`SIGSEGV`**, not `SIGTERM` |
+| handler never replies, `SIGKILL` after 300 ms | 0.1 ms | 0.2–0.6 ms after the `SIGKILL` | `SIGKILL` |
+
+So whoever owns the exception port (a debugger, an in-process crash reporter such as a Crashpad/Breakpad-style handler)
+decides how long a crashed child stays alive, and `waitpid` waits for it. A `SIGTERM` does end the wait, but the
+child then completes the crash and is reported as `SIGSEGV`: a supervisor that sent `SIGTERM` must not conclude that
+the child died of its signal. `SIGKILL` is immediate. (Without a handler the macOS figures match `crash_latency`:
+`ReportCrash` does not hold the process.)
+
+## Linux: dumpability, `WNOWAIT`, executing a script by descriptor (verified, all three Ubuntu runners)
+
+`explore/linux/linux_extras.c`, runs `41886046710`, `41888597722`:
+
+* `prctl(PR_SET_DUMPABLE, 0)` before `execve` is undone by the exec (the program read back 1); `RLIMIT_CORE` set before
+  `exec` stays (1). A launcher can opt a child out of the crash handler only through `RLIMIT_CORE=1` (see above).
+* **`waitid(..., WEXITED | WNOWAIT)` reserves nothing.** One thread observed the exited child (pid, status 37) with
+  `WNOWAIT`, a second thread then reaped it with `waitpid`, and the observer's own collection got `ECHILD`. The same with
+  a pidfd (`waitid(P_PIDFD, ...)`): a pidfd gives a stable identity, not ownership of the exit status. If a runtime
+  (Crystal's) reaps children on its own, any other waiter can lose the status.
+* **`fexecve` of a `#!` script fails with `ENOENT` when the descriptor is close-on-exec** (the interpreter is handed
+  `/dev/fd/N`, which no longer exists after the exec); without `O_CLOEXEC` the script ran (exit 23); an ELF binary works
+  with `O_CLOEXEC`. A spawner that executes by descriptor to pin the file must not set `O_CLOEXEC` on scripts.
+
+## Windows: ExitProcess while a killed thread held what DLL detach needs (verified, all three builds)
+
+`win_more exitproc` with `detach_dll.dll`, run `41886046710`, elevated. `ExitProcess` terminates every other thread
+first and then runs each DLL's `DLL_PROCESS_DETACH`. A worker thread took a resource and slept; the main thread called
+`ExitProcess(0)`; detach then waited for that resource.
+
+| what detach waits for | result |
+|---|---|
+| nothing | exits in 0–1 ms, code 0 |
+| a critical section the terminated thread held | **exits at once with code 0 — detach never finished** (the loader ends the process instead of blocking) |
+| an SRW lock the terminated thread held | the same: exit at once, code 0, rest of detach skipped |
+| an event the terminated thread would have set | **hangs**; still alive after 6 s; `TerminateProcess` ended it in 2 ms |
+| a mutex the terminated thread held | the wait returns `WAIT_ABANDONED` (128) and detach completes |
+| the terminated worker's thread handle | returns at once (the thread is already gone) |
+| nothing, but detach sleeps 1.5 s | the exit takes 1.50 s |
+
+So a "graceful" exit can hang forever, or can skip cleanup silently while reporting success (exit code 0 after an
+abandoned critical section). A supervisor needs a deadline after asking a child to exit and must escalate to
+`TerminateProcess` / `TerminateJobObject` (which do not run DLL detach). The exit code of a child that exited by itself
+says nothing about whether its cleanup ran.
 
 ## Still open
 
