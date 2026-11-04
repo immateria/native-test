@@ -1975,7 +1975,10 @@ static int child_ac(const wchar_t *logpath, DWORD supervisor_pid, int port) {
   BOOL as = job ? AssignProcessToJobObject(job, GetCurrentProcess()) : FALSE;
   ADD(",\"create_job_object\":%s,\"assign_self_to_a_nested_job\":%s,\"assign_error\":%lu}", bstr(job != NULL), bstr(as), (unsigned long)(as ? 0 : GetLastError()));
 #undef ADD
-  log_to(log, "ready\n%s\n", o);
+  { /* log_to formats into a 512-byte buffer, too small for this line */
+    DWORD w;
+    if (log != INVALID_HANDLE_VALUE) { WriteFile(log, "ready\n", 6, &w, NULL); WriteFile(log, o, (DWORD)strlen(o), &w, NULL); WriteFile(log, "\n", 1, &w, NULL); }
+  }
   return 0;
 }
 
