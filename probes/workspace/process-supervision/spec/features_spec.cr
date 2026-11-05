@@ -186,7 +186,11 @@ require "file_utils"
             o.namespaces = ProcessSupervision::SpawnOptions::Namespace::Pid
             o.pid_namespace_init = init
           end
-          child = feature_leader("sleep", ["30"], options: opts)
+          child = begin
+            feature_leader("sleep", ["30"], options: opts)
+          rescue ex : ProcessSupervision::Error::Unsupported | File::AccessDeniedError | IO::Error
+            pending!("namespaces refused here: #{ex.message}")
+          end
           sleep 200.milliseconds
           child.handle.signal(Signal::TERM)
           status = child.wait(3.seconds)
@@ -206,7 +210,11 @@ require "file_utils"
         pending!("needs root") unless LibC.getuid == 0
         opts = options(&.namespaces=(ProcessSupervision::SpawnOptions::Namespace::Pid))
         # the subshell exits at once, so its `sleep 0.2` is orphaned to the namespace's PID 1 (the init)
-        child = feature_leader("/bin/sh", ["-c", "(sleep 0.2 &); sleep 1.5"], options: opts)
+        child = begin
+          feature_leader("/bin/sh", ["-c", "(sleep 0.2 &); sleep 1.5"], options: opts)
+        rescue ex : ProcessSupervision::Error::Unsupported | File::AccessDeniedError | IO::Error
+          pending!("namespaces refused here: #{ex.message}")
+        end
         sleep 800.milliseconds
         zombies = Dir.children("/proc").select(&.to_i64?).count do |entry|
           stat = File.read("/proc/#{entry}/stat") rescue next false
