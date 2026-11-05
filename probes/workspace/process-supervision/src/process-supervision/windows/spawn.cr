@@ -20,29 +20,106 @@
       # and *error* is `Process::Redirect::Inherit` (the default: the parent's
       # standard handle, or the null device if it has none), `Close` (the null
       # device), `Pipe` (read or write it through `Child#input` / `#output` /
-      # `#error`, closed by `Child#close`) or an `IO::FileDescriptor` such as a
-      # `File`. Other `IO` objects are rejected, as is a file opened for
-      # overlapped I/O: pipe and copy instead. Batch files are rejected
-      # because direct CreateProcessW execution implicitly invokes cmd.exe.
+      # `#error`, closed by `Child#close`), an `IO::FileDescriptor` such as a
+      # `File`, or any other `IO`, which gets a pipe and a copy fiber (as does a
+      # file opened for overlapped I/O, which a child cannot use directly).
+      # Batch files are rejected because direct CreateProcessW execution
+      # implicitly invokes cmd.exe; `spawn_batch` runs them with cmd.exe quoting.
       def spawn(command : String, args : Enumerable(String) = [] of String, *,
                 env : Process::Env = nil, clear_env : Bool = false,
                 chdir : Path | String? = nil,
                 input : ::Process::Stdio = ::Process::Redirect::Inherit,
                 output : ::Process::Stdio = ::Process::Redirect::Inherit,
-                error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
+                error : ::Process::Stdio = ::Process::Redirect::Inherit,
+                options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : ProcessSupervision::Child
+        options.check_supported!("a Windows Job", new_session: false, ipc: false, console_group: true, hide_window: true)
         run_on_execution_context("process-supervision-windows-job-spawn") do
           spawn_on_execution_context(command, args, env: env, clear_env: clear_env, chdir: chdir,
-            input: input, output: output, error: error)
+            input: input, output: output, error: error, options: options)
         end
       end
+
+      # Runs a batch file (`.bat` / `.cmd`) through `cmd.exe`, contained in this Job like `spawn`, with arguments quoted
+      # for cmd.exe's parser instead of the C runtime's ("BatBadBut", CVE-2024-24576): each argument that is not plain is
+      # quoted, `"` is doubled, `%` is followed by a `%cd:~,%` no-op so `%VAR%` is never expanded, and delayed expansion
+      # (`!`) and AutoRun are switched off (`cmd.exe /e:ON /v:OFF /d /c`). `cmd.exe` is named by its full path
+      # (`%SystemRoot%\System32\cmd.exe`), so no `cmd.exe` in the current directory or PATH is picked up.
+      #
+      # Measured (explore/windows/argv_fuzz.cr, Server 2022 and 2025): 3 000 random argument lists, including every
+      # cmd metacharacter and `%PATH%`, reach a program called from the batch file with `%*` unchanged, and an
+      # injection attempt in every tenth list ran nothing. An argument containing a line feed or carriage return cannot
+      # be passed through cmd.exe at all (cmd ends or drops the line there), so it is refused with `ArgumentError`, as
+      # is a script path containing `"`.
+      def spawn_batch(script : Path | String, args : Enumerable(String) = [] of String, *,
+                      env : Process::Env = nil, clear_env : Bool = false,
+                      chdir : Path | String? = nil,
+                      input : ::Process::Stdio = ::Process::Redirect::Inherit,
+                      output : ::Process::Stdio = ::Process::Redirect::Inherit,
+                      error : ::Process::Stdio = ::Process::Redirect::Inherit,
+                      options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : ProcessSupervision::Child
+        options.check_supported!("a Windows Job", new_session: false, ipc: false, console_group: true, hide_window: true)
+        run_on_execution_context("process-supervision-windows-job-spawn") do
+          spawn_on_execution_context(script.to_s, args, env: env, clear_env: clear_env, chdir: chdir,
+            input: input, output: output, error: error, options: options, batch: true)
+        end
+      end
+
+      # The `cmd.exe` command line `spawn_batch` uses: `/e:ON /v:OFF /d /c ""<script>" <args>"`.
+      def self.batch_command_line(script : String, args : Enumerable(String)) : String
+        raise ArgumentError.new("batch script path contains a double quote") if script.includes?('"')
+        String.build do |io|
+          io << %(/e:ON /v:OFF /d /c ""#{script}")
+          args.each_with_index do |arg, index|
+            if arg.includes?('\n') || arg.includes?('\r')
+              raise ArgumentError.new("argument #{index} contains a line break, which cannot pass through cmd.exe")
+            end
+            io << ' '
+            append_batch_argument(io, arg)
+          end
+          io << '"'
+        end
+      end
+
+      private def self.append_batch_argument(io : IO, arg : String) : Nil
+        quote = arg.empty? || arg.ends_with?('\\')
+        arg.each_char do |char|
+          if (char.ascii? && !(char.ascii_alphanumeric? || "#$*+-./:?@\\_".includes?(char))) || char.control?
+            quote = true
+          end
+        end
+        io << '"' if quote
+        backslashes = 0
+        arg.each_char do |char|
+          if char == '\\'
+            backslashes += 1
+          else
+            if char == '"'
+              backslashes.times { io << '\\' }
+              io << '"'
+            elsif char == '%'
+              io << "%%cd:~,"
+            end
+            backslashes = 0
+          end
+          io << char
+        end
+        if quote
+          backslashes.times { io << '\\' }
+          io << '"'
+        end
+      end
+
+      # The longest command line CreateProcessW accepts, in UTF-16 units including the terminator.
+      MAX_COMMAND_LINE = 32_767
 
       private def spawn_on_execution_context(command : String, args : Enumerable(String), *,
                                              env : Process::Env, clear_env : Bool,
                                              chdir : Path | String?,
                                              input : ::Process::Stdio, output : ::Process::Stdio,
-                                             error : ::Process::Stdio) : ProcessSupervision::Child
+                                             error : ::Process::Stdio,
+                                             options : ProcessSupervision::SpawnOptions,
+                                             batch : Bool = false) : ProcessSupervision::Child
         validate_no_nul!(command, "command")
-        reject_batch_file(command)
         argv = [command]
         args.each_with_index do |arg, index|
           validate_no_nul!(arg, "argument #{index}")
@@ -50,10 +127,24 @@
         end
         chdir_string = chdir.try &.to_s
         chdir_string.try { |path| validate_no_nul!(path, "chdir") }
-        env_entries = materialize_environment(env)
-        env_block = build_environment(env_entries, clear_env)
-
-        command_line = Process.quote_windows(argv).to_utf16
+        application_w = nil.as(Slice(UInt16)?)
+        if batch
+          trimmed = command.rstrip(". ").downcase
+          unless trimmed.ends_with?(".bat") || trimmed.ends_with?(".cmd")
+            raise ArgumentError.new("spawn_batch needs a .bat or .cmd script")
+          end
+          cmd = "#{ENV["SystemRoot"]? || "C:\\Windows"}\\System32\\cmd.exe"
+          application_w = cmd.to_utf16
+          command_line = (%("#{cmd}" ) + Job.batch_command_line(command, argv[1..])).to_utf16
+        else
+          reject_batch_file(command)
+          command_line = Process.quote_windows(argv).to_utf16
+        end
+        if command_line.size + 1 > MAX_COMMAND_LINE
+          # the same error CreateProcessW would report (ERROR_FILENAME_EXCED_RANGE), raised before anything is created
+          raise Error::Native.new("CreateProcessW",
+            "command line is #{command_line.size + 1} UTF-16 units; the limit is #{MAX_COMMAND_LINE}", 206_i64)
+        end
         chdir_w = chdir_string.try &.to_utf16
 
         plumbing = nil.as(Plumbing?)
@@ -66,7 +157,18 @@
 
         begin
           plumbing = Plumbing.build(input, output, error)
-          inherited = plumbing.handles
+          plumbing.copies.wait_delay = options.wait_delay
+          # extra handles: inheritable duplicates the child sees under the same numeric values, announced as
+          # PROCESS_SUPERVISION_HANDLES=<requested number>:<handle value>,...
+          announced = [] of String
+          options.extra_fds.each do |target, io|
+            handle = plumbing.add_extra(io)
+            announced << "#{target}:#{handle.address}"
+          end
+          env_entries = materialize_environment(env) || [] of Tuple(String, String?)
+          env_entries << {"PROCESS_SUPERVISION_HANDLES", announced.join(',')} unless announced.empty?
+          env_block = build_environment(env_entries, clear_env)
+          inherited = plumbing.allow_list
 
           attr_bytes = LibC::SizeT.new(0)
           NativeLib.InitializeProcThreadAttributeList(Pointer(Void).null, 2_u32, 0_u32, pointerof(attr_bytes))
@@ -107,9 +209,12 @@
             flags = Native::EXTENDED_STARTUPINFO_PRESENT |
                     Native::CREATE_UNICODE_ENVIRONMENT |
                     Native::CREATE_SUSPENDED
+            # its own console process group: CTRL_BREAK_EVENT can then be sent to it alone (request_stop)
+            flags |= 0x00000200_u32 if options.console_group # CREATE_NEW_PROCESS_GROUP
+            flags |= 0x08000000_u32 if options.hide_window   # CREATE_NO_WINDOW
 
             if LibC.CreateProcessW(
-                 Pointer(UInt16).null,
+                 application_w.try(&.to_unsafe) || Pointer(UInt16).null,
                  command_line.to_unsafe,
                  Pointer(LibC::SECURITY_ATTRIBUTES).null,
                  Pointer(LibC::SECURITY_ATTRIBUTES).null,
@@ -152,7 +257,7 @@
           system_process = Crystal::System::Process.new(process_info)
           process_transferred = true
           process = SpawnedProcess.wrap(system_process)
-          ProcessSupervision::Child.new(process, stable_handle, self, plumbing.input, plumbing.output, plumbing.error)
+          ProcessSupervision::Child.new(process, stable_handle, self, plumbing.input, plumbing.output, plumbing.error, plumbing.copies)
         rescue ex
           stable_handle.try do |handle|
             handle.close rescue nil
@@ -188,9 +293,23 @@
       # allow-list never holds a value twice.
       private class Plumbing
         getter handles = StaticArray(LibC::HANDLE, 3).new(LibC::HANDLE.null)
+        @extra = [] of LibC::HANDLE
+
+        def add_extra(io : IO::FileDescriptor) : LibC::HANDLE
+          handle = Native.duplicate_inheritable(LibC::HANDLE.new(io.fd), "DuplicateHandle(extra handle)")
+          @extra << handle
+          handle
+        end
+
+        # every handle the child may inherit: the three standard ones, then the extra ones
+        def allow_list : Array(LibC::HANDLE)
+          @handles.to_a + @extra
+        end
+
         getter input : IO::FileDescriptor? = nil
         getter output : IO::FileDescriptor? = nil
         getter error : IO::FileDescriptor? = nil
+        getter copies = ProcessSupervision::StreamCopies.new
 
         @child_ends = [] of IO::FileDescriptor
 
@@ -218,34 +337,57 @@
             when .close?
               @handles[target] = Native.null_device(input: reading)
             when .pipe?
-              if reading
-                reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
-                @child_ends << reader
-                @input = writer
-                @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(reader.fd), "DuplicateHandle(stdin pipe)")
-              else
-                reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
-                @child_ends << writer
-                target == 1 ? (@output = reader) : (@error = reader)
-                @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(writer.fd), "DuplicateHandle(#{target == 1 ? "stdout" : "stderr"} pipe)")
+              parent_end = pipe(target)
+              case target
+              when 0 then @input = parent_end
+              when 1 then @output = parent_end
+              else        @error = parent_end
               end
             end
           when IO::FileDescriptor
-            raise ArgumentError.new("standard stream #{target} is closed") if spec.closed?
             # An overlapped regular file cannot serve a child that does
-            # synchronous I/O on it; the stdlib reopens or pipes such files.
-            # Overlapped pipes (an IO.pipe end) are fine.
-            unless spec.system_blocking? || pipe?(spec)
-              raise ArgumentError.new("standard stream #{target}: a file opened for overlapped I/O cannot be handed to a child; open it blocking, or pipe and copy")
+            # synchronous I/O on it, so it is copied through a pipe like any
+            # other IO. Overlapped pipes (an IO.pipe end) are fine as they are.
+            if !spec.closed? && (spec.system_blocking? || pipe?(spec))
+              @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(spec.fd), "DuplicateHandle(standard stream #{target})")
+            else
+              copy_through_pipe(target, spec)
             end
-            @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(spec.fd), "DuplicateHandle(standard stream #{target})")
           else
-            raise ArgumentError.new("only Process::Redirect and IO::FileDescriptor are supported for standard streams")
+            copy_through_pipe(target, spec)
+          end
+        end
+
+        private def copy_through_pipe(target : Int32, io : IO) : Nil
+          if io.closed?
+            @handles[target] = Native.null_device(input: target == 0)
+          elsif target == 0
+            @copies.add_input(io, pipe(target))
+          else
+            @copies.add_output(pipe(target), io)
+          end
+        end
+
+        # A pipe for stream *target*: the child's end (synchronous) is
+        # duplicated into `handles`, the parent's end (overlapped) is returned.
+        private def pipe(target : Int32) : IO::FileDescriptor
+          if target == 0
+            reader, writer = IO.pipe(read_blocking: true, write_blocking: false)
+            @child_ends << reader
+            @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(reader.fd), "DuplicateHandle(stdin pipe)")
+            writer
+          else
+            reader, writer = IO.pipe(read_blocking: false, write_blocking: true)
+            @child_ends << writer
+            @handles[target] = Native.duplicate_inheritable(LibC::HANDLE.new(writer.fd), "DuplicateHandle(#{target == 1 ? "stdout" : "stderr"} pipe)")
+            reader
           end
         end
 
         def release_child_side : Nil
           @handles.each { |handle| Native.close_native_handle(handle) }
+          @extra.each { |handle| Native.close_native_handle(handle) }
+          @extra.clear
           @handles = StaticArray(LibC::HANDLE, 3).new(LibC::HANDLE.null)
           @child_ends.each { |io| io.close rescue nil }
           @child_ends.clear
@@ -254,6 +396,7 @@
         def abandon : Nil
           release_child_side
           {@input, @output, @error}.each { |io| io.try { |stream| stream.close rescue nil } }
+          @copies.close
         end
 
         private def pipe?(io : IO::FileDescriptor) : Bool

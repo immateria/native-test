@@ -29,7 +29,10 @@
         process_user_time : Time::Span? = nil,
         cpu_rate_percent : Float64? = nil,
         priority_class : PriorityClass? = nil,
-        ui_restrictions : UIRestrictions? = nil do
+        ui_restrictions : UIRestrictions? = nil,
+        # JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION: a crashing member ends at once instead of waiting on a Windows
+        # Error Reporting dialog or debugger prompt (which can hold a crashed child forever on a desktop session)
+        die_on_unhandled_exception : Bool = false do
         def validate! : Nil
           {job_memory: job_memory, process_memory: process_memory}.each do |name, value|
             next unless value

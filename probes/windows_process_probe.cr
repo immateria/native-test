@@ -293,6 +293,23 @@ def probe_failure_text(ex : Exception) : String
   "#{ex.class.name}: #{ex.message} @ #{ex.backtrace?.try(&.first?) || "no-backtrace"}"
 end
 
+# An output target whose writes fail (r14 copy-error case).
+class R14FailingWriteIO < IO
+  def read(slice : Bytes) : Int32
+    0
+  end
+
+  def write(slice : Bytes) : Nil
+    raise IO::Error.new("injected write failure")
+  end
+end
+
+@[Link("kernel32")]
+lib R14Kernel32
+  fun GetCurrentProcess : LibC::HANDLE
+  fun GetProcessHandleCount(process : LibC::HANDLE, count : UInt32*) : LibC::BOOL
+end
+
 module NativeProbe
   @@failures = 0
   @@skipped = 0
@@ -818,6 +835,22 @@ module NativeProbe
       ms = ARGV[2]?.try(&.to_i?) || 500
       sleep({ms, 7000}.min.milliseconds)
       exit 0
+    when "cat"
+      IO.copy(STDIN, STDOUT)
+      exit 0
+    when "split"
+      STDOUT.print "out\n"
+      STDERR.print "err\n"
+      exit 0
+    when "tree"
+      Process.new(self_exe, ["--child", "ready"], input: Process::Redirect::Inherit, output: Process::Redirect::Inherit,
+        error: Process::Redirect::Inherit).wait
+      exit 0
+    when "ready"
+      STDOUT.print "ready\n"
+      STDOUT.flush
+      sleep 6.seconds
+      exit 0
     when "args"
       marker = ARGV[2]? || raise "missing marker"
       File.write(marker, {"args" => ARGV[3..], "cwd" => Dir.current,
@@ -1110,6 +1143,183 @@ module NativeProbe
       STDERR.puts "unknown child mode"
       exit 64
     end
+  end
+
+  # Revision 14: ProcessSupervision.spawn and the standard-stream options of Job#spawn (Inherit/Close/Pipe, file
+  # descriptors, and IO objects copied through a pipe).
+  def self.run_r14_spawn_streams_matrix : Nil
+    pipe = Process::Redirect::Pipe
+
+    test("r14_supervision_spawn_uses_job_object") do
+      child = ProcessSupervision.spawn(self_exe, ["--child", "sleep", "50"])
+      begin
+        status = child.wait(5.seconds)
+        mechanism = child.group.mechanism
+        result = child.group.shutdown
+        {mechanism.job_object? && status.try(&.success?) == true && result.drained?,
+         details(mechanism: mechanism, status: status.try(&.exit_code), drained: result.drained?)}
+      ensure
+        close_child(child)
+      end
+    end
+
+    test("r14_spawn_pipe_round_trip_and_eof") do
+      job = ProcessSupervision.job
+      child = nil.as(ProcessSupervision::Child?)
+      begin
+        child = job.spawn(self_exe, ["--child", "cat"], input: pipe, output: pipe)
+        child.input.print "hello\nworld\n"
+        child.input.close
+        text = child.output.gets_to_end
+        status = child.wait(5.seconds)
+        {text == "hello\nworld\n" && status.try(&.success?) == true, details(text: text.inspect, status: status.try(&.exit_code))}
+      ensure
+        close_child(child)
+        close_job(job)
+      end
+    end
+
+    test("r14_spawn_stdout_and_stderr_apart") do
+      job = ProcessSupervision.job
+      child = nil.as(ProcessSupervision::Child?)
+      begin
+        child = job.spawn(self_exe, ["--child", "split"], output: pipe, error: pipe)
+        stdout_text = child.output.gets_to_end
+        stderr_text = child.error.gets_to_end
+        status = child.wait(5.seconds)
+        {stdout_text == "out\n" && stderr_text == "err\n" && status.try(&.success?) == true,
+         details(stdout: stdout_text.inspect, stderr: stderr_text.inspect)}
+      ensure
+        close_child(child)
+        close_job(job)
+      end
+    end
+
+    test("r14_spawn_close_is_null_device") do
+      job = ProcessSupervision.job
+      child = nil.as(ProcessSupervision::Child?)
+      begin
+        child = job.spawn(self_exe, ["--child", "cat"], input: Process::Redirect::Close, output: pipe)
+        text = child.output.gets_to_end
+        status = child.wait(5.seconds)
+        {text.empty? && status.try(&.success?) == true, details(text: text.inspect, status: status.try(&.exit_code))}
+      ensure
+        close_child(child)
+        close_job(job)
+      end
+    end
+
+    test("r14_spawn_file_descriptor_streams") do
+      Dir.mkdir_p(workdir)
+      source = File.join(workdir, "r14-in.txt")
+      target = File.join(workdir, "r14-out.txt")
+      File.write(source, "from a file\n")
+      job = ProcessSupervision.job
+      status = nil.as(Process::Status?)
+      begin
+        File.open(source) do |reader|
+          File.open(target, "w") do |writer|
+            child = job.spawn(self_exe, ["--child", "cat"], input: reader, output: writer)
+            begin
+              status = child.wait(5.seconds)
+            ensure
+              close_child(child)
+            end
+          end
+        end
+      ensure
+        close_job(job)
+      end
+      text = File.read(target)
+      {text == "from a file\n" && status.try(&.success?) == true, details(text: text.inspect)}
+    end
+
+    test("r14_spawn_io_objects_copied_both_ways") do
+      data = "0123456789abcdef" * 65_536
+      target = IO::Memory.new
+      job = ProcessSupervision.job
+      child = nil.as(ProcessSupervision::Child?)
+      begin
+        child = job.spawn(self_exe, ["--child", "cat"], input: IO::Memory.new(data), output: target)
+        status = child.wait(10.seconds)
+        {status.try(&.success?) == true && target.to_s == data, details(bytes: target.size, expected: data.bytesize)}
+      ensure
+        close_child(child)
+        close_job(job)
+      end
+    end
+
+    test("r14_spawn_copy_error_raised_status_kept") do
+      job = ProcessSupervision.job
+      child = nil.as(ProcessSupervision::Child?)
+      begin
+        child = job.spawn(self_exe, ["--child", "split"], output: R14FailingWriteIO.new, error: Process::Redirect::Close)
+        raised = begin
+          child.wait(5.seconds)
+          "none"
+        rescue ex : IO::Error
+          ex.message || ""
+        end
+        status = child.status
+        {raised.includes?("injected") && status.try(&.success?) == true, details(raised: raised, status: status.try(&.exit_code))}
+      ensure
+        close_child(child)
+        close_job(job)
+      end
+    end
+
+    test("r14_spawn_failed_creation_no_handle_growth") do
+      job = ProcessSupervision.job
+      begin
+        missing = File.join(workdir, "r14-missing-#{Random.new.hex(4)}.exe")
+        attempt = -> do
+          begin
+            job.spawn(missing, input: pipe, output: pipe, error: pipe)
+          rescue
+          end
+          begin
+            job.spawn(missing, input: IO::Memory.new("x"), output: IO::Memory.new)
+          rescue
+          end
+        end
+        3.times { attempt.call }
+        before = r14_handle_count
+        30.times { attempt.call }
+        after = r14_handle_count
+        {after <= before + 5, details(before: before, after: after, attempts: 60)}
+      ensure
+        close_job(job)
+      end
+    end
+
+    test("r14_job_kill_ends_pipe_a_grandchild_held") do
+      job = ProcessSupervision.job
+      child = nil.as(ProcessSupervision::Child?)
+      begin
+        child = job.spawn(self_exe, ["--child", "tree"], output: pipe)
+        first = child.output.gets
+        job.kill
+        rest = Channel(String).new(1)
+        spawn { rest.send(child.output.gets_to_end) }
+        outcome = select
+        when text = rest.receive
+          text
+        when timeout(5.seconds)
+          "timeout"
+        end
+        drained = job.wait_empty(5.seconds)
+        {first == "ready" && outcome == "" && drained, details(first: first.inspect, rest: outcome.inspect, drained: drained)}
+      ensure
+        close_child(child)
+        close_job(job)
+      end
+    end
+  end
+
+  def self.r14_handle_count : UInt32
+    count = 0_u32
+    R14Kernel32.GetProcessHandleCount(R14Kernel32.GetCurrentProcess, pointerof(count))
+    count
   end
 
   def self.wait_result(handle : ProcessHandle, timeout : Time::Span) : String
@@ -6176,6 +6386,7 @@ module NativeProbe
     run_r6_matrix
     run_r9_source_matrix
     run_r10_hardening_matrix
+    run_r14_spawn_streams_matrix
   ensure
     finish
   end

@@ -2,7 +2,7 @@
 
 This is the native qualification kit for exact **checkpoint 0009 / working** source under `workspace/`. Revision 12 preserves all **889** revision-11 behavioral case identities and hardens both the Linux production API and native handback admission.
 
-It contains **459 Windows Crystal cases**, **385 macOS Crystal cases**, and **45 independent macOS C/SDK behavioral checks**: **889 behavioral checks total**.
+It contains **468 Windows Crystal cases**, **397 macOS Crystal cases**, and **45 independent macOS C/SDK behavioral checks**: **910 behavioral checks total** (revision 14; see below).
 
 See `COVERAGE.md` for every literal case name, `R12-BEHAVIOR-MATRIX.md` for the active behavior matrix, and `REVISION-12-CHANGES.md` for this pass.
 
@@ -25,6 +25,12 @@ The workspace below no longer matches the checkpoint hashes quoted above: the sp
 (process-handle), `ProcessGroup#spawn`/`spawn_leader`, `CgroupV2#spawn`/`usable?`/`delegated_parent`,
 `ProcessSupervision.spawn`/`strongest_mechanism`, and refuses process group 1. `MANIFEST.sha256` pins the current files; every
 kit case keeps its name and meaning. The measurements behind the changes are in `explore/FINDINGS.md`.
+
+Later: standard-stream options on every spawn (`input:`/`output:`/`error:`, including any `IO` via `stream_copies.cr`),
+`pidfd_spawn` as the first Linux engine, the process-group descendant marker (`posix/marker_scan.cr`,
+`ProcessGroup#escapees`, `ProcessHandle::Kqueue.watch`). Revision 14 adds **9 Windows and 11 macOS cases** (`r14_*`) for
+`ProcessSupervision.spawn`, the stream options and the marker: **468 Windows Crystal, 397 macOS Crystal, 45 C/SDK** (910).
+Existing cases keep their names and meaning.
 
 ## Handoff integrity
 

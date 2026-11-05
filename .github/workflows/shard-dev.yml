@@ -93,28 +93,43 @@ jobs:
             (cd "../probes/workspace/$s" && "$GITHUB_WORKSPACE/shard-out/spec-$s" --verbose) > "run-plain-$s.txt" 2>&1
             echo "== $s plain exit=$?"; tail -n 12 "run-plain-$s.txt"
           done
+          # Linux: the supervision suite again on each forced spawn engine (the plain run uses pidfd_spawn where glibc has it)
+          if [ "$(uname -s)" = Linux ] && [ -x spec-process-supervision ]; then
+            for engine in clone3 fork; do
+              (cd ../probes/workspace/process-supervision && PROCESS_SUPERVISION_SPEC_ENGINE=$engine "$GITHUB_WORKSPACE/shard-out/spec-process-supervision" --verbose) > "run-engine-$engine.txt" 2>&1
+              echo "== engine $engine exit=$?"; tail -n 6 "run-engine-$engine.txt"
+            done
+          fi
+          grep -ho '\[engine[^]]*\] .*' run-*.txt 2>/dev/null || true
+          # 200 spawn / stream / graceful-stop cycles, checking descriptors stay flat
+          if [ -x spec-process-supervision ]; then
+            (cd ../probes/workspace/process-supervision && PROCESS_SUPERVISION_STRESS=1 "$GITHUB_WORKSPACE/shard-out/spec-process-supervision" -e stress --verbose) > run-stress.txt 2>&1
+            echo "== stress exit=$?"; tail -n 6 run-stress.txt
+          fi
           exit 0
 
       - name: Run the supervision specs in other Linux environments
         if: runner.os == 'Linux' && (github.event_name != 'workflow_dispatch' || inputs.scenarios)
+        timeout-minutes: 25
         run: |
           set +e
+          T="timeout -k 10 300"  # a hung environment ends with exit 124 and its partial output, not a stuck job
           uid="$(id -u)"; gid="$(id -g)"
           S="$GITHUB_WORKSPACE/shard-out/spec-process-supervision"
           W="$GITHUB_WORKSPACE/probes/workspace/process-supervision"
           [ -x "$S" ] || { echo "no spec binary"; exit 0; }
           cd "$W"
           out="$GITHUB_WORKSPACE/shard-out"
-          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p Delegate=yes -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-delegate-yes.txt" 2>&1
+          $T sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p Delegate=yes -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-delegate-yes.txt" 2>&1
           echo "== systemd Delegate=yes exit=$?"; tail -n 6 "$out/run-systemd-delegate-yes.txt"
-          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-no-delegate.txt" 2>&1
+          $T sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-no-delegate.txt" 2>&1
           echo "== systemd no Delegate exit=$?"; tail -n 6 "$out/run-systemd-no-delegate.txt"
           sudo loginctl enable-linger "$(id -un)"
           for i in $(seq 1 30); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
           XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-            systemd-run --user --quiet --pipe --wait --collect -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-user-manager.txt" 2>&1
+            $T systemd-run --user --quiet --pipe --wait --collect -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-user-manager.txt" 2>&1
           echo "== systemd user manager exit=$?"; tail -n 6 "$out/run-systemd-user-manager.txt"
-          sudo "$S" --verbose > "$out/run-host-root.txt" 2>&1
+          $T sudo "$S" --verbose > "$out/run-host-root.txt" 2>&1
           echo "== host root exit=$?"; tail -n 6 "$out/run-host-root.txt"
           sudo chown -R "$uid:$gid" "$out"
           # containers: the spec binary is dynamically linked, so use an Ubuntu image of the host's release
@@ -124,7 +139,7 @@ jobs:
           for mode in default privileged; do
             extra=""; [ "$mode" = privileged ] && extra="--privileged"
             # same absolute path inside: the specs read their sources through paths baked in at compile time
-            docker run --rm $extra -v "$GITHUB_WORKSPACE":"$GITHUB_WORKSPACE" -w "$W" shardspec "$S" --verbose > "$out/run-docker-$mode.txt" 2>&1
+            $T docker run --rm $extra -v "$GITHUB_WORKSPACE":"$GITHUB_WORKSPACE" -w "$W" shardspec "$S" --verbose > "$out/run-docker-$mode.txt" 2>&1
             echo "== docker $mode exit=$?"; tail -n 6 "$out/run-docker-$mode.txt"
           done
           sudo chown -R "$uid:$gid" "$out"
@@ -147,6 +162,24 @@ jobs:
           path: shard-out/shard-format.patch
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Gate (fail on any spec failure)
+        run: |
+          set -u
+          cd shard-out
+          bad=0
+          for f in run-*.txt; do
+            [ -f "$f" ] || continue
+            summary=$(grep -Eo '[0-9]+ examples, [0-9]+ failures, [0-9]+ errors, [0-9]+ pending' "$f" | tail -1)
+            if [ -z "$summary" ]; then echo "::error::$f has no spec summary (crash or hang)"; bad=1; continue; fi
+            echo "$f: $summary"
+            echo "$summary" | grep -Eq ' 0 failures, 0 errors' || { echo "::error::$f: $summary"; bad=1; }
+          done
+          # a spec binary that failed to build leaves no run file at all
+          for f in run-plain-process-handle.txt run-plain-process-supervision.txt run-stress.txt; do
+            [ -f "$f" ] || { echo "::error::$f is missing (did the spec build fail? see build-*.txt)"; bad=1; }
+          done
+          exit $bad
 
   shard-windows:
     if: ${{ startsWith(inputs.runner || '', 'windows') }}
@@ -177,12 +210,16 @@ jobs:
           & crystal build --no-color -o (Join-Path $out "stdio_child.exe") (Join-Path $ws "process-supervision\spec\support\stdio_child.cr") *> (Join-Path $out "build-stdio-child.txt")
           "build stdio_child exit=$LASTEXITCODE"
           Get-Content (Join-Path $out "build-stdio-child.txt") -TotalCount 40
+          & crystal build --no-color -o (Join-Path $out "service_child.exe") (Join-Path $ws "process-supervision\spec\support\service_child.cr") *> (Join-Path $out "build-service-child.txt")
+          "build service_child exit=$LASTEXITCODE"
+          Get-Content (Join-Path $out "build-service-child.txt") -TotalCount 40
           exit 0
 
       - name: Run the specs
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE "shard-out"
           $env:PROCESS_SUPERVISION_STDIO_CHILD = Join-Path $out "stdio_child.exe"
+          $env:PROCESS_SUPERVISION_SERVICE_CHILD = Join-Path $out "service_child.exe"
           foreach ($s in "process-handle", "process-supervision") {
             $exe = Join-Path $out "spec-$s.exe"
             if (!(Test-Path $exe)) { "no binary for $s"; continue }
@@ -202,3 +239,22 @@ jobs:
           path: shard-out/*.txt
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Gate (fail on any spec failure)
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "shard-out"
+          $bad = $false
+          $files = Get-ChildItem -Path $out -Filter "run-*.txt" -ErrorAction SilentlyContinue
+          if (-not $files) { Write-Output "::error::no spec ran"; exit 1 }
+          # a spec binary that failed to build leaves no run file at all
+          foreach ($name in @("run-plain-process-handle.txt", "run-plain-process-supervision.txt")) {
+            if (-not (Test-Path (Join-Path $out $name))) { Write-Output "::error::$name is missing (did the spec build fail? see build-*.txt)"; $bad = $true }
+          }
+          foreach ($f in $files) {
+            $m = Select-String -Path $f.FullName -Pattern '\d+ examples, \d+ failures, \d+ errors, \d+ pending' | Select-Object -Last 1
+            if (-not $m) { Write-Output "::error::$($f.Name) has no spec summary (crash or hang)"; $bad = $true; continue }
+            $summary = $m.Matches[0].Value
+            Write-Output "$($f.Name): $summary"
+            if ($summary -notmatch ' 0 failures, 0 errors') { Write-Output "::error::$($f.Name): $summary"; $bad = $true }
+          }
+          if ($bad) { exit 1 }

@@ -6,7 +6,9 @@
     @[Flags]
     enum Access : UInt32
       Terminate               =     0x0001
+      VmRead                  =     0x0010
       SetQuota                =     0x0100
+      SuspendResume           =     0x0800
       QueryLimitedInformation =     0x1000
       Synchronize             = 0x00100000
     end

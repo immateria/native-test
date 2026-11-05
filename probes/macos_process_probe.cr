@@ -126,6 +126,17 @@ def probe_failure_text(ex : Exception) : String
   "#{ex.class.name}: #{ex.message} @ #{ex.backtrace?.try(&.first?) || "no-backtrace"}"
 end
 
+# An output target whose writes fail (r14 copy-error case).
+class R14FailingWriteIO < IO
+  def read(slice : Bytes) : Int32
+    0
+  end
+
+  def write(slice : Bytes) : Nil
+    raise IO::Error.new("injected write failure")
+  end
+end
+
 module NativeProbe
   @@failures = 0
   @@skipped = 0
@@ -483,6 +494,197 @@ module NativeProbe
       fflags_hex: event.fflags.to_s(16), data: event.data,
       udata: event.udata.address.to_u64, eof: (event.flags & EV_EOF) != 0,
       error: (event.flags & EV_ERROR) != 0)
+  end
+
+  # Revision 14: ProcessSupervision.spawn, standard-stream options (Pipe/Close/IO objects) and the process-group
+  # descendant marker that finds a descendant which left the group.
+  def self.run_r14_spawn_streams_matrix : Nil
+    pipe = Process::Redirect::Pipe
+
+    test("r14_supervision_spawn_uses_tracked_process_group") do
+      child = ProcessSupervision.spawn("/bin/sh", ["-c", "exit 0"])
+      begin
+        status = child.wait(5.seconds)
+        group = child.group
+        tracked = group.as?(ProcessSupervision::POSIX::ProcessGroup).try(&.tracks_descendants?)
+        result = group.shutdown
+        {group.mechanism.process_group? && tracked == true && status.try(&.success?) == true && result.drained?,
+         details(mechanism: group.mechanism, tracked: tracked, status: status.try(&.exit_code))}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_spawn_pipe_round_trip_and_eof") do
+      child = r14_leader("/bin/cat", input: pipe, output: pipe)
+      begin
+        child.input.print "hello\nworld\n"
+        child.input.close
+        text = child.output.gets_to_end
+        status = child.wait(5.seconds)
+        {text == "hello\nworld\n" && status.try(&.success?) == true, details(text: text.inspect)}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_spawn_stdout_and_stderr_apart") do
+      child = r14_leader("/bin/sh", ["-c", "echo out; echo err >&2"], output: pipe, error: pipe)
+      begin
+        stdout_text = child.output.gets_to_end
+        stderr_text = child.error.gets_to_end
+        status = child.wait(5.seconds)
+        {stdout_text == "out\n" && stderr_text == "err\n" && status.try(&.success?) == true,
+         details(stdout: stdout_text.inspect, stderr: stderr_text.inspect)}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_spawn_close_is_null_device") do
+      child = r14_leader("/bin/cat", input: Process::Redirect::Close, output: pipe)
+      begin
+        text = child.output.gets_to_end
+        status = child.wait(5.seconds)
+        {text.empty? && status.try(&.success?) == true, details(text: text.inspect)}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_spawn_io_objects_copied_both_ways") do
+      data = "0123456789abcdef" * 65_536
+      target = IO::Memory.new
+      child = r14_leader("/bin/cat", input: IO::Memory.new(data), output: target)
+      begin
+        status = child.wait(10.seconds)
+        {status.try(&.success?) == true && target.to_s == data, details(bytes: target.size, expected: data.bytesize)}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_spawn_child_ignoring_input_io_keeps_status") do
+      child = r14_leader("/bin/sh", ["-c", "exit 3"], input: IO::Memory.new("x" * 1_048_576))
+      begin
+        status = child.wait(10.seconds)
+        {status.try(&.exit_code) == 3, details(status: status.try(&.exit_code))}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_spawn_copy_error_raised_status_kept") do
+      child = r14_leader("/bin/sh", ["-c", "echo out"], output: R14FailingWriteIO.new)
+      begin
+        raised = begin
+          child.wait(5.seconds)
+          "none"
+        rescue ex : IO::Error
+          ex.message || ""
+        end
+        status = child.status
+        {raised.includes?("injected") && status.try(&.success?) == true, details(raised: raised, status: status.try(&.exit_code))}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_spawn_failed_exec_no_descriptor_growth") do
+      attempt = -> do
+        begin
+          r14_leader("/nonexistent-r14/program", input: pipe, output: pipe, error: pipe)
+        rescue
+        end
+        begin
+          r14_leader("/nonexistent-r14/program", input: IO::Memory.new("x"), output: IO::Memory.new)
+        rescue
+        end
+      end
+      3.times { attempt.call }
+      before = Dir.children("/dev/fd").size
+      30.times { attempt.call }
+      after = Dir.children("/dev/fd").size
+      {after == before, details(before: before, after: after, attempts: 60)}
+    end
+
+    test("r14_marker_in_environment_with_clear_env") do
+      child = r14_leader("/usr/bin/env", clear_env: true, output: pipe)
+      begin
+        text = child.output.gets_to_end
+        child.wait(5.seconds)
+        count = text.lines.count(&.starts_with?("PROCESS_SUPERVISION_GROUP="))
+        {count == 1, details(marker_lines: count)}
+      ensure
+        r14_release(child)
+      end
+    end
+
+    test("r14_marker_finds_setsid_escapee_and_shutdown_ends_it") do
+      child = r14_leader("/bin/sh", ["-c", %q(perl -MPOSIX -e 'POSIX::setsid(); sleep 30' & echo $!; wait)], output: pipe)
+      group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      escaped = 0_i64
+      begin
+        escaped = child.output.gets.not_nil!.strip.to_i64
+        left = r14_left_group(escaped, group.pgid)
+        started = Time.instant
+        found = group.escapees
+        scan_ms = (Time.instant - started).total_milliseconds.round(2)
+        drained = group.shutdown(grace: 5.seconds, kill_after: 5.seconds, close: false).drained?
+        gone = r14_gone?(escaped, 5.seconds)
+        {left && found == [escaped] && drained && gone,
+         details(left_group: left, found: found.join(","), escaped: escaped, drained: drained, gone: gone, scan_ms: scan_ms)}
+      ensure
+        LibC.kill(escaped.to_i32, Signal::KILL.value) if escaped > 0
+        r14_release(child)
+      end
+    end
+
+    test("r14_untracked_group_loses_setsid_escapee") do
+      child = r14_leader("/bin/sh", ["-c", %q(perl -MPOSIX -e 'POSIX::setsid(); sleep 30' & echo $!; wait)], output: pipe,
+        track_descendants: false)
+      group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      escaped = 0_i64
+      begin
+        escaped = child.output.gets.not_nil!.strip.to_i64
+        left = r14_left_group(escaped, group.pgid)
+        drained = group.shutdown(grace: 5.seconds, kill_after: 5.seconds, close: false).drained?
+        survived = !r14_gone?(escaped, 300.milliseconds)
+        {left && !group.tracks_descendants? && drained && survived,
+         details(left_group: left, drained: drained, survived: survived, contract: "a bare process group cannot reach a setsid descendant")}
+      ensure
+        LibC.kill(escaped.to_i32, Signal::KILL.value) if escaped > 0
+        r14_release(child)
+      end
+    end
+  end
+
+  def self.r14_leader(command : String, args = [] of String, **options) : ProcessSupervision::Child
+    ProcessSupervision::POSIX::ProcessGroup.spawn_leader(command, args, **options)
+  end
+
+  def self.r14_release(child : ProcessSupervision::Child) : Nil
+    child.group.kill rescue nil
+    child.wait(5.seconds) rescue nil
+    child.close rescue nil
+    child.group.close rescue nil
+  end
+
+  def self.r14_left_group(pid : Int64, pgid : Int64) : Bool
+    deadline = Time.instant + 5.seconds
+    until LibC.getpgid(pid.to_i32) != pgid.to_i32 || Time.instant > deadline
+      sleep 10.milliseconds
+    end
+    LibC.getpgid(pid.to_i32) != pgid.to_i32
+  end
+
+  def self.r14_gone?(pid : Int64, within : Time::Span) : Bool
+    deadline = Time.instant + within
+    loop do
+      return true if LibC.kill(pid.to_i32, 0) != 0 && Errno.value == Errno::ESRCH
+      return false if Time.instant > deadline
+      sleep 10.milliseconds
+    end
   end
 
   def self.child_mode : NoReturn
@@ -5083,6 +5285,7 @@ module NativeProbe
     run_completion_matrix
     run_r6_matrix
     run_r9_source_matrix
+    run_r14_spawn_streams_matrix
   ensure
     finish
   end

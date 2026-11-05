@@ -5,6 +5,8 @@ require "./process-handle/identity"
 require "./process-handle/observation"
 require "./process-handle/handle"
 require "./process-handle/execution"
+require "./process-handle/usage"
+require "./process-handle/snapshot"
 
 {% if flag?(:linux) %}
   require "./process-handle/linux/base"

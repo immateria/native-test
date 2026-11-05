@@ -1,5 +1,6 @@
 require "./spec_helper"
 require "file_utils"
+require "./features_spec"
 
 # Several examples use the spec process's own group as a stand-in group. Inside a container the spec binary is
 # commonly PID 1 and leads process group 1, which ProcessGroup refuses to address (kill(-1, sig) is a broadcast).
@@ -7,6 +8,17 @@ private def spec_pgid : Int64
   pgid = Process.pgid
   pending!("this process leads process group 1 (PID 1 of a container)") if pgid == 1
   pgid
+end
+
+# An output target whose writes fail, for the copy-error examples.
+private class FailingWriteIO < IO
+  def read(slice : Bytes) : Int32
+    0
+  end
+
+  def write(slice : Bytes) : Nil
+    raise IO::Error.new("injected write failure")
+  end
 end
 
 private class ShutdownFailureGroup < ProcessSupervision::Group
@@ -100,7 +112,7 @@ end
 {% else %}
   describe ProcessSupervision do
     it "loads the public surface" do
-      ProcessSupervision::VERSION.should eq("0.7.0")
+      ProcessSupervision::VERSION.should eq("0.9.0")
     end
   end
 {% end %}
@@ -610,16 +622,18 @@ end
 
     it "uses the fork path, entering the cgroup before exec, when clone3 is refused" do
       group = new_cgroup
+      previous = ProcessSupervision::Linux::RawSpawn.clone3_disabled?
       ProcessSupervision::Linux::RawSpawn.clone3_disabled = true
       begin
         with_temp_dir do |dir|
           output = File.join(dir, "cgroup")
           child = group.spawn("/bin/sh", ["-c", %q(cat /proc/self/cgroup > "$1"), "sh", output])
+          ProcessSupervision::Linux::RawSpawn.last_engine.should eq("fork")
           finish(child).success?.should be_true
           File.read(output).should contain(File.basename(group.path.to_s))
         end
       ensure
-        ProcessSupervision::Linux::RawSpawn.clone3_disabled = false
+        ProcessSupervision::Linux::RawSpawn.clone3_disabled = previous
         group.close
       end
     end
@@ -653,9 +667,17 @@ end
       mount = ProcessSupervision::Linux::CgroupV2.mountpoint
       pending!("no cgroup-v2 mount") unless mount
       pending!("a cgroup can be created in this environment") if ProcessSupervision::Linux::CgroupV2.delegated_parent
-      # EACCES for an ordinary user, EROFS for a default container: both Unavailable, so a fallback_pgid is honoured
-      expect_raises(ProcessSupervision::Error::Unavailable) do
-        ProcessSupervision::Linux::CgroupV2.create(mount.not_nil!, "ps-spec-unwritable")
+      # EACCES for an ordinary user, EROFS for a default container: both Unavailable, so a fallback_pgid is honoured.
+      # Root on a host whose v2 hierarchy is not the system's main one (a v1/v2 hybrid host) may create there:
+      # delegated_parent never offers the hierarchy root, so that case is not an error and is cleaned up.
+      created = begin
+        ProcessSupervision::Linux::CgroupV2.create(mount.not_nil!, "ps-spec-unwritable-#{Process.pid}")
+      rescue ex : ProcessSupervision::Error::Unavailable
+        nil
+      end
+      if created
+        created.close
+        pending!("the hierarchy root accepts new cgroups for this user (root on a hybrid host)")
       end
     end
 
@@ -701,6 +723,81 @@ end
 {% end %}
 
 {% if flag?(:unix) %}
+  # A shell that starts a descendant which leaves the process group (a new session) and prints its pid.
+  private def escape_script : String
+    {% if flag?(:darwin) %}
+      %q(perl -MPOSIX -e 'POSIX::setsid(); sleep 60' & echo $!; wait)
+    {% else %}
+      %q(setsid sleep 60 & echo $!; wait)
+    {% end %}
+  end
+
+  private def gone?(pid : Int64, within : Time::Span = 5.seconds) : Bool
+    deadline = Time.instant + within
+    loop do
+      return true if LibC.kill(pid.to_i32, 0) != 0 && Errno.value == Errno::ESRCH
+      return false if Time.instant > deadline
+      sleep 10.milliseconds
+    end
+  end
+
+  private def left_group(pid : Int64, pgid : Int64) : Bool
+    deadline = Time.instant + 5.seconds
+    until LibC.getpgid(pid.to_i32) != pgid.to_i32 || Time.instant > deadline
+      sleep 10.milliseconds
+    end
+    LibC.getpgid(pid.to_i32) != pgid.to_i32
+  end
+
+  describe "ProcessSupervision::POSIX::ProcessGroup descendant tracking" do
+    it "marks the children's environment, also when it starts empty" do
+      child = leader("/usr/bin/env", clear_env: true, output: Process::Redirect::Pipe)
+      text = child.output.gets_to_end
+      finish(child).success?.should be_true
+      group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      group.tracks_descendants?.should be_true
+      text.lines.count(&.starts_with?("PROCESS_SUPERVISION_GROUP=")).should eq(1)
+      group.close
+    end
+
+    it "finds a descendant that left the group, and shutdown ends it too" do
+      child = leader("/bin/sh", ["-c", escape_script], output: Process::Redirect::Pipe)
+      group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      escaped = 0_i64
+      begin
+        escaped = child.output.gets.not_nil!.strip.to_i64
+        left_group(escaped, group.pgid).should be_true
+        group.escapees.should eq([escaped])
+        group.empty?.should be_false
+        group.shutdown(grace: 5.seconds, kill_after: 5.seconds, close: false).drained?.should be_true
+        gone?(escaped).should be_true
+        group.escapees.should be_empty
+      ensure
+        LibC.kill(escaped.to_i32, Signal::KILL.value) if escaped > 0 && !gone?(escaped, 0.seconds)
+        child.close
+        group.close
+      end
+    end
+
+    it "loses the descendant without tracking, which is what a bare process group does" do
+      child = leader("/bin/sh", ["-c", escape_script], output: Process::Redirect::Pipe, track_descendants: false)
+      group = child.group.as(ProcessSupervision::POSIX::ProcessGroup)
+      escaped = 0_i64
+      begin
+        escaped = child.output.gets.not_nil!.strip.to_i64
+        left_group(escaped, group.pgid).should be_true
+        group.tracks_descendants?.should be_false
+        group.escapees.should be_empty
+        group.shutdown(grace: 5.seconds, kill_after: 5.seconds, close: false).drained?.should be_true
+        gone?(escaped, 300.milliseconds).should be_false
+      ensure
+        LibC.kill(escaped.to_i32, Signal::KILL.value) if escaped > 0
+        child.close
+        group.close
+      end
+    end
+  end
+
   describe "ProcessSupervision standard stream redirection" do
     pipe = Process::Redirect::Pipe
 
@@ -792,8 +889,50 @@ end
       input.not_nil!.closed?.should be_true
     end
 
-    it "rejects stream objects it cannot hand to a child" do
-      expect_raises(ArgumentError) { leader("true", output: IO::Memory.new) }
+    it "copies between a child and IO objects that are not file descriptors" do
+      source = IO::Memory.new("through memory\n")
+      target = IO::Memory.new
+      child = leader("cat", input: source, output: target)
+      finish(child).success?.should be_true
+      child.group.close
+      target.to_s.should eq("through memory\n")
+    end
+
+    it "copies a megabyte through IO objects in both directions" do
+      data = "0123456789abcdef" * 65_536
+      target = IO::Memory.new
+      child = leader("cat", input: IO::Memory.new(data), output: target, error: IO::Memory.new)
+      finish(child).success?.should be_true
+      child.group.close
+      (target.to_s == data).should be_true
+    end
+
+    it "returns the status of a child that exits without reading its input IO" do
+      child = leader("sh", ["-c", "exit 3"], input: IO::Memory.new("x" * 1_048_576))
+      finish(child).exit_code.should eq(3)
+      child.group.close
+    end
+
+    it "hands a closed IO the null device" do
+      closed = IO::Memory.new
+      closed.close
+      target = IO::Memory.new
+      child = leader("cat", input: closed, output: target)
+      finish(child).success?.should be_true
+      child.group.close
+      target.to_s.should eq("")
+    end
+
+    it "raises a failed copy from wait and still records the status" do
+      child = leader("sh", ["-c", "echo out"], output: FailingWriteIO.new)
+      begin
+        expect_raises(IO::Error, /injected/) { child.wait(10.seconds) }
+        expect_raises(IO::Error, /injected/) { child.wait }
+        child.status.not_nil!.success?.should be_true
+      ensure
+        child.close
+        child.group.close
+      end
     end
 
     it "leaks no descriptors when the exec fails" do
@@ -801,6 +940,7 @@ end
       before = Dir.children(fd_directory).size
       30.times do
         expect_raises(File::NotFoundError) { leader("/nonexistent-ps-spec/program", input: pipe, output: pipe, error: pipe) }
+        expect_raises(File::NotFoundError) { leader("/nonexistent-ps-spec/program", input: IO::Memory.new("x"), output: IO::Memory.new) }
       end
       Dir.children(fd_directory).size.should eq(before)
     end
@@ -823,7 +963,8 @@ end
     {false, true}.each do |forced|
       it "pipes the streams of a child inside the cgroup (fork path forced: #{forced})" do
         group = new_cgroup
-        ProcessSupervision::Linux::RawSpawn.clone3_disabled = forced
+        previous = ProcessSupervision::Linux::RawSpawn.clone3_disabled?
+        ProcessSupervision::Linux::RawSpawn.clone3_disabled = forced || previous
         begin
           child = group.spawn("sh", ["-c", "cat /proc/self/cgroup; cat"], input: Process::Redirect::Pipe, output: Process::Redirect::Pipe)
           child.input.print "tail\n"
@@ -834,7 +975,7 @@ end
           child.wait(10.seconds).not_nil!.success?.should be_true
           child.close
         ensure
-          ProcessSupervision::Linux::RawSpawn.clone3_disabled = false
+          ProcessSupervision::Linux::RawSpawn.clone3_disabled = previous
           group.close
         end
       end
@@ -974,10 +1115,45 @@ end
       input.not_nil!.closed?.should be_true
     end
 
-    it "rejects stream objects it cannot hand to a child, before creating anything" do
+    it "copies between a child and IO objects that are not file descriptors" do
       in_job do |job|
-        expect_raises(ArgumentError) { job.spawn(stdio_child, ["cat"], output: IO::Memory.new) }
-        job.empty?.should be_true
+        target = IO::Memory.new
+        child = job.spawn(stdio_child, ["cat"], input: IO::Memory.new("through memory\n"), output: target)
+        child.wait(10.seconds).not_nil!.success?.should be_true
+        child.close
+        target.to_s.should eq("through memory\n")
+      end
+    end
+
+    it "copies a megabyte through IO objects in both directions" do
+      data = "0123456789abcdef" * 65_536
+      in_job do |job|
+        target = IO::Memory.new
+        child = job.spawn(stdio_child, ["cat"], input: IO::Memory.new(data), output: target)
+        child.wait(10.seconds).not_nil!.success?.should be_true
+        child.close
+        (target.to_s == data).should be_true
+      end
+    end
+
+    it "returns the status of a child that exits without reading its input IO" do
+      in_job do |job|
+        child = job.spawn(stdio_child, ["split"], input: IO::Memory.new("x" * 1_048_576), output: Process::Redirect::Close,
+          error: Process::Redirect::Close)
+        child.wait(10.seconds).not_nil!.success?.should be_true
+        child.close
+      end
+    end
+
+    it "raises a failed copy from wait and still records the status" do
+      in_job do |job|
+        child = job.spawn(stdio_child, ["split"], output: FailingWriteIO.new, error: Process::Redirect::Close)
+        begin
+          expect_raises(IO::Error, /injected/) { child.wait(10.seconds) }
+          child.status.not_nil!.success?.should be_true
+        ensure
+          child.close
+        end
       end
     end
 
@@ -986,8 +1162,11 @@ end
         missing = File.join(Dir.tempdir, "ps-spec-missing-#{Random.new.hex(4)}.exe")
         3.times { expect_raises(Exception) { job.spawn(missing, input: pipe, output: pipe, error: pipe) } }
         before = handle_count
-        30.times { expect_raises(Exception) { job.spawn(missing, input: pipe, output: pipe, error: pipe) } }
-        # 30 attempts with three pipes each: a leak of even one handle per attempt would show as 30
+        30.times do
+          expect_raises(Exception) { job.spawn(missing, input: pipe, output: pipe, error: pipe) }
+          expect_raises(Exception) { job.spawn(missing, input: IO::Memory.new("x"), output: IO::Memory.new) }
+        end
+        # 60 attempts with two or three pipes each: a leak of even one handle per attempt would show as 60
         handle_count.should be <= before + 5
       end
     end
@@ -1022,6 +1201,87 @@ end
         child.group.shutdown
       ensure
         child.close
+      end
+    end
+  end
+{% end %}
+
+{% if flag?(:linux) %}
+  # The engine a spawn should have used here: the forced one, else pidfd_spawn where the C library has it (for a cgroup,
+  # with posix_spawnattr_setcgroup_np), else clone3; fork wherever a seccomp filter refused clone3.
+  private def expected_engines(cgroup : Bool) : Array(String)
+    case ENV["PROCESS_SUPERVISION_SPEC_ENGINE"]?
+    when "fork"   then ["fork"]
+    when "clone3" then ["clone3", "fork"]
+    else
+      ProcessSupervision::Linux::RawSpawn.pidfd_spawn_available?(cgroup) ? ["pidfd_spawn", "fork"] : ["clone3", "fork"]
+    end
+  end
+
+  private def median_spawn_time(samples : Int32) : Time::Span
+    times = Array.new(samples) do
+      started = Time.instant
+      child = ProcessSupervision::POSIX::ProcessGroup.spawn_leader("true")
+      elapsed = Time.instant - started
+      child.wait(10.seconds)
+      child.close
+      child.group.close
+      elapsed
+    end
+    times.sort[samples // 2]
+  end
+
+  describe "ProcessSupervision::Linux spawn engines" do
+    it "uses pidfd_spawn for a process group wherever the C library has it" do
+      child = ProcessSupervision::POSIX::ProcessGroup.spawn_leader("true")
+      engine = ProcessSupervision::Linux::RawSpawn.last_engine
+      child.wait(10.seconds).not_nil!.success?.should be_true
+      child.close
+      child.group.close
+      expected_engines(false).should contain(engine)
+      STDERR.puts "[engine] process group: #{engine} (pidfd_spawn available: #{ProcessSupervision::Linux::RawSpawn.pidfd_spawn_available?})"
+    end
+
+    it "uses pidfd_spawn with a cgroup attribute for a cgroup wherever the C library has it" do
+      group = new_cgroup
+      begin
+        child = group.spawn("/bin/sh", ["-c", "cat /proc/self/cgroup"], output: Process::Redirect::Pipe)
+        engine = ProcessSupervision::Linux::RawSpawn.last_engine
+        child.output.gets_to_end.should contain(File.basename(group.path.to_s))
+        child.wait(10.seconds).not_nil!.success?.should be_true
+        child.close
+        expected_engines(true).should contain(engine)
+        STDERR.puts "[engine] cgroup: #{engine} (setcgroup available: #{ProcessSupervision::Linux::RawSpawn.pidfd_spawn_available?(true)})"
+      ensure
+        group.close
+      end
+    end
+
+    it "leaves no descriptor behind when exec fails, whichever C library is in use" do
+      fd_directory = "/proc/self/fd"
+      before = Dir.children(fd_directory).size
+      closed_before = ProcessSupervision::Linux::RawSpawn.leaked_pidfds_closed
+      20.times { expect_raises(File::NotFoundError) { ProcessSupervision::POSIX::ProcessGroup.spawn_leader("/nonexistent-ps-spec/program") } }
+      Dir.children(fd_directory).size.should eq(before)
+      STDERR.puts "[engine] engine=#{ProcessSupervision::Linux::RawSpawn.last_engine} leaked pidfds closed: #{ProcessSupervision::Linux::RawSpawn.leaked_pidfds_closed - closed_before} of 20 failed spawns"
+    end
+
+    it "spawns without copying a large heap where pidfd_spawn is available" do
+      pending!("pidfd_spawn is not in this C library") unless ProcessSupervision::Linux::RawSpawn.pidfd_spawn_available?
+      pending!("an engine is forced for this run") if ENV["PROCESS_SUPERVISION_SPEC_ENGINE"]?
+      ballast = Bytes.new(512 * 1024 * 1024, 1_u8) # touched, so the pages are really mapped
+      begin
+        spawn_time = median_spawn_time(15)
+        ProcessSupervision::Linux::RawSpawn.clone3_disabled = true
+        fork_time = begin
+          median_spawn_time(15)
+        ensure
+          ProcessSupervision::Linux::RawSpawn.clone3_disabled = false
+        end
+        STDERR.puts "[engine-timing] heap=512MiB pidfd_spawn median=#{spawn_time.total_milliseconds.round(2)}ms fork median=#{fork_time.total_milliseconds.round(2)}ms"
+        spawn_time.should be < fork_time
+      ensure
+        ballast[0].should eq(1_u8)
       end
     end
   end

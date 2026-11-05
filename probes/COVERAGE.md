@@ -1,8 +1,8 @@
 # Revision 12 literal coverage ledger
 
-Revision 12 is bound to Crystal Process Development **checkpoint 0009** and contains **890 individually named behavioral checks**: **459 Windows Crystal**, **386 macOS Crystal**, and **45 independent macOS C/SDK** checks. The names below are the qualification authority used by the handback validator; a current-revision handback is incomplete if any expected name is absent.
+Revision 12 is bound to Crystal Process Development **checkpoint 0009** and contains **910 individually named behavioral checks**: **468 Windows Crystal**, **397 macOS Crystal**, and **45 independent macOS C/SDK** checks. The names below are the qualification authority used by the handback validator; a current-revision handback is incomplete if any expected name is absent.
 
-## Windows Crystal — 459 cases
+## Windows Crystal — 468 cases
 
 - `identity_generation_proof_rules`
 - `pid_validation_all_public_entrypoints`
@@ -463,8 +463,17 @@ Revision 12 is bound to Crystal Process Development **checkpoint 0009** and cont
 - `r7_finite_wait_sequence_15ms_x16`
 - `r7_finite_wait_sequence_30ms_x8`
 - `r7_parent_immediate_job_limit_snapshot`
+- `r14_supervision_spawn_uses_job_object`
+- `r14_spawn_pipe_round_trip_and_eof`
+- `r14_spawn_stdout_and_stderr_apart`
+- `r14_spawn_close_is_null_device`
+- `r14_spawn_file_descriptor_streams`
+- `r14_spawn_io_objects_copied_both_ways`
+- `r14_spawn_copy_error_raised_status_kept`
+- `r14_spawn_failed_creation_no_handle_growth`
+- `r14_job_kill_ends_pipe_a_grandchild_held`
 
-## macOS Crystal — 386 cases
+## macOS Crystal — 397 cases
 
 - `identity_generation_equality_and_pid_reuse_model`
 - `pid_input_rejection_zero_negative_and_overflow`
@@ -852,6 +861,17 @@ Revision 12 is bound to Crystal Process Development **checkpoint 0009** and cont
 - `r7_unreaped_zombie_presence_is_not_false_dead`
 - `r7_kinfo_fallback_recovers_unreaped_zombie_and_generation`
 - `r13_group_signal_zombie_only_group_is_not_fatal`
+- `r14_supervision_spawn_uses_tracked_process_group`
+- `r14_spawn_pipe_round_trip_and_eof`
+- `r14_spawn_stdout_and_stderr_apart`
+- `r14_spawn_close_is_null_device`
+- `r14_spawn_io_objects_copied_both_ways`
+- `r14_spawn_child_ignoring_input_io_keeps_status`
+- `r14_spawn_copy_error_raised_status_kept`
+- `r14_spawn_failed_exec_no_descriptor_growth`
+- `r14_marker_in_environment_with_clear_env`
+- `r14_marker_finds_setsid_escapee_and_shutdown_ends_it`
+- `r14_untracked_group_loses_setsid_escapee`
 
 ## macOS independent SDK/C — 45 cases
 

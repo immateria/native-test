@@ -133,8 +133,19 @@ semantics remain with `pty`.
 3. ~~Race-free Linux initial cgroup containment.~~ Done: `CgroupV2#spawn` (clone3 `CLONE_INTO_CGROUP`, fork fallback),
    qualified in plain, root, systemd `Delegate=yes`, user-manager and container environments.
 4. FreeBSD process-reaper investigation. The macOS capability matrix is measured (kqueue tracking refused, environment
-   marker scan works, `START_SUSPENDED` works); a macOS descendant tracker is not implemented.
+   marker scan works, `START_SUSPENDED` works); the marker is implemented for Linux and macOS process groups.
 5. Capability reporting is done by trying (`CgroupV2.usable?`, `delegated_parent`, `ProcessSupervision.strongest_mechanism`);
    adopting an already-running process into a group is still open.
-6. Stdio redirection is done for Linux, macOS and Windows Jobs (Inherit/Close/Pipe/FileDescriptor); arbitrary `IO` targets
-   are open, as is `posix_spawn` as the Linux engine for process groups.
+6. Done: stdio redirection on Linux, macOS and Windows Jobs (Inherit/Close/Pipe/FileDescriptor and any `IO`, copied through
+   a pipe); `pidfd_spawn` as the first Linux engine; the process-group descendant marker (`ProcessGroup#escapees`).
+7. Open: a `pidfd_spawn` that a seccomp filter refuses is detected by `ENOSYS` only; a C library with `pidfd_spawn` but a
+   fix for BZ 31695 is handled by the same code path (the probe finds nothing to close) but was not run here.
+8. First cut, built in one pass (see `ROADMAP.md`): `SpawnOptions` on every backend (an option a backend cannot honour
+   raises `Error::Unsupported` before anything is created; on Linux the options only `pidfd_spawn` can express keep it as
+   the engine, the rest move to clone3/fork with the setup done in the child in a fixed order: cgroup, session/group,
+   descriptors, namespaces, rlimits, umask, death signal, credentials, `no_new_privs`, signals, directory, exec);
+   `Group#signal`/`suspend`/`resume`/`request_stop`/`stop`; `ExitOutcome`; `ProcessHandle#usage` and process snapshots;
+   `Lifeline`; cgroup limits, statistics and `SystemdScope`; the `Supervisor` layer (restart policy, sd_notify readiness
+   and watchdog, bounded logs, dependencies, events). Rules this pass added: no blocking Crystal I/O under a
+   `Thread::Mutex` (execution contexts move fibers between threads), and descriptors that are only waited on are
+   wrapped with `IO::FileDescriptor.new(handle:)` so their blocking mode is left as it is.

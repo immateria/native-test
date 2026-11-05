@@ -148,7 +148,7 @@ require "./spec_helper"
 {% else %}
   describe ProcessHandle do
     it "loads the public surface" do
-      ProcessHandle::VERSION.should eq("0.8.0")
+      ProcessHandle::VERSION.should eq("0.10.0")
     end
   end
 {% end %}
@@ -165,6 +165,53 @@ require "./spec_helper"
 
     it "does not claim that a proc_pidinfo snapshot is a stable process handle" do
       expect_raises(ProcessHandle::Error::Unsupported) { ProcessHandle.open(Process.pid) }
+    end
+
+    it "keeps every exit watch in one shared kqueue and wakes every waiter on exit" do
+      warm = Process.new("/bin/sleep", ["30"])
+      ProcessHandle::Kqueue.watch(warm.pid).close # the watcher's own descriptors exist from here on
+      before = Dir.children("/dev/fd").size
+      sleepers = Array.new(50) { Process.new("/bin/sleep", ["30"]) }
+      handles = sleepers.map { |child| ProcessHandle::Kqueue.watch(child.pid) }
+      extra = Array.new(3) { ProcessHandle::Kqueue.watch(sleepers[0].pid) }
+      (Dir.children("/dev/fd").size - before).should be <= 2
+      handles.all?(&.alive?).should be_true
+
+      done = Channel(Bool).new
+      (handles + extra).each { |handle| spawn { done.send(handle.wait(10.seconds)) } }
+      sleep 50.milliseconds
+      sleepers.each(&.signal(Signal::KILL))
+      results = Array.new(handles.size + extra.size) { done.receive }
+      results.all?.should be_true
+      (handles + extra).none?(&.alive?).should be_true
+      sleepers.each(&.wait)
+      (handles + extra).each(&.close)
+      warm.signal(Signal::KILL)
+      warm.wait
+    end
+
+    it "wakes a waiter when the process exits, and times out while it runs" do
+      child = Process.new("/bin/sleep", ["0.3"])
+      handle = ProcessHandle::Kqueue.watch(child.pid)
+      started = Time.instant
+      handle.wait(30.milliseconds).should be_false
+      (Time.instant - started).should be < 1.second
+      handle.wait(10.seconds).should be_true
+      (Time.instant - started).should be < 3.seconds
+      child.wait
+      handle.close
+    end
+
+    it "sees an exit as soon as the process is reaped" do
+      20.times do
+        child = Process.new("/bin/sleep", ["0.01"])
+        handle = ProcessHandle::Kqueue.watch(child.pid)
+        child.wait
+        handle.alive?.should be_false
+        handle.close
+        # the pid may be recycled now; a new watch on it is never the old one
+        ProcessHandle::Kqueue.watch(child.pid).tap { |again| again.alive?.should be_false; again.close }
+      end
     end
   end
 {% end %}
