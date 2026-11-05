@@ -481,6 +481,46 @@ require "file_utils"
       end
     end
 
+    it "refuses to run as a service when the SCM did not start the program" do
+      expect_raises(ProcessSupervision::Error::Unavailable, /service control manager/) do
+        ProcessSupervision::Windows::Service.run("ps-not-a-service", start_timeout: 10.seconds) { }
+      end
+    end
+
+    it "runs a supervisor as a Windows service: install, start, stop with its workers, uninstall" do
+      exe = ENV["PROCESS_SUPERVISION_SERVICE_CHILD"]?
+      pending!("PROCESS_SUPERVISION_SERVICE_CHILD is not set") unless exe && File.exists?(exe)
+      service = ProcessSupervision::Windows::Service
+      name = "ps-spec-#{Process.pid}-#{Random.rand(100_000)}"
+      log = Path[Dir.tempdir] / "#{name}.log"
+      service.install(name, exe, [log.to_s, name], description: "process-supervision spec")
+      begin
+        service.state(name).should eq(ProcessSupervision::Windows::Service::State::Stopped)
+        service.start(name)
+        deadline = Time.instant + 30.seconds
+        until (File.exists?(log) && File.read(log).includes?("worker=")) || Time.instant > deadline
+          sleep 50.milliseconds
+        end
+        text = File.read(log)
+        service.state(name).should eq(ProcessSupervision::Windows::Service::State::Running)
+        service_pid = service.process_id(name).not_nil!
+        worker = text[/worker=(\d+)/, 1].to_i64
+        ProcessHandle.snapshot.find { |entry| entry.pid == worker }.not_nil!.parent_pid.should eq(service_pid)
+
+        service.stop(name, 30.seconds).should be_true
+        File.read(log).should contain("shutdown drained=true")
+        File.read(log).should contain("service returned")
+        ProcessHandle.snapshot.any? { |entry| entry.pid == worker }.should be_false
+        service.process_id(name).should be_nil
+      ensure
+        service.stop(name, 10.seconds) rescue nil
+        service.uninstall(name).should be_true
+        File.delete?(log)
+      end
+      service.state(name).should be_nil
+      service.uninstall(name).should be_false
+    end
+
     it "ends a crashing child at once with die_on_unhandled_exception and classifies the crash" do
       job = ProcessSupervision.job(ProcessSupervision::Windows::Job::Limits.new(die_on_unhandled_exception: true))
       child = job.spawn(windows_child, ["crash"])

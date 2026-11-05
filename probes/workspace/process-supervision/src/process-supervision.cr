@@ -42,6 +42,7 @@ require "./process-supervision/supervisor"
   require "./process-supervision/windows/job"
   require "./process-supervision/windows/spawn"
   require "./process-supervision/windows/job_control"
+  require "./process-supervision/windows/service"
 {% end %}
 
 module ProcessSupervision

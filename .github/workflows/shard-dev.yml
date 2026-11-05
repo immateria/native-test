@@ -210,12 +210,16 @@ jobs:
           & crystal build --no-color -o (Join-Path $out "stdio_child.exe") (Join-Path $ws "process-supervision\spec\support\stdio_child.cr") *> (Join-Path $out "build-stdio-child.txt")
           "build stdio_child exit=$LASTEXITCODE"
           Get-Content (Join-Path $out "build-stdio-child.txt") -TotalCount 40
+          & crystal build --no-color -o (Join-Path $out "service_child.exe") (Join-Path $ws "process-supervision\spec\support\service_child.cr") *> (Join-Path $out "build-service-child.txt")
+          "build service_child exit=$LASTEXITCODE"
+          Get-Content (Join-Path $out "build-service-child.txt") -TotalCount 40
           exit 0
 
       - name: Run the specs
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE "shard-out"
           $env:PROCESS_SUPERVISION_STDIO_CHILD = Join-Path $out "stdio_child.exe"
+          $env:PROCESS_SUPERVISION_SERVICE_CHILD = Join-Path $out "service_child.exe"
           foreach ($s in "process-handle", "process-supervision") {
             $exe = Join-Path $out "spec-$s.exe"
             if (!(Test-Path $exe)) { "no binary for $s"; continue }
