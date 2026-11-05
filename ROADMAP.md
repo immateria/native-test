@@ -12,7 +12,40 @@ Credential, Cloneflags, `UseCgroupFD`, `PidFD`), Python `subprocess` (`pass_fds`
 `user`/`group`/`umask`), Rust `std::process` / tokio / `command-fds`, libuv `uv_spawn`, Node `child_process` (IPC channel),
 .NET `Process`, and the supervisors systemd, s6/runit, supervisord and Erlang/OTP.
 
-## Built (for reference)
+## Status after the first pass over every gap
+
+Everything below marked **first cut** now exists in the shards with specs (`spec/features_spec.cr`); "first cut" means
+the API shape and edge cases still need review, as asked: "map out as much as possible, even if not quite right".
+
+| Gap | Now | Where |
+|---|---|---|
+| CI that can fail | **built** | `shard-dev.yml` Gate step (spec summaries), plus a stress run |
+| Hybrid cgroup hosts | **built** (it was a spec bug, not a library bug) | the spec cleans up and is pending where root may create at the hierarchy root |
+| Event-driven waits | **built** for cgroups (inotify on `cgroup.events`) and macOS handles (kqueue fd in the event loop); process groups back off 5 → 100 ms | `CgroupV2#wait_empty`, `ProcessHandle::Kqueue#wait`, `Readiness` |
+| One kqueue per handle | open | |
+| Versions / stale text | **built** | process-handle 0.9.0, process-supervision 0.8.0 |
+| Arbitrary signals | **first cut** | `Group#signal`, `ProcessHandle#signal` (POSIX, cgroups via pidfd; Windows raises) |
+| Graceful stop | **first cut** | `Group#request_stop`, `Group#stop` (CONT+TERM; CTRL_BREAK + WM_CLOSE on Windows with `SpawnOptions#console_group`) |
+| Suspend / resume | **first cut** | `Group#suspend/resume` (SIGSTOP, `cgroup.freeze`, NtSuspendProcess per Job member), `ProcessHandle#suspend/resume` |
+| Extra descriptors, IPC | **first cut** | `SpawnOptions#extra_fds`, `#ipc` (`Child#ipc`); Windows handles announced in `PROCESS_SUPERVISION_HANDLES` |
+| Session options | **first cut** | `SpawnOptions#new_session`, `#console_group`, `#hide_window` |
+| Credentials | **first cut** (Linux) | `SpawnOptions#uid/gid/groups/umask/no_new_privileges`; macOS/Windows raise Unsupported |
+| Rlimits | **first cut** (Linux) | `SpawnOptions#rlimits`; macOS raises (posix_spawn has no rlimit attribute) |
+| Cgroup limits and events | **first cut** | `CgroupV2#limits=`, `#stats`, `#memory_events`, `#members`, `CgroupV2.enable_controllers` (explicit opt-in) |
+| Resource usage | **first cut** | `ProcessHandle#usage` (Linux /proc, macOS `proc_pid_rusage` v4, Windows times/memory/IO counters) |
+| Exit status in full | **first cut** | `ExitOutcome`, `Child#outcome` |
+| Supervisor death | **first cut** | `SpawnOptions#parent_death_signal` (Linux), `ProcessSupervision::Lifeline` (POSIX watcher), Job kill-on-close |
+| Crash policy | **first cut** (Windows) | `Job::Limits#die_on_unhandled_exception`; core dumps via `rlimits[Core]` |
+| Process tree snapshot | **first cut** | `ProcessHandle.snapshot`, `.descendants` |
+| Large command lines | **first cut** (Windows check) | `Job#spawn` raises before `CreateProcessW` past 32 767 units; quoting fuzz open |
+| Restart policy, readiness, watchdog, logs, events, dependencies | **first cut** | `ProcessSupervision::Supervisor`, `LineLog` |
+| IPC channel | **first cut** (socket pair; no framing) | `SpawnOptions#ipc` |
+| systemd delegated scope | **first cut**, experimental | `Linux::SystemdScope.acquire` |
+| Namespaces | **first cut** (clone3 path; no uid_map for user namespaces) | `SpawnOptions#namespaces` |
+| Stress | **first cut** | `PROCESS_SUPERVISION_STRESS=1` spec, run in CI |
+| launchd, Windows SCM, seccomp/Landlock, AppContainer, FreeBSD, musl runs, fuzzing, soak, benchmarks, one shared kqueue, reload/fd hand-over | open | |
+
+## Built before the first pass (for reference)
 
 | Area | What exists |
 |---|---|
