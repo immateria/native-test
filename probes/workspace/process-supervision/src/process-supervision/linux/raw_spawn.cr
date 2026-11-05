@@ -98,6 +98,10 @@
       end
 
       # Test hook: forces the clone3/fork engine.
+      def self.pidfd_spawn_disabled? : Bool
+        @@pidfd_spawn_disabled
+      end
+
       def self.pidfd_spawn_disabled=(value : Bool)
         @@pidfd_spawn_disabled = value
       end

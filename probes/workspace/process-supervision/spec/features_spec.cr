@@ -149,10 +149,11 @@ require "file_utils"
         leaked = LibC.open("/dev/null", LibC::O_RDONLY)
         leaked.should be >= 3
         reader, writer = IO.pipe
+        previous = ProcessSupervision::Linux::RawSpawn.pidfd_spawn_disabled?
         begin
           script = "[ -e /proc/$$/fd/#{leaked} ] && echo leaked || echo closed"
           {false, true}.each do |forced_clone3|
-            ProcessSupervision::Linux::RawSpawn.pidfd_spawn_disabled = forced_clone3
+            ProcessSupervision::Linux::RawSpawn.pidfd_spawn_disabled = forced_clone3 || previous
             [options { }, options(&.umask=(0o022_u32)), options { |o| o.extra_fds[9] = writer }].each do |opts|
               child = feature_leader("/bin/sh", ["-c", script + "; (echo extra >&9) 2>/dev/null || true"],
                 output: Process::Redirect::Pipe, options: opts)
@@ -165,7 +166,7 @@ require "file_utils"
           writer.close
           reader.gets_to_end.lines.count("extra").should eq(2) # the extra descriptor still reached the program
         ensure
-          ProcessSupervision::Linux::RawSpawn.pidfd_spawn_disabled = false
+          ProcessSupervision::Linux::RawSpawn.pidfd_spawn_disabled = previous
           LibC.close(leaked)
           reader.close
         end
