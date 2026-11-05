@@ -111,7 +111,7 @@ jobs:
         run: |
           mkdir -p hard-out work
           tag="macos-${{ matrix.runner }}"
-          timeout 600 bash explore/macos/launchd_probe.sh work > "hard-out/$tag-launchd.jsonl" 2> "hard-out/$tag-launchd.err"; echo "launchd exit=$?"
+          bash explore/macos/launchd_probe.sh work > "hard-out/$tag-launchd.jsonl" 2> "hard-out/$tag-launchd.err"; echo "launchd exit=$?"
           cat "hard-out/$tag-launchd.jsonl"; head -c 3000 "hard-out/$tag-launchd.err"
       - name: Upload
         if: always()
@@ -169,14 +169,27 @@ jobs:
           prepare: |
             pkg install -y crystal || echo "no crystal package"
           run: |
+            set +e
             mkdir -p hard-out
             tag="freebsd-${{ matrix.release }}"
+            pwd
             uname -a > "hard-out/$tag-platform.txt"
             (crystal --version 2>&1 || echo "crystal: not installed") >> "hard-out/$tag-platform.txt"
-            cc -O1 -Wall -o hard-out/fbsd_proc explore/freebsd/fbsd_proc.c > "hard-out/$tag-build.txt" 2>&1; echo "build exit=$?"
-            ./hard-out/fbsd_proc > "hard-out/$tag-fbsd_proc.jsonl" 2> "hard-out/$tag-fbsd_proc.err"; echo "unprivileged-or-root exit=$?"
-            cat hard-out/*.txt hard-out/*.jsonl
+            cc -O1 -Wall -o hard-out/fbsd_proc explore/freebsd/fbsd_proc.c > "hard-out/$tag-build.txt" 2>&1
+            echo "build exit=$?"
+            cat "hard-out/$tag-build.txt"
+            ./hard-out/fbsd_proc > "hard-out/$tag-fbsd_proc.jsonl" 2> "hard-out/$tag-fbsd_proc.err"
+            echo "fbsd_proc exit=$?"
+            cat hard-out/*-platform.txt hard-out/*.jsonl
             head -c 2000 "hard-out/$tag-fbsd_proc.err"
+            # how far the shards are from FreeBSD: does process-handle's spec even compile there?
+            W="$PWD/probes/workspace"
+            CRYSTAL_PATH="$W/process-handle/src:$W/process-supervision/src:$(crystal env CRYSTAL_PATH)" \
+              crystal build --no-color -o hard-out/ph_spec "$W/process-handle/spec/process_handle_spec.cr" > "hard-out/$tag-crystal-process-handle-build.txt" 2>&1
+            echo "process-handle spec build exit=$?"
+            head -c 3000 "hard-out/$tag-crystal-process-handle-build.txt"
+            [ -x hard-out/ph_spec ] && (cd "$W/process-handle" && "$OLDPWD/hard-out/ph_spec" --verbose > "$OLDPWD/hard-out/$tag-crystal-process-handle-run.txt" 2>&1; echo "process-handle spec exit=$?")
+            exit 0
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4

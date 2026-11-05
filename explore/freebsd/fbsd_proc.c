@@ -148,7 +148,10 @@ static void reaper_cases(void) {
     memset(&rs, 0, sizeof rs);
     procctl(P_PID, getpid(), PROC_REAP_STATUS, &rs);
     struct procctl_reaper_pidinfo info[64];
-    struct procctl_reaper_pids rp = {64, info};
+    struct procctl_reaper_pids rp;
+    memset(&rp, 0, sizeof rp);
+    rp.rp_count = 64;
+    rp.rp_pids = info;
     memset(info, 0, sizeof info);
     int gr = procctl(P_PID, getpid(), PROC_REAP_GETPIDS, &rp);
     char list[1024] = "";

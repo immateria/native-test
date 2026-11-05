@@ -106,7 +106,7 @@ end
       errors += 1
       next
     end
-    got = output.to_s.split('\n')[0...-1]
+    got = output.to_s.split('\n')[0...-1].map(&.rchop('\r')) # argdump's stdout is in text mode
     expected = args.map { |a| hex(a) }
     next if got == expected
     failures += 1
@@ -250,4 +250,17 @@ ENV["ARGDUMP_OUT"] = dump_file.to_s
     samples << {"args" => args.inspect, "line" => line, "got_hex" => got.inspect}
   end
   report "cmd_quoting_candidate#{rare ? "_with_newlines" : ""}", cases, failures, samples, injections: injections, errors: errors
+end
+
+# 5. which control characters survive the cmd.exe route at all: each alone, at the start, middle and end of an argument
+{"\n", "\r", "\v", "\f", "\t", "\e", "\u0001", "\u007f"}.each do |char|
+  results = [] of String
+  {"#{char}", "a#{char}", "a#{char}b", "#{char}b", "\"#{char}\"", "%#{char}%"}.each do |arg|
+    File.delete?(dump_file)
+    line = %(cmd.exe /e:ON /v:OFF /d /c ""#{wrapper}") + " " + bat_arg(arg) + " next" + %(")
+    code = raw_run(line)
+    got = File.exists?(dump_file) ? File.read(dump_file).split('\n')[0...-1] : [] of String
+    results << (got == [hex(arg), hex("next")] ? "ok" : "exit=#{code} got=#{got.inspect}")
+  end
+  emit "cmd_control_char", char: char.inspect, results: results
 end
