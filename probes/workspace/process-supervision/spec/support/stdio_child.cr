@@ -9,6 +9,7 @@
 #   crash        raise an unhandled STATUS_ILLEGAL_INSTRUCTION exception (an access violation would not do: Crystal's
 #                runtime catches it in a vectored handler, prints it and exits with code 1)
 #   write-handle write "via handle\n" to the inherited handle announced for descriptor 5
+#   args         write each further argument, `inspect`ed, on its own line
 {% if flag?(:win32) %}
   lib LibStdioChildKernel32
     fun RaiseException(code : UInt32, flags : UInt32, count : UInt32, arguments : Void*) : Void
@@ -18,6 +19,8 @@
 case ARGV[0]?
 when "cat"
   IO.copy(STDIN, STDOUT)
+when "args"
+  ARGV[1..].each { |arg| STDOUT.print arg.inspect, "\n" }
 when "split"
   STDOUT.print "out\n"
   STDERR.print "err\n"

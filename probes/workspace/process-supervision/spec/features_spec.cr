@@ -456,6 +456,31 @@ require "file_utils"
       end
     end
 
+    it "runs a batch file with cmd.exe quoting: arguments arrive unchanged and nothing is injected" do
+      dir = Path[Dir.tempdir] / "ps-batch-#{Random.rand(1_000_000)}"
+      Dir.mkdir_p(dir)
+      script = dir / "forward.cmd"
+      File.write(script, "@\"#{windows_child}\" args %*\r\n")
+      marker = dir / "injected.txt"
+      args = ["plain", "two words", "", %(quote"inside), %(trailing\\), "%PATH%", "100%", "a^b&c|d<e>f",
+              %("&echo injected>"#{marker}"), "!x!", "(paren)", "tab\there", "ünïcödé"]
+      job = ProcessSupervision.job
+      begin
+        child = job.spawn_batch(script, args, output: Process::Redirect::Pipe)
+        lines = child.output.gets_to_end.lines
+        child.wait(10.seconds).not_nil!.success?.should be_true
+        child.close
+        lines.should eq(args.map(&.inspect))
+        File.exists?(marker).should be_false
+
+        expect_raises(ArgumentError, /line break/) { job.spawn_batch(script, ["a\nb"]) }
+        expect_raises(ProcessSupervision::Error::Unsupported) { job.spawn(script.to_s, ["x"]) }
+      ensure
+        job.close
+        FileUtils.rm_rf(dir.to_s)
+      end
+    end
+
     it "ends a crashing child at once with die_on_unhandled_exception and classifies the crash" do
       job = ProcessSupervision.job(ProcessSupervision::Windows::Job::Limits.new(die_on_unhandled_exception: true))
       child = job.spawn(windows_child, ["crash"])
