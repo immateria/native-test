@@ -35,7 +35,7 @@ the API shape and edge cases still need review, as asked: "map out as much as po
 | Resource usage | **first cut** | `ProcessHandle#usage` (Linux /proc, macOS `proc_pid_rusage` v4, Windows times/memory/IO counters) |
 | Exit status in full | **first cut** | `ExitOutcome`, `Child#outcome` |
 | Supervisor death | **first cut** | `SpawnOptions#parent_death_signal` (Linux), `ProcessSupervision::Lifeline` (POSIX watcher), Job kill-on-close |
-| Crash policy | **first cut** (Windows) | `Job::Limits#die_on_unhandled_exception`; core dumps via `rlimits[Core]` |
+| Crash policy | **first cut** (Windows) | `Job::Limits#die_on_unhandled_exception`; core dumps via `rlimits[Core]`. Note: a Crystal child's access violation is caught by its own runtime and exits 1, so it is not seen as a crash |
 | Process tree snapshot | **first cut** | `ProcessHandle.snapshot`, `.descendants` |
 | Large command lines | **first cut** (Windows check) | `Job#spawn` raises `Error::Native` (206, as `CreateProcessW` would) past 32 767 units, before anything is created; quoting fuzz open |
 | Restart policy, readiness, watchdog, logs, events, dependencies | **first cut** | `ProcessSupervision::Supervisor`, `LineLog` |

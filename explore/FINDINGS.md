@@ -1170,7 +1170,7 @@ Commits `f6ea4f9` (the pass), then `6d4fac4`, `de0f4a5`, `55046d0` and `aa4fd94`
 the eleven runs per runner (plain, clone3 and fork engines, systemd `Delegate=yes`, no delegation, user manager, root,
 Docker default and privileged, plus the 200-cycle stress run), 22 process-handle examples; macOS (`de0f4a5`, 15, 15
 Intel, 26) 55 supervision and 9 process-handle examples, 0 failures, stress passing; Windows (`aa4fd94`, Server 2022 and
-2025) pending (runs in progress). Kit (`55046d0`): Windows elevated and unelevated and macOS Crystal + SDK lanes all
+2025) 27 supervision and 7 process-handle examples, 0 failures; the Windows control specs (process ids, suspend/resume, usage, snapshot, CTRL_BREAK stop, crash policy, extra handle, refused options) ran natively for the first time here, after the user32 link fix. Kit (`55046d0`): Windows elevated and unelevated and macOS Crystal + SDK lanes all
 `qualification_validation=pass`, manifest checks before and after pass.
 
 What building it found:
