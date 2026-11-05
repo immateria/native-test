@@ -1371,7 +1371,8 @@ starts it, finds its Job worker parented to the service process, stops it (the w
 and uninstalls it: 30 supervision examples, 0 failures, 0 pending on Server 2022 and 2025; outside the SCM, `run`
 raises `Error::Unavailable` (`StartServiceCtrlDispatcherW` error 1063). `ProcessSupervision::Launchd` writes and loads a
 job and reads `launchctl print`; its spec checks that launchd starts the job, that `XPC_SERVICE_NAME` is the label, that
-`status` reports the running pid, and that `uninstall` ends the process and removes the property list.
+`status` reports the running pid, and that `uninstall` ends the process and removes the property list. It passes on macOS 15 and 26 (57 supervision examples, 0 failures; the one pending is the stress spec, which runs
+in its own step).
 
 ## Still open
 
