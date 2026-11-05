@@ -99,37 +99,14 @@
       end
     end
 
-    # Event-driven: a kqueue descriptor is itself readable while it has a pending event, so a copy of it is handed to the
-    # runtime's event loop (which is kqueue on macOS) and the fiber sleeps until the exit is reported. If the event loop
-    # refuses the descriptor, falls back to polling every 5 ms.
+    # Polls the exit watch every 5 ms. Handing a copy of the kqueue to the runtime's event loop does not work on macOS:
+    # Crystal's kqueue event loop registers every descriptor for both EVFILT_READ and EVFILT_WRITE, and the kernel
+    # refuses EVFILT_WRITE on a kqueue descriptor (kevent: EINVAL; measured on macOS 15, 15 Intel and 26). An
+    # event-driven wait needs its own kevent thread or EVFILT_PROC support in the runtime.
     private def wait_on_execution_context(timeout : Time::Span?) : Bool
       validate_timeout(timeout)
-      deadline = timeout.try { |span| Time.instant + span }
-      watcher = @mutex.synchronize do
-        check_open_locked
-        LibC.fcntl(@kq, 67, 0) # F_DUPFD_CLOEXEC
-      end
-      return poll_wait(deadline) if watcher < 0
-      # macOS refuses O_NONBLOCK on a kqueue descriptor (fcntl fails with ENOTTY on some releases); readiness waiting
-      # does not need it, so the descriptor is wrapped as it is, without the constructor's blocking-mode setup.
-      io = IO::FileDescriptor.new(handle: watcher)
-      begin
-        loop do
-          return true unless alive?
-          remaining = deadline.try { |limit| limit - Time.instant }
-          return false if remaining && remaining <= Time::Span.zero
-          io.read_timeout = remaining
-          begin
-            Crystal::EventLoop.current.wait_readable(io)
-          rescue IO::TimeoutError
-            return !alive?
-          rescue IO::Error
-            return poll_wait(deadline)
-          end
-        end
-      ensure
-        io.close rescue nil
-      end
+      @mutex.synchronize { check_open_locked }
+      poll_wait(timeout.try { |span| Time.instant + span })
     end
 
     private def poll_wait(deadline : Time::Instant?) : Bool
