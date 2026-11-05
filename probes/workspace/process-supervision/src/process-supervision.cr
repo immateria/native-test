@@ -16,6 +16,7 @@ require "./process-supervision/lifeline"
 require "./process-supervision/group"
 require "./process-supervision/child"
 require "./process-supervision/supervisor"
+require "./process-supervision/launchd"
 
 {% if flag?(:unix) %}
   require "./process-supervision/posix/spawn"

@@ -563,3 +563,63 @@ require "file_utils"
     end
   end
 {% end %}
+
+describe ProcessSupervision::Launchd::JobSpec do
+  it "renders a property list with escaped values and an ExitTimeOut sized from the shutdown budget" do
+    spec = ProcessSupervision::Launchd::JobSpec.new("dev.example.sup", ["/usr/local/bin/sup", "--name", "a&b <c>"])
+    spec.environment["MODE"] = %("quoted")
+    spec.keep_alive = true
+    spec.throttle_interval = 1.second
+    spec.exit_timeout_for(grace: 5.seconds, kill_after: 3.seconds)
+    plist = spec.to_plist
+    plist.should contain("<key>Label</key>\n  <string>dev.example.sup</string>")
+    plist.should contain("<string>a&amp;b &lt;c&gt;</string>")
+    plist.should contain("<key>MODE</key><string>&quot;quoted&quot;</string>")
+    plist.should contain("<key>KeepAlive</key>\n  <true/>")
+    plist.should contain("<key>ThrottleInterval</key>\n  <integer>1</integer>")
+    plist.should contain("<key>ExitTimeOut</key>\n  <integer>10</integer>")
+    plist.should_not contain("AbandonProcessGroup")
+    expect_raises(ArgumentError) { ProcessSupervision::Launchd::JobSpec.new("a/b", ["x"]) }
+  end
+end
+
+{% if flag?(:darwin) %}
+  describe ProcessSupervision::Launchd do
+    it "installs a job that launchd starts, reports it, and stops it on uninstall" do
+      domain = ProcessSupervision::Launchd.default_domain
+      pending!("launchd domain #{domain} is not available") unless Process.run("launchctl", ["print", domain]).success?
+      dir = Path[Dir.tempdir] / "ps-launchd-#{Process.pid}-#{Random.rand(100_000)}"
+      Dir.mkdir_p(dir)
+      label = "dev.process-supervision.spec.#{Process.pid}.#{Random.rand(100_000)}"
+      script = %(echo $$ > "#{dir}/pid"; printf '%s' "$XPC_SERVICE_NAME" > "#{dir}/label"; exec /bin/sleep 600)
+      spec = ProcessSupervision::Launchd::JobSpec.new(label, ["/bin/sh", "-c", script])
+      spec.exit_timeout_for(grace: 1.second, kill_after: 1.second)
+      begin
+        path = ProcessSupervision::Launchd.install(spec, domain)
+        File.exists?(path).should be_true
+        deadline = Time.instant + 10.seconds
+        until File.exists?(dir / "label") || Time.instant > deadline
+          sleep 50.milliseconds
+        end
+        pid = File.read(dir / "pid").strip.to_i64
+        File.read(dir / "label").should eq(label)
+        status = ProcessSupervision::Launchd.status(label, domain).not_nil!
+        status.state.should eq("running")
+        status.pid.should eq(pid)
+
+        ProcessSupervision::Launchd.uninstall(label, domain).should be_true
+        deadline = Time.instant + 10.seconds
+        while LibC.kill(pid.to_i32, 0) == 0 && Time.instant < deadline
+          sleep 50.milliseconds
+        end
+        LibC.kill(pid.to_i32, 0).should_not eq(0)
+        File.exists?(path).should be_false
+        ProcessSupervision::Launchd.status(label, domain).should be_nil
+        ProcessSupervision::Launchd.uninstall(label, domain).should be_false
+      ensure
+        ProcessSupervision::Launchd.uninstall(label, domain) rescue nil
+        FileUtils.rm_rf(dir.to_s)
+      end
+    end
+  end
+{% end %}
