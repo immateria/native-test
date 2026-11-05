@@ -169,27 +169,43 @@ static void reaper_cases(void) {
     double t0 = now_ms();
     int kr = procctl(P_PID, getpid(), PROC_REAP_KILL, &rk);
     int kerr = kr == 0 ? 0 : errno;
-    sleep_ms(50);
-    int g1_alive = alive(pids[1]), g2_alive = alive(pids[2]), m_alive = nested && alive(pids[0]);
-    int reaped;
-    reap_all(1000, &reaped);
-    /* the nested reaper's own descendants: if they survived, a second kill reaches them now that they are ours */
-    int second_killed = -1;
-    if (g1_alive || g2_alive) {
-      memset(&rk, 0, sizeof rk);
-      rk.rk_sig = SIGKILL;
-      procctl(P_PID, getpid(), PROC_REAP_KILL, &rk);
-      second_killed = (int)rk.rk_killed;
-      int more;
-      reap_all(1000, &more);
-      reaped += more;
+    double kill_ms = now_ms() - t0;
+    /* each process's fate: reaped by us (with its status and when), or still not ours / alive after 2 s.
+       A pid that is not our child yet (a nested reaper's descendant) answers ECHILD until it is reparented. */
+    char fate[3][96];
+    pid_t who[3] = {pids[0], pids[1], pids[2]};
+    int done[3] = {nested ? 0 : 1, 0, 0};
+    snprintf(fate[0], sizeof fate[0], "%s", nested ? "pending" : "reaped before the kill");
+    snprintf(fate[1], sizeof fate[1], "pending");
+    snprintf(fate[2], sizeof fate[2], "pending");
+    double end = now_ms() + 2000;
+    while (now_ms() < end && !(done[0] && done[1] && done[2])) {
+      for (int i = 0; i < 3; i++) {
+        if (done[i]) continue;
+        int wst;
+        pid_t r = waitpid(who[i], &wst, WNOHANG);
+        if (r == who[i]) {
+          char sts[64];
+          status_text(wst, sts, sizeof sts);
+          snprintf(fate[i], sizeof fate[i], "%s after %.2f ms", sts, now_ms() - t0);
+          done[i] = 1;
+        }
+      }
+      sleep_ms(1);
     }
+    for (int i = 0; i < 3; i++) if (!done[i]) {
+      int gone = kill(who[i], 0) != 0 && errno == ESRCH;
+      snprintf(fate[i], sizeof fate[i], "%s", gone ? "gone, not reaped by us" : "still running after 2 s");
+      if (!gone) kill(who[i], SIGKILL);
+    }
+    int leftovers;
+    reap_all(500, &leftovers);
     emit(P, nested ? "reap_kill_nested_reaper" : "reap_kill_orphans",
          "\"status_children\":%u,\"status_descendants\":%u,\"status_flags\":%u,\"getpids\":%d,\"pids\":\"%s\","
-         "\"middle\":%d,\"g1\":%d,\"g2_setsid\":%d,\"kill_result\":%d,\"kill_errno\":\"%s\",\"killed\":%u,\"fpid\":%d,"
-         "\"ms\":%.2f,\"g1_alive_after\":%d,\"g2_alive_after\":%d,\"middle_alive_after\":%d,\"second_kill_killed\":%d,\"reaped\":%d",
-         rs.rs_children, rs.rs_descendants, rs.rs_flags, gr, list, (int)pids[0], (int)pids[1], (int)pids[2], kr,
-         errno_name(kerr), rk.rk_killed, (int)rk.rk_fpid, now_ms() - t0, g1_alive, g2_alive, m_alive, second_killed, reaped);
+         "\"kill_result\":%d,\"kill_errno\":\"%s\",\"rk_killed\":%u,\"rk_fpid\":%d,\"kill_call_ms\":%.3f,"
+         "\"middle\":\"%s\",\"g1\":\"%s\",\"g2_setsid\":\"%s\",\"leftovers_reaped\":%d",
+         rs.rs_children, rs.rs_descendants, rs.rs_flags, gr, list, kr, errno_name(kerr), rk.rk_killed, (int)rk.rk_fpid,
+         kill_ms, fate[0], fate[1], fate[2], leftovers);
   }
 
   /* PROC_PDEATHSIG_CTL: a grandchild asks for SIGTERM when its parent dies; the parent then exits */

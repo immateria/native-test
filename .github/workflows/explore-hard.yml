@@ -189,6 +189,11 @@ jobs:
             echo "process-handle spec build exit=$?"
             head -c 3000 "hard-out/$tag-crystal-process-handle-build.txt"
             [ -x hard-out/ph_spec ] && (cd "$W/process-handle" && "$OLDPWD/hard-out/ph_spec" --verbose > "$OLDPWD/hard-out/$tag-crystal-process-handle-run.txt" 2>&1; echo "process-handle spec exit=$?")
+            CRYSTAL_PATH="$W/process-handle/src:$W/process-supervision/src:$(crystal env CRYSTAL_PATH)" \
+              crystal build --no-color -o hard-out/ps_spec "$W/process-supervision/spec/process_supervision_spec.cr" > "hard-out/$tag-crystal-process-supervision-build.txt" 2>&1
+            echo "process-supervision spec build exit=$?"
+            head -c 3000 "hard-out/$tag-crystal-process-supervision-build.txt"
+            [ -x hard-out/ps_spec ] && (cd "$W/process-supervision" && timeout 300 "$OLDPWD/hard-out/ps_spec" --verbose > "$OLDPWD/hard-out/$tag-crystal-process-supervision-run.txt" 2>&1; echo "process-supervision spec exit=$?"; tail -5 "$OLDPWD/hard-out/$tag-crystal-process-supervision-run.txt")
             exit 0
       - name: Upload
         if: always()

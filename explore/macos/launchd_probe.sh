@@ -9,7 +9,9 @@ set -u
 WORK=$(cd "$1" && pwd)
 UIDN=$(id -u)
 emit() { printf '{"probe":"launchd","case":"%s",%s}\n' "$1" "$2"; }
-alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null && echo true || echo false; }
+# ps, not kill -0: kill -0 answers EPERM for another user's process and succeeds for a zombie
+state_of() { local st; st=$(ps -o stat= -p "${1:-0}" 2>/dev/null | tr -d ' '); case "$st" in "") echo gone;; Z*) echo zombie;; *) echo alive;; esac; }
+coalition() { sudo launchctl procinfo "$1" 2>/dev/null | grep -iE -A3 'coalition = \{' | grep -iE 'coalition|ID' | tr -s ' \n"\t' ' ' | cut -c1-240; }
 ms() { perl -MTime::HiRes=time -e 'printf "%.0f", time*1000'; }
 
 # the job: writes its pid, starts a background sleep (same process group) and a setsid() escapee, then sleeps
@@ -63,21 +65,31 @@ run_case() { # name domain sudo term_action extra_xml ending
   local main=$(cat "$dir/main.pid" 2>/dev/null) bg=$(cat "$dir/bg.pid" 2>/dev/null) esc=$(cat "$dir/esc.pid" 2>/dev/null)
   local target="$domain/$label"
   local state=$($su launchctl print "$target" 2>&1 | grep -E '^\s*(state|pid|last exit code|runs) =' | tr -s ' \n"' ' ')
-  local coalition=""
-  [ -n "$main" ] && coalition=$(sudo launchctl procinfo "$main" 2>&1 | grep -iE 'coalition|responsible' | tr -s ' \n"\t' ' ' | cut -c1-400)
+  local co_main="" co_bg="" co_esc=""
+  [ -n "$main" ] && { co_main=$(coalition "$main"); co_bg=$(coalition "$bg"); co_esc=$(coalition "$esc"); }
   local pgid_main=$(ps -o pgid= -p "${main:-1}" 2>/dev/null | tr -d ' ') pgid_bg=$(ps -o pgid= -p "${bg:-1}" 2>/dev/null | tr -d ' ') pgid_esc=$(ps -o pgid= -p "${esc:-1}" 2>/dev/null | tr -d ' ')
   local t1=$(ms) action="" restarted=""
   case $ending in
     bootout) action=$($su launchctl bootout "$target" 2>&1 | tr '\n"\\' '   ');;
-    kill_main) kill -9 "$main"; sleep 0.3;;
+    kill_main) sudo kill -9 "$main";;
     kill_main_keepalive)
-      kill -9 "$main"
+      sudo kill -9 "$main"
       i=0; while [ $i -lt 300 ]; do n=$(cat "$dir/main.pid" 2>/dev/null); [ -n "$n" ] && [ "$n" != "$main" ] && break; sleep 0.05; i=$((i+1)); done
       restarted="\"restart_ms\":$(( $(ms) - t1 )),\"new_main\":\"$(cat "$dir/main.pid" 2>/dev/null)\",";;
   esac
   local end_ms=$(( $(ms) - t1 ))
-  sleep 0.5
-  emit "$name" "\"domain\":\"$domain\",\"bootstrap\":\"$boot\",\"bootstrap_ms\":$boot_ms,\"running_after_ms\":$run_ms,\"main\":\"$main\",\"bg\":\"$bg\",\"escapee\":\"$esc\",\"pgids\":\"$pgid_main/$pgid_bg/$pgid_esc\",\"print\":\"$state\",\"procinfo\":\"$coalition\",\"ending\":\"$ending\",\"action\":\"$action\",\"end_ms\":$end_ms,$restarted\"main_alive\":$(alive "$main"),\"bg_alive\":$(alive "$bg"),\"escapee_alive\":$(alive "$esc"),\"stderr\":\"$(head -c 300 "$dir/stderr.txt" 2>/dev/null | tr '\n"\\' '   ')\""
+  # when each process is gone (ms after the ending began; -1 = still there after 8 s)
+  local g_main=-1 g_bg=-1 g_esc=-1 now
+  while :; do
+    now=$(( $(ms) - t1 ))
+    [ $g_main = -1 ] && [ "$(state_of "$main")" = gone ] && g_main=$now
+    [ $g_bg = -1 ] && [ "$(state_of "$bg")" = gone ] && g_bg=$now
+    [ $g_esc = -1 ] && [ "$(state_of "$esc")" = gone ] && g_esc=$now
+    { [ $g_main != -1 ] && [ $g_bg != -1 ] && [ $g_esc != -1 ]; } && break
+    [ $now -gt 8000 ] && break
+    sleep 0.05
+  done
+  emit "$name" "\"domain\":\"$domain\",\"bootstrap\":\"$boot\",\"bootstrap_ms\":$boot_ms,\"running_after_ms\":$run_ms,\"main\":\"$main\",\"bg\":\"$bg\",\"escapee\":\"$esc\",\"pgids\":\"$pgid_main/$pgid_bg/$pgid_esc\",\"print\":\"$state\",\"coalition_main\":\"$co_main\",\"coalition_bg\":\"$co_bg\",\"coalition_escapee\":\"$co_esc\",\"ending\":\"$ending\",\"action\":\"$action\",\"end_ms\":$end_ms,$restarted\"main_gone_ms\":$g_main,\"bg_gone_ms\":$g_bg,\"escapee_gone_ms\":$g_esc,\"escapee_state\":\"$(state_of "$esc")\",\"stderr\":\"$(head -c 300 "$dir/stderr.txt" 2>/dev/null | tr '\n"\\' '   ')\""
   $su launchctl bootout "$target" > /dev/null 2>&1
   for p in $(cat "$dir"/*.pid 2>/dev/null); do sudo kill -9 "$p" 2>/dev/null; done
   $su rm -f "$plistfile"
@@ -89,7 +101,8 @@ run_case gui_abandon_process_group "gui/$UIDN" "" "exit 0" "<key>AbandonProcessG
 run_case gui_main_crash "gui/$UIDN" "" "exit 0" "" kill_main
 run_case gui_keepalive "gui/$UIDN" "" "exit 0" "<key>KeepAlive</key><true/>" kill_main_keepalive
 run_case gui_keepalive_throttle1 "gui/$UIDN" "" "exit 0" "<key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>1</integer>" kill_main_keepalive
-run_case user_bootout "user/$UIDN" "" "exit 0" "" bootout
 run_case system_bootout system sudo "exit 0" "" bootout
 run_case system_main_crash system sudo "exit 0" "" kill_main
+run_case system_bootout_ignores_term system sudo "" "<key>ExitTimeOut</key><integer>3</integer>" bootout
+run_case system_abandon_process_group system sudo "exit 0" "<key>AbandonProcessGroup</key><true/>" bootout
 exit 0
