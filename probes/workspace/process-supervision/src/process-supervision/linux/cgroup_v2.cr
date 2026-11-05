@@ -1,4 +1,9 @@
 {% if flag?(:linux) %}
+  private lib LibProcessSupervisionInotify
+    fun inotify_init1(flags : Int32) : Int32
+    fun inotify_add_watch(fd : Int32, path : UInt8*, mask : UInt32) : Int32
+  end
+
   module ProcessSupervision::Linux
     # Controller for one non-root cgroup-v2 subtree.
     #
@@ -162,7 +167,7 @@
         raise ArgumentError.new("pid must be positive") unless value > 0
         @mutex.synchronize do
           check_open_locked
-          File.write(@path / "cgroup.procs", "#{value}\n", mode: "w")
+          CgroupV2.raw_write(@path / "cgroup.procs", "#{value}\n")
         end
       rescue ex : File::AccessDeniedError
         raise ProcessSupervision::Error::Unavailable.new("cgroup.procs is not delegated/writable: #{ex.message}")
@@ -182,10 +187,13 @@
                 chdir : Path | String? = nil,
                 input : ::Process::Stdio = ::Process::Redirect::Inherit,
                 output : ::Process::Stdio = ::Process::Redirect::Inherit,
-                error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
+                error : ::Process::Stdio = ::Process::Redirect::Inherit,
+                options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : ProcessSupervision::Child
         run_on_execution_context("process-supervision-cgroup-spawn") do
-          prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir)
-          plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+          options.check_supported!("Linux cgroup v2", credentials: true, umask: true, rlimits: true, parent_death_signal: true,
+            no_new_privileges: true, namespaces: true)
+          prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, nil, options)
+          plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
           pending = begin
             @mutex.synchronize do
               check_open_locked
@@ -224,7 +232,7 @@
       def kill : Nil
         @mutex.synchronize do
           check_open_locked
-          File.write(@path / "cgroup.kill", "1\n", mode: "w")
+          CgroupV2.raw_write(@path / "cgroup.kill", "1\n")
           @killed = true
         end
       rescue ex : File::AccessDeniedError
@@ -241,7 +249,9 @@
             if read_populated(@path / "cgroup.events")
               raise ProcessSupervision::Error::Busy.new("cannot remove a populated cgroup")
             end
-            Dir.delete(@path)
+            if LibC.rmdir(@path.to_s) != 0
+              raise File::Error.from_errno("Unable to remove directory", file: @path.to_s)
+            end
           end
 
           @closed = true
@@ -256,18 +266,36 @@
         @mutex.synchronize { @closed }
       end
 
+      private IN_MODIFY   = 0x00000002_u32
+      private IN_NONBLOCK =         0o4000
+      private IN_CLOEXEC  =      0o2000000
+
+      # Event-driven: the kernel signals a modification of `cgroup.events` (inotify IN_MODIFY) when `populated` changes,
+      # so this sleeps until then instead of polling. Falls back to polling if inotify is unavailable.
       private def wait_empty_on_execution_context(timeout : Time::Span?) : Bool
         validate_timeout(timeout)
-        deadline = timeout.try { |span| Time.instant + span }
-        loop do
-          return true if empty?
-          if deadline
-            remaining = deadline - Time.instant
-            return false if remaining <= Time::Span.zero
-            sleep({remaining, 10.milliseconds}.min)
-          else
-            sleep 10.milliseconds
+        return true if empty?
+        fd = LibProcessSupervisionInotify.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        return ProcessSupervision::Readiness.poll(timeout) { empty? } if fd < 0
+        IO::FileDescriptor.set_blocking(fd, false)
+        io = IO::FileDescriptor.new(fd)
+        begin
+          if LibProcessSupervisionInotify.inotify_add_watch(fd, (@path / "cgroup.events").to_s, IN_MODIFY) < 0
+            return ProcessSupervision::Readiness.poll(timeout) { empty? }
           end
+          deadline = timeout.try { |span| Time.instant + span }
+          buffer = Bytes.new(4096)
+          loop do
+            return true if empty?
+            remaining = deadline.try { |limit| limit - Time.instant }
+            return false if remaining && remaining <= Time::Span.zero
+            return empty? unless ProcessSupervision::Readiness.wait_readable(io, remaining)
+            # drain the queued events; the next empty? reads the current state
+            while LibC.read(fd, buffer.to_unsafe, buffer.size) > 0
+            end
+          end
+        ensure
+          io.close rescue nil
         end
       end
 
@@ -369,8 +397,35 @@
         end
       end
 
+      # Raw system calls for the interface files touched under @mutex: Crystal's File I/O may hand the thread off during
+      # a blocking syscall (execution contexts), and a Thread::Mutex must be unlocked by the thread that locked it.
+      protected def self.raw_write(path : Path, data : String) : Nil
+        fd = LibC.open(path.to_s, LibC::O_WRONLY | LibC::O_CLOEXEC)
+        raise File::Error.from_errno("Unable to open", file: path.to_s) if fd < 0
+        begin
+          if LibC.write(fd, data.to_unsafe, data.bytesize) < 0
+            raise File::Error.from_errno("Unable to write", file: path.to_s)
+          end
+        ensure
+          LibC.close(fd)
+        end
+      end
+
+      protected def self.raw_read(path : Path) : String
+        fd = LibC.open(path.to_s, LibC::O_RDONLY | LibC::O_CLOEXEC)
+        raise File::Error.from_errno("Unable to open", file: path.to_s) if fd < 0
+        begin
+          buffer = Bytes.new(4096)
+          count = LibC.read(fd, buffer.to_unsafe, buffer.size)
+          raise File::Error.from_errno("Unable to read", file: path.to_s) if count < 0
+          String.new(buffer[0, count])
+        ensure
+          LibC.close(fd)
+        end
+      end
+
       private def read_populated(events : Path) : Bool
-        File.each_line(events) do |line|
+        CgroupV2.raw_read(events).each_line do |line|
           fields = line.split(' ', 2)
           next unless fields.size == 2
           key, value = fields

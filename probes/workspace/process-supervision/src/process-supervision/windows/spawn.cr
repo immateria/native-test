@@ -30,18 +30,24 @@
                 chdir : Path | String? = nil,
                 input : ::Process::Stdio = ::Process::Redirect::Inherit,
                 output : ::Process::Stdio = ::Process::Redirect::Inherit,
-                error : ::Process::Stdio = ::Process::Redirect::Inherit) : ProcessSupervision::Child
+                error : ::Process::Stdio = ::Process::Redirect::Inherit,
+                options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : ProcessSupervision::Child
+        options.check_supported!("a Windows Job", new_session: false, ipc: false, console_group: true, hide_window: true)
         run_on_execution_context("process-supervision-windows-job-spawn") do
           spawn_on_execution_context(command, args, env: env, clear_env: clear_env, chdir: chdir,
-            input: input, output: output, error: error)
+            input: input, output: output, error: error, options: options)
         end
       end
+
+      # The longest command line CreateProcessW accepts, in UTF-16 units including the terminator.
+      MAX_COMMAND_LINE = 32_767
 
       private def spawn_on_execution_context(command : String, args : Enumerable(String), *,
                                              env : Process::Env, clear_env : Bool,
                                              chdir : Path | String?,
                                              input : ::Process::Stdio, output : ::Process::Stdio,
-                                             error : ::Process::Stdio) : ProcessSupervision::Child
+                                             error : ::Process::Stdio,
+                                             options : ProcessSupervision::SpawnOptions) : ProcessSupervision::Child
         validate_no_nul!(command, "command")
         reject_batch_file(command)
         argv = [command]
@@ -51,10 +57,10 @@
         end
         chdir_string = chdir.try &.to_s
         chdir_string.try { |path| validate_no_nul!(path, "chdir") }
-        env_entries = materialize_environment(env)
-        env_block = build_environment(env_entries, clear_env)
-
         command_line = Process.quote_windows(argv).to_utf16
+        if command_line.size + 1 > MAX_COMMAND_LINE
+          raise ArgumentError.new("command line is #{command_line.size + 1} UTF-16 units; CreateProcessW accepts #{MAX_COMMAND_LINE}")
+        end
         chdir_w = chdir_string.try &.to_utf16
 
         plumbing = nil.as(Plumbing?)
@@ -67,7 +73,17 @@
 
         begin
           plumbing = Plumbing.build(input, output, error)
-          inherited = plumbing.handles
+          # extra handles: inheritable duplicates the child sees under the same numeric values, announced as
+          # PROCESS_SUPERVISION_HANDLES=<requested number>:<handle value>,...
+          announced = [] of String
+          options.extra_fds.each do |target, io|
+            handle = plumbing.add_extra(io)
+            announced << "#{target}:#{handle.address}"
+          end
+          env_entries = materialize_environment(env) || [] of Tuple(String, String?)
+          env_entries << {"PROCESS_SUPERVISION_HANDLES", announced.join(',')} unless announced.empty?
+          env_block = build_environment(env_entries, clear_env)
+          inherited = plumbing.allow_list
 
           attr_bytes = LibC::SizeT.new(0)
           NativeLib.InitializeProcThreadAttributeList(Pointer(Void).null, 2_u32, 0_u32, pointerof(attr_bytes))
@@ -108,6 +124,9 @@
             flags = Native::EXTENDED_STARTUPINFO_PRESENT |
                     Native::CREATE_UNICODE_ENVIRONMENT |
                     Native::CREATE_SUSPENDED
+            # its own console process group: CTRL_BREAK_EVENT can then be sent to it alone (request_stop)
+            flags |= 0x00000200_u32 if options.console_group # CREATE_NEW_PROCESS_GROUP
+            flags |= 0x08000000_u32 if options.hide_window   # CREATE_NO_WINDOW
 
             if LibC.CreateProcessW(
                  Pointer(UInt16).null,
@@ -189,6 +208,19 @@
       # allow-list never holds a value twice.
       private class Plumbing
         getter handles = StaticArray(LibC::HANDLE, 3).new(LibC::HANDLE.null)
+        @extra = [] of LibC::HANDLE
+
+        def add_extra(io : IO::FileDescriptor) : LibC::HANDLE
+          handle = Native.duplicate_inheritable(LibC::HANDLE.new(io.fd), "DuplicateHandle(extra handle)")
+          @extra << handle
+          handle
+        end
+
+        # every handle the child may inherit: the three standard ones, then the extra ones
+        def allow_list : Array(LibC::HANDLE)
+          @handles.to_a + @extra
+        end
+
         getter input : IO::FileDescriptor? = nil
         getter output : IO::FileDescriptor? = nil
         getter error : IO::FileDescriptor? = nil
@@ -269,6 +301,8 @@
 
         def release_child_side : Nil
           @handles.each { |handle| Native.close_native_handle(handle) }
+          @extra.each { |handle| Native.close_native_handle(handle) }
+          @extra.clear
           @handles = StaticArray(LibC::HANDLE, 3).new(LibC::HANDLE.null)
           @child_ends.each { |io| io.close rescue nil }
           @child_ends.clear

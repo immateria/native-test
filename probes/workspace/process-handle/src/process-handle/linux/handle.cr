@@ -156,7 +156,8 @@
       @mutex.synchronize { checked_pidfd.fd }
     end
 
-    private def signal(signal : Signal) : Nil
+    # Sends *signal* to exactly this process (pidfd_send_signal); a no-op once it has exited.
+    def signal(signal : Signal) : Nil
       @mutex.synchronize do
         pidfd = checked_pidfd
         return if Native.ready?(pidfd)

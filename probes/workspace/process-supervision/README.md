@@ -170,9 +170,8 @@ numeric PID to `cgroup.procs`; because that operation is PID-addressed, it is
 not advertised as a race-free spawn mechanism. A future initial-containment
 API must enter the target into the cgroup before untrusted child code can run.
 
-0.7.0 therefore provides strong Windows initial containment, strong Linux
-cgroup tree kill/observation, and PTY-derived wait/lifecycle ownership, but not
-yet a race-free Linux spawn-into-cgroup primitive. Windows Job close also keeps
+Race-free Linux spawn-into-cgroup is `CgroupV2#spawn` (see "Spawning on Linux and
+macOS"); `attach` remains for processes that already exist. Windows Job close also keeps
 logical Job closure separate from completion-port cleanup completion: if the
 secondary event-reader cleanup fails, a later close retries it instead of
 forgetting that resource. Job limit-event reader access is synchronized with

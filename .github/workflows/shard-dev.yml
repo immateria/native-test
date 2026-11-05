@@ -101,6 +101,11 @@ jobs:
             done
           fi
           grep -ho '\[engine[^]]*\] .*' run-*.txt 2>/dev/null || true
+          # 200 spawn / stream / graceful-stop cycles, checking descriptors stay flat
+          if [ -x spec-process-supervision ]; then
+            (cd ../probes/workspace/process-supervision && PROCESS_SUPERVISION_STRESS=1 "$GITHUB_WORKSPACE/shard-out/spec-process-supervision" -e stress --verbose) > run-stress.txt 2>&1
+            echo "== stress exit=$?"; tail -n 6 run-stress.txt
+          fi
           exit 0
 
       - name: Run the supervision specs in other Linux environments
@@ -156,6 +161,21 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Gate (fail on any spec failure)
+        run: |
+          set -u
+          cd shard-out
+          bad=0
+          for f in run-*.txt; do
+            [ -f "$f" ] || continue
+            summary=$(grep -Eo '[0-9]+ examples, [0-9]+ failures, [0-9]+ errors, [0-9]+ pending' "$f" | tail -1)
+            if [ -z "$summary" ]; then echo "::error::$f has no spec summary (crash or hang)"; bad=1; continue; fi
+            echo "$f: $summary"
+            echo "$summary" | grep -Eq ' 0 failures, 0 errors' || { echo "::error::$f: $summary"; bad=1; }
+          done
+          ls run-*.txt > /dev/null 2>&1 || { echo "::error::no spec ran"; bad=1; }
+          exit $bad
+
   shard-windows:
     if: ${{ startsWith(inputs.runner || '', 'windows') }}
     name: shard ${{ inputs.runner }}
@@ -210,3 +230,18 @@ jobs:
           path: shard-out/*.txt
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Gate (fail on any spec failure)
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "shard-out"
+          $bad = $false
+          $files = Get-ChildItem -Path $out -Filter "run-*.txt" -ErrorAction SilentlyContinue
+          if (-not $files) { Write-Output "::error::no spec ran"; exit 1 }
+          foreach ($f in $files) {
+            $m = Select-String -Path $f.FullName -Pattern '\d+ examples, \d+ failures, \d+ errors, \d+ pending' | Select-Object -Last 1
+            if (-not $m) { Write-Output "::error::$($f.Name) has no spec summary (crash or hang)"; $bad = $true; continue }
+            $summary = $m.Matches[0].Value
+            Write-Output "$($f.Name): $summary"
+            if ($summary -notmatch ' 0 failures, 0 errors') { Write-Output "::error::$($f.Name): $summary"; $bad = $true }
+          }
+          if ($bad) { exit 1 }

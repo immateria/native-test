@@ -40,12 +40,14 @@
                 input : ::Process::Stdio = ::Process::Redirect::Inherit,
                 output : ::Process::Stdio = ::Process::Redirect::Inherit,
                 error : ::Process::Stdio = ::Process::Redirect::Inherit,
-                track_descendants : Bool = true) : ProcessSupervision::Child
+                track_descendants : Bool = true,
+                options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : ProcessSupervision::Child
+        check_options!(options, joining: true)
         marker = track_descendants ? MarkerScan.entry(@mutex.synchronize { @marker ||= MarkerScan.new_token }) : nil
         {% if flag?(:linux) %}
           run_on_execution_context("process-supervision-posix-spawn") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
-            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             group = @pgid.to_i32
             pending = begin
               @mutex.synchronize do
@@ -60,13 +62,13 @@
           end
         {% elsif flag?(:darwin) %}
           run_on_execution_context("process-supervision-posix-spawn") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
-            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             begin
               @mutex.synchronize do
                 check_open_locked
                 _, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, @pgid.to_i32, plumbing)
-                ProcessSupervision::Child.new(process, handle, self, plumbing.input, plumbing.output, plumbing.error, plumbing.copies)
+                ProcessSupervision::Child.new(process, handle, self, plumbing.input, plumbing.output, plumbing.error, plumbing.copies, plumbing.ipc)
               end
             rescue ex
               plumbing.abandon
@@ -86,27 +88,44 @@
                             input : ::Process::Stdio = ::Process::Redirect::Inherit,
                             output : ::Process::Stdio = ::Process::Redirect::Inherit,
                             error : ::Process::Stdio = ::Process::Redirect::Inherit,
-                            track_descendants : Bool = true) : ProcessSupervision::Child
+                            track_descendants : Bool = true,
+                options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : ProcessSupervision::Child
+        ProcessGroup.check_options!(options, joining: false)
         token = track_descendants ? MarkerScan.new_token : nil
         marker = token.try { |value| MarkerScan.entry(value) }
         {% if flag?(:linux) %}
           run_on_execution_context("process-supervision-posix-spawn-leader") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
-            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             pending = ProcessSupervision::Linux::RawSpawn.create(prepared, plumbing, pgroup: 0)
             # the group object needs the pid, so build it from the pending child
             ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, new(pending.pid.to_i64, token), nil)
           end
         {% elsif flag?(:darwin) %}
           run_on_execution_context("process-supervision-posix-spawn-leader") do
-            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker)
-            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error)
+            prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
+            plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             pid, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, 0, plumbing)
-            ProcessSupervision::Child.new(process, handle, new(pid.to_i64, token), plumbing.input, plumbing.output, plumbing.error, plumbing.copies)
+            ProcessSupervision::Child.new(process, handle, new(pid.to_i64, token), plumbing.input, plumbing.output, plumbing.error, plumbing.copies, plumbing.ipc)
           end
         {% else %}
           raise ProcessSupervision::Error::Unsupported.new("spawning is not implemented for this target yet")
         {% end %}
+      end
+
+      # Linux honours every POSIX option; macOS's posix_spawn has no credential, limit or umask attributes. Joining an
+      # existing group cannot also start a new session.
+      protected def self.check_options!(options : ProcessSupervision::SpawnOptions, *, joining : Bool) : Nil
+        {% if flag?(:linux) %}
+          options.check_supported!("a Linux process group", new_session: !joining, credentials: true, umask: true,
+            rlimits: true, parent_death_signal: true, no_new_privileges: true, namespaces: true)
+        {% else %}
+          options.check_supported!("a macOS process group", new_session: !joining)
+        {% end %}
+      end
+
+      private def check_options!(options : ProcessSupervision::SpawnOptions, *, joining : Bool) : Nil
+        ProcessGroup.check_options!(options, joining: joining)
       end
 
       def mechanism : ProcessSupervision::Mechanism
@@ -122,13 +141,31 @@
       end
 
       # Whether the group has no live member and no marked descendant lives outside it (see `#escapees`).
+      #
+      # Nothing that can block runs under the controller's Thread::Mutex: with execution contexts a fiber that blocks in
+      # a syscall can resume on another thread, and the mutex would be left locked by the first one (found by the stress
+      # spec: the zombie check below used to read /proc under the lock).
       def empty? : Bool
-        token = @mutex.synchronize do
+        state, token = @mutex.synchronize do
           check_open_locked
-          return false unless group_empty_locked?
-          @marker
+          {group_state_locked, @marker}
+        end
+        case state
+        when .members?
+          return false
+        when .maybe_zombies?
+          {% if flag?(:linux) %}
+            return false if live_member_linux?
+          {% end %}
         end
         token.nil? || escapees_for(token).empty?
+      end
+
+      private enum GroupState
+        Empty
+        Members
+        # Linux: kill(-pgid, 0) succeeds while the only members are zombies; a /proc scan decides
+        MaybeZombies
       end
 
       # Whether children spawned through this controller carry its descendant marker.
@@ -196,22 +233,27 @@
         @mutex.synchronize { @closed }
       end
 
+      # A process group has no "became empty" notification, so this polls with a growing interval (5 ms to 100 ms).
       private def wait_empty_on_execution_context(timeout : Time::Span?) : Bool
         validate_timeout(timeout)
-        deadline = timeout.try { |span| Time.instant + span }
-        loop do
-          return true if empty?
-          if deadline
-            remaining = deadline - Time.instant
-            return false if remaining <= Time::Span.zero
-            sleep({remaining, 10.milliseconds}.min)
-          else
-            sleep 10.milliseconds
-          end
-        end
+        ProcessSupervision::Readiness.poll(timeout) { empty? }
       end
 
-      private def signal(signal : Signal) : Nil
+      def suspend : Nil
+        signal(Signal::STOP)
+      end
+
+      def resume : Nil
+        signal(Signal::CONT)
+      end
+
+      def request_stop : Nil
+        signal(Signal::CONT)
+        signal(Signal::TERM)
+      end
+
+      # Sends *signal* to the process group and to every marked escapee.
+      def signal(signal : Signal) : Nil
         token = @mutex.synchronize do
           check_open_locked
           rc = LibC.kill(-@pgid.to_i32, signal.value)
@@ -228,14 +270,37 @@
         escapees_for(token).each { |pid| signal_escapee(pid, entry, signal) }
       end
 
-      private def group_empty_locked? : Bool
+      # Plain system call only (runs under the mutex).
+      private def group_state_locked : GroupState
         rc = LibC.kill(-@pgid.to_i32, 0)
-        return false if rc == 0
+        {% if flag?(:linux) %}
+          # Linux still delivers to zombies, so a group whose members have all exited but are not yet reaped (an
+          # orphan waiting for an init that reaps slowly, as in some containers) answers 0. It counts as empty when no
+          # member is anything but a zombie, as macOS's EPERM already says; the caller checks /proc outside the lock.
+          return GroupState::MaybeZombies if rc == 0
+        {% end %}
+        return GroupState::Members if rc == 0
         errno = Errno.value
-        return true if errno == Errno::ESRCH
-        return no_live_member?(errno) if errno == Errno::EPERM
+        return GroupState::Empty if errno == Errno::ESRCH
+        if errno == Errno::EPERM
+          return no_live_member?(errno) ? GroupState::Empty : GroupState::Members
+        end
         raise ProcessSupervision::Error::Native.new("killpg(0)", errno.message, errno.value.to_i64)
       end
+
+      {% if flag?(:linux) %}
+        private def live_member_linux? : Bool
+          Dir.each_child("/proc") do |name|
+            next unless name.each_char.all?(&.ascii_number?)
+            stat = File.read("/proc/#{name}/stat") rescue next
+            close = stat.rindex(')') || next
+            fields = stat[close + 2..].split(' ', 4)
+            # fields: state, ppid, pgrp
+            return true if fields[2]? == @pgid.to_s && fields[0] != "Z" && fields[0] != "X"
+          end
+          false
+        end
+      {% end %}
 
       # Darwin returns EPERM, not ESRCH, from kill(-pgid, sig) once every process left in the group is a
       # zombie (exited, not yet reaped): nothing remains that can receive the signal. It does so for

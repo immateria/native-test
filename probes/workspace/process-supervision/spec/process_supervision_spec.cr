@@ -1,5 +1,6 @@
 require "./spec_helper"
 require "file_utils"
+require "./features_spec"
 
 # Several examples use the spec process's own group as a stand-in group. Inside a container the spec binary is
 # commonly PID 1 and leads process group 1, which ProcessGroup refuses to address (kill(-1, sig) is a broadcast).
@@ -111,7 +112,7 @@ end
 {% else %}
   describe ProcessSupervision do
     it "loads the public surface" do
-      ProcessSupervision::VERSION.should eq("0.7.0")
+      ProcessSupervision::VERSION.should eq("0.8.0")
     end
   end
 {% end %}
@@ -666,9 +667,17 @@ end
       mount = ProcessSupervision::Linux::CgroupV2.mountpoint
       pending!("no cgroup-v2 mount") unless mount
       pending!("a cgroup can be created in this environment") if ProcessSupervision::Linux::CgroupV2.delegated_parent
-      # EACCES for an ordinary user, EROFS for a default container: both Unavailable, so a fallback_pgid is honoured
-      expect_raises(ProcessSupervision::Error::Unavailable) do
-        ProcessSupervision::Linux::CgroupV2.create(mount.not_nil!, "ps-spec-unwritable")
+      # EACCES for an ordinary user, EROFS for a default container: both Unavailable, so a fallback_pgid is honoured.
+      # Root on a host whose v2 hierarchy is not the system's main one (a v1/v2 hybrid host) may create there:
+      # delegated_parent never offers the hierarchy root, so that case is not an error and is cleaned up.
+      created = begin
+        ProcessSupervision::Linux::CgroupV2.create(mount.not_nil!, "ps-spec-unwritable-#{Process.pid}")
+      rescue ex : ProcessSupervision::Error::Unavailable
+        nil
+      end
+      if created
+        created.close
+        pending!("the hierarchy root accepts new cgroups for this user (root on a hybrid host)")
       end
     end
 

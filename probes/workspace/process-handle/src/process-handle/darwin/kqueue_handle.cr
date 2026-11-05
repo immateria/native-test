@@ -99,9 +99,39 @@
       end
     end
 
+    # Event-driven: a kqueue descriptor is itself readable while it has a pending event, so a copy of it is handed to the
+    # runtime's event loop (which is kqueue on macOS) and the fiber sleeps until the exit is reported. If the event loop
+    # refuses the descriptor, falls back to polling every 5 ms.
     private def wait_on_execution_context(timeout : Time::Span?) : Bool
       validate_timeout(timeout)
       deadline = timeout.try { |span| Time.instant + span }
+      watcher = @mutex.synchronize do
+        check_open_locked
+        LibC.fcntl(@kq, 67, 0) # F_DUPFD_CLOEXEC
+      end
+      return poll_wait(deadline) if watcher < 0
+      IO::FileDescriptor.set_blocking(watcher, false)
+      io = IO::FileDescriptor.new(watcher)
+      begin
+        loop do
+          return true unless alive?
+          remaining = deadline.try { |limit| limit - Time.instant }
+          return false if remaining && remaining <= Time::Span.zero
+          io.read_timeout = remaining
+          begin
+            Crystal::EventLoop.current.wait_readable(io)
+          rescue IO::TimeoutError
+            return !alive?
+          rescue IO::Error
+            return poll_wait(deadline)
+          end
+        end
+      ensure
+        io.close rescue nil
+      end
+    end
+
+    private def poll_wait(deadline : Time::Instant?) : Bool
       loop do
         return true unless alive?
         if deadline
@@ -134,7 +164,8 @@
       @mutex.synchronize { @closed }
     end
 
-    private def signal(signal : Signal) : Nil
+    # Sends *signal* to this process; never once its exit has been observed (so never to a recycled PID).
+    def signal(signal : Signal) : Nil
       @mutex.synchronize do
         check_open_locked
         return if exited_locked?

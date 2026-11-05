@@ -31,14 +31,39 @@
         getter argv : CStrings
         getter envp : CStrings
         getter chdir : String?
+        getter options : ProcessSupervision::SpawnOptions
+        # this process, for the child's parent-death check
+        getter parent_pid : Int32
+        # flat {resource, soft, hard} triples for the child's setrlimit calls (allocated here, read in the child)
+        getter rlimits : Pointer(UInt64)
+        getter rlimit_count : Int32
+        getter groups : Pointer(UInt32)
+        getter group_count : Int32
+        # descriptor number of the child's IPC socket, or -1
+        getter ipc_target : Int32
 
-        def initialize(@command : String, @path : String, @argv : CStrings, @envp : CStrings, @chdir : String?)
+        def initialize(@command : String, @path : String, @argv : CStrings, @envp : CStrings, @chdir : String?,
+                       @options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new,
+                       @ipc_target : Int32 = -1)
+          @parent_pid = LibC.getpid
+          @rlimit_count = @options.rlimits.size
+          @rlimits = Pointer(UInt64).malloc({@rlimit_count * 3, 1}.max)
+          @options.rlimits.each_with_index do |(resource, limits), index|
+            @rlimits[index * 3] = resource.native.to_u64
+            @rlimits[index * 3 + 1] = limits[0]
+            @rlimits[index * 3 + 2] = limits[1]
+          end
+          list = @options.groups || [] of UInt32
+          @group_count = list.size
+          @groups = Pointer(UInt32).malloc({@group_count, 1}.max)
+          list.each_with_index { |value, index| @groups[index] = value }
         end
       end
 
       # *marker* is an extra `NAME=value` entry (a process group's descendant marker) that survives `clear_env`.
       def self.prepare(command : String, args : Enumerable(String), env : ::Process::Env,
-                       clear_env : Bool, chdir : Path | String?, marker : String? = nil) : Prepared
+                       clear_env : Bool, chdir : Path | String?, marker : String? = nil,
+                       options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : Prepared
         validate_text!(command, "command")
         raise ArgumentError.new("command must not be empty") if command.empty?
         argv = [command]
@@ -54,7 +79,16 @@
           entries.reject!(&.starts_with?("#{name}="))
           entries << marker
         end
-        Prepared.new(command, resolve(command), CStrings.new(argv), CStrings.new(entries), directory)
+        ipc_target = -1
+        if options.ipc
+          ipc_target = 3
+          while options.extra_fds.has_key?(ipc_target)
+            ipc_target += 1
+          end
+          entries.reject!(&.starts_with?("PROCESS_SUPERVISION_IPC_FD="))
+          entries << "PROCESS_SUPERVISION_IPC_FD=#{ipc_target}"
+        end
+        Prepared.new(command, resolve(command), CStrings.new(argv), CStrings.new(entries), directory, options, ipc_target)
       end
 
       # Resolves in the caller so that the result does not depend on the child's working directory.
@@ -90,10 +124,19 @@
       #
       # Supported: Process::Redirect::Inherit / Close (the null device) / Pipe, an IO::FileDescriptor (a File, STDOUT), and
       # any other IO, which gets a pipe and a copy fiber (`copies`, started by Child); a closed IO gets the null device.
-      # Every source is copied to a descriptor >= 3 first, so that a source which is itself 0, 1 or 2 (a closed stdin makes
-      # pipe() return 0) cannot be overwritten by an earlier dup2.
+      # Every source is copied to a descriptor above every target (3 and up, and above the highest extra descriptor), so
+      # that no dup2 in the child can overwrite a source it still needs (a closed stdin makes pipe() return 0).
+      #
+      # Extra descriptors (`SpawnOptions#extra_fds`, the IPC socket) are further {target, source} pairs (`extra_targets`,
+      # `extra_sources`, `extra_count`: plain memory the child side can read without allocating).
       class Plumbing
         getter sources = StaticArray(Int32, 3).new(-1)
+        getter extra_targets = Pointer(Int32).malloc(16)
+        getter extra_sources = Pointer(Int32).malloc(16)
+        getter extra_count = 0
+        getter ipc : ::UNIXSocket? = nil
+        @minimum = 3
+        @child_sockets = [] of ::UNIXSocket
         getter input : IO::FileDescriptor? = nil
         getter output : IO::FileDescriptor? = nil
         getter error : IO::FileDescriptor? = nil
@@ -102,12 +145,17 @@
         @child_ends = [] of IO::FileDescriptor
         @copies_fds = [] of Int32
 
-        def self.build(input : ::Process::Stdio, output : ::Process::Stdio, error : ::Process::Stdio) : Plumbing
+        def self.build(input : ::Process::Stdio, output : ::Process::Stdio, error : ::Process::Stdio,
+                       options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new,
+                       ipc_target : Int32 = -1) : Plumbing
           plumbing = new
           begin
+            plumbing.reserve_above((options.extra_fds.keys + [ipc_target]).max? || 2)
             plumbing.add(0, input)
             plumbing.add(1, output)
             plumbing.add(2, error)
+            options.extra_fds.each { |target, io| plumbing.add_extra(target, io) }
+            plumbing.add_ipc(ipc_target) if ipc_target >= 3
           rescue ex
             plumbing.abandon
             raise ex
@@ -117,6 +165,30 @@
 
         def self.inherit : Plumbing
           new
+        end
+
+        protected def reserve_above(highest_target : Int32) : Nil
+          @minimum = {3, highest_target + 1}.max
+        end
+
+        def add_extra(target : Int32, io : IO::FileDescriptor) : Nil
+          raise ArgumentError.new("too many extra descriptors (16 at most)") if @extra_count >= 16
+          @extra_targets[@extra_count] = target
+          @extra_sources[@extra_count] = duplicate_above_stdio(io.fd)
+          @extra_count += 1
+        end
+
+        def add_ipc(target : Int32) : Nil
+          parent_end, child_end = ::UNIXSocket.pair
+          # O_NONBLOCK belongs to the open socket, which the child would share: its end must block (the parent's is a
+          # separate socket of the pair and stays non-blocking for the event loop)
+          IO::FileDescriptor.set_blocking(child_end.fd, true)
+          @ipc = parent_end
+          @child_sockets << child_end
+          raise ArgumentError.new("too many extra descriptors (16 at most)") if @extra_count >= 16
+          @extra_targets[@extra_count] = target
+          @extra_sources[@extra_count] = duplicate_above_stdio(child_end.fd)
+          @extra_count += 1
         end
 
         def add(target : Int32, spec : ::Process::Stdio) : Nil
@@ -176,20 +248,23 @@
           @child_ends.clear
           @copies_fds.each { |fd| LibC.close(fd) }
           @copies_fds.clear
+          @child_sockets.each { |socket| socket.close rescue nil }
+          @child_sockets.clear
         end
 
         def abandon : Nil
           release_child_side
           {@input, @output, @error}.each { |io| io.try { |stream| stream.close rescue nil } }
+          @ipc.try { |socket| socket.close rescue nil }
           @copies.close
         end
 
         private def movable(io : IO::FileDescriptor) : Int32
-          io.fd >= 3 ? io.fd : duplicate_above_stdio(io.fd)
+          io.fd >= @minimum ? io.fd : duplicate_above_stdio(io.fd)
         end
 
         private def duplicate_above_stdio(fd : Int32) : Int32
-          copy = LibC.fcntl(fd, F_DUPFD_CLOEXEC, 3)
+          copy = LibC.fcntl(fd, F_DUPFD_CLOEXEC, @minimum)
           raise native_error("fcntl(F_DUPFD_CLOEXEC)") if copy < 0
           @copies_fds << copy
           copy

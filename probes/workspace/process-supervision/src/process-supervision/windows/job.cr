@@ -173,6 +173,7 @@
             flags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS
             info.basicLimitInformation.priorityClass = priority.value
           end
+          flags |= 0x0400_u32 if limits.die_on_unhandled_exception # JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
         end
         info.basicLimitInformation.limitFlags = flags
         set_information(

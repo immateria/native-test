@@ -31,11 +31,12 @@
       private SPAWN_SETSIGDEF       = 0x0004_i16
       private SPAWN_SETSIGMASK      = 0x0008_i16
       private SPAWN_START_SUSPENDED = 0x0080_i16
+      private SPAWN_SETSID          = 0x0400_i16
       private SPAWN_CLOEXEC_DEFAULT = 0x4000_i16
 
       def self.launch(prepared : Spawn::Prepared, pgroup : Int32?, plumbing : Spawn::Plumbing) : {Int32, ::Process, ProcessHandle}
         pid = begin
-          create_suspended(prepared, pgroup, plumbing.sources)
+          create_suspended(prepared, pgroup, plumbing)
         rescue ex
           plumbing.abandon
           raise ex
@@ -64,7 +65,7 @@
         {pid, process, handle}
       end
 
-      private def self.create_suspended(prepared : Spawn::Prepared, pgroup : Int32?, stdio : StaticArray(Int32, 3)) : Int32
+      private def self.create_suspended(prepared : Spawn::Prepared, pgroup : Int32?, plumbing : Spawn::Plumbing) : Int32
         attributes = StaticArray(UInt64, 64).new(0_u64)
         actions = StaticArray(UInt64, 64).new(0_u64)
         every = StaticArray(UInt64, 32).new(0_u64)
@@ -77,19 +78,26 @@
           LibProcessSupervisionDarwin.posix_spawnattr_setsigdefault(pointerof(attributes), pointerof(every))
           LibProcessSupervisionDarwin.posix_spawnattr_setsigmask(pointerof(attributes), pointerof(none))
           flags = SPAWN_START_SUSPENDED | SPAWN_SETSIGDEF | SPAWN_SETSIGMASK | SPAWN_CLOEXEC_DEFAULT
-          if group = pgroup
+          if prepared.options.new_session
+            # a new session is also a new process group led by the child
+            flags |= SPAWN_SETSID
+          elsif group = pgroup
             flags |= SPAWN_SETPGROUP
             LibProcessSupervisionDarwin.posix_spawnattr_setpgroup(pointerof(attributes), group)
           end
           LibProcessSupervisionDarwin.posix_spawnattr_setflags(pointerof(attributes), flags)
           # CLOEXEC_DEFAULT closes everything that is not named here: inherit 0-2 unless redirected
           3.times do |target|
-            source = stdio[target]
+            source = plumbing.sources[target]
             if source >= 0
               LibProcessSupervisionDarwin.posix_spawn_file_actions_adddup2(pointerof(actions), source, target)
             else
               LibProcessSupervisionDarwin.posix_spawn_file_actions_addinherit_np(pointerof(actions), target)
             end
+          end
+          plumbing.extra_count.times do |index|
+            LibProcessSupervisionDarwin.posix_spawn_file_actions_adddup2(pointerof(actions), plumbing.extra_sources[index],
+              plumbing.extra_targets[index])
           end
           prepared.chdir.try do |directory|
             rc = LibProcessSupervisionDarwin.posix_spawn_file_actions_addchdir_np(pointerof(actions), directory)

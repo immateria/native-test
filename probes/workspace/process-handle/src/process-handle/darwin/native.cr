@@ -30,6 +30,7 @@
     end
 
     fun proc_pidinfo(pid : Int32, flavor : Int32, arg : UInt64, info : BSDInfo*, size : Int32) : Int32
+    fun proc_listallpids(buffer : Void*, size : Int32) : Int32
   end
 
   private lib LibProcessHandleDarwinSystem
@@ -95,6 +96,23 @@
       end
     rescue ProcessHandle::Error::AccessDenied
       ProcessHandle::Observation.new(pid, ProcessHandle::Observation::State::Unknown, nil)
+    end
+
+    def self.snapshot : Array(ProcessHandle::Entry)
+      count = LibProcessHandleDarwin.proc_listallpids(Pointer(Void).null, 0)
+      return [] of ProcessHandle::Entry if count <= 0
+      pids = Array(Int32).new(count + 64, 0)
+      count = LibProcessHandleDarwin.proc_listallpids(pids.to_unsafe.as(Void*), pids.size * sizeof(Int32))
+      entries = [] of ProcessHandle::Entry
+      count.times do |index|
+        pid = pids[index]
+        next unless pid > 0
+        info = read_bsdinfo(pid.to_i64) rescue nil
+        next unless info
+        name = String.new(info.comm.to_unsafe)
+        entries << ProcessHandle::Entry.new(pid.to_i64, info.ppid.to_i64, name)
+      end
+      entries
     end
 
     def self.lookup_identity(pid : Int64) : ProcessHandle::Identity?

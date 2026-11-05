@@ -1,11 +1,17 @@
 require "process-handle"
+require "socket"
 require "./process-supervision/version"
 require "./process-supervision/error"
 require "./process-supervision/mechanism"
 require "./process-supervision/execution_bridge"
 require "./process-supervision/stream_copies"
+require "./process-supervision/readiness"
+require "./process-supervision/spawn_options"
+require "./process-supervision/exit_outcome"
+require "./process-supervision/lifeline"
 require "./process-supervision/group"
 require "./process-supervision/child"
+require "./process-supervision/supervisor"
 
 {% if flag?(:unix) %}
   require "./process-supervision/posix/spawn"
@@ -20,6 +26,7 @@ require "./process-supervision/child"
 {% if flag?(:linux) %}
   require "./process-supervision/linux/raw_spawn"
   require "./process-supervision/linux/cgroup_v2"
+  require "./process-supervision/linux/cgroup_control"
 {% end %}
 
 {% if flag?(:win32) %}
@@ -30,6 +37,7 @@ require "./process-supervision/child"
   require "./process-supervision/windows/job/limit_events"
   require "./process-supervision/windows/job"
   require "./process-supervision/windows/spawn"
+  require "./process-supervision/windows/job_control"
 {% end %}
 
 module ProcessSupervision
@@ -77,11 +85,12 @@ module ProcessSupervision
                  chdir : Path | String? = nil,
                  input : ::Process::Stdio = ::Process::Redirect::Inherit,
                  output : ::Process::Stdio = ::Process::Redirect::Inherit,
-                 error : ::Process::Stdio = ::Process::Redirect::Inherit) : Child
+                 error : ::Process::Stdio = ::Process::Redirect::Inherit,
+                 options : SpawnOptions = SpawnOptions.new) : Child
     {% if flag?(:win32) %}
       job = Windows::Job.new
       begin
-        job.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
+        job.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error, options: options)
       rescue ex
         job.close rescue nil
         raise ex
@@ -95,7 +104,7 @@ module ProcessSupervision
         end
         if group
           begin
-            return group.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
+            return group.spawn(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error, options: options)
           rescue ex : Error::Unavailable
             # lost the delegation between the probe and the spawn: use the weaker mechanism rather than fail
             group.close rescue nil
@@ -105,9 +114,9 @@ module ProcessSupervision
           end
         end
       end
-      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
+      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error, options: options)
     {% elsif flag?(:unix) %}
-      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error)
+      POSIX::ProcessGroup.spawn_leader(command, args, env: env, clear_env: clear_env, chdir: chdir, input: input, output: output, error: error, options: options)
     {% else %}
       raise Error::Unsupported.new("spawning is not implemented for this target")
     {% end %}

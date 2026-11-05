@@ -13,6 +13,12 @@
     fun posix_spawn_file_actions_destroy(actions : Void*) : Int32
     fun posix_spawn_file_actions_adddup2(actions : Void*, fd : Int32, target : Int32) : Int32
     fun posix_spawn_file_actions_addchdir_np(actions : Void*, path : UInt8*) : Int32
+    fun setsid : Int32
+    fun setrlimit(resource : Int32, limit : LibC::Rlimit*) : Int32
+    fun setgroups(size : LibC::SizeT, list : UInt32*) : Int32
+    fun setgid(gid : UInt32) : Int32
+    fun prctl(option : Int32, arg2 : UInt64, arg3 : UInt64, arg4 : UInt64, arg5 : UInt64) : Int32
+    fun unshare(flags : Int32) : Int32
   end
 
   module ProcessSupervision::Linux
@@ -51,6 +57,9 @@
       private SPAWN_SETPGROUP  = 0x02_i16
       private SPAWN_SETSIGDEF  = 0x04_i16
       private SPAWN_SETSIGMASK = 0x08_i16
+      private SPAWN_SETSID     = 0x80_i16
+      private PR_SET_PDEATHSIG    =  1
+      private PR_SET_NO_NEW_PRIVS = 38
       private SPAWN_SETCGROUP  = 0x100_i16
 
       # glibc 2.39 entry points, looked up at run time (absent from older C libraries and from musl)
@@ -137,9 +146,13 @@
             cgroup_fd = open_fd(cgroup.to_s, LibC::O_RDONLY | LibC::O_CLOEXEC)
             procs_fd = open_fd((cgroup / "cgroup.procs").to_s, LibC::O_WRONLY | LibC::O_CLOEXEC)
           end
-          spawned = use_pidfd_spawn?(!cgroup.nil?) ? pidfd_spawn(prepared, cgroup_fd, pgroup, plumbing.sources, !cgroup.nil?, error_writer.fd) : nil
+          # options that need code in the child between fork and exec (credentials, limits, namespaces...) rule out
+          # pidfd_spawn; session, extra descriptors and IPC are posix_spawn attributes and file actions
+          spawned = if use_pidfd_spawn?(!cgroup.nil?) && !prepared.options.needs_child_setup?
+                      pidfd_spawn(prepared, cgroup_fd, pgroup, plumbing, !cgroup.nil?, error_writer.fd)
+                    end
           # on the pidfd_spawn path every failure is the call's return code: the error pipe only ever reports EOF
-          pid, pidfd = spawned || clone_process(prepared, cgroup_fd, procs_fd, pgroup, error_writer.fd, plumbing.sources)
+          pid, pidfd = spawned || clone_process(prepared, cgroup_fd, procs_fd, pgroup, error_writer.fd, plumbing)
           Pending.new(pid, pidfd >= 0 ? pidfd : nil, error_reader)
         rescue ex
           error_reader.close rescue nil
@@ -181,7 +194,7 @@
 
         begin
           handle = ProcessHandle::Linux.adopt_child(pending.pid.to_i64, pidfd)
-          ProcessSupervision::Child.new(process, handle, group, plumbing.input, plumbing.output, plumbing.error, plumbing.copies)
+          ProcessSupervision::Child.new(process, handle, group, plumbing.input, plumbing.output, plumbing.error, plumbing.copies, plumbing.ipc)
         rescue ex
           process.terminate(graceful: false) rescue nil
           process.wait rescue nil
@@ -209,7 +222,7 @@
       # failure it is closed if, and only if, it now is a pidfd whose process is gone (`Pid: -1` in its fdinfo). With a
       # fixed C library that descriptor is free or someone else's and is left alone.
       private def self.pidfd_spawn(prepared : ProcessSupervision::POSIX::Spawn::Prepared, cgroup_fd : Int32, pgroup : Int32?,
-                                   stdio : StaticArray(Int32, 3), into_cgroup : Bool, any_fd : Int32) : {Int32, Int32}?
+                                   plumbing : ProcessSupervision::POSIX::Spawn::Plumbing, into_cgroup : Bool, any_fd : Int32) : {Int32, Int32}?
         found = symbols.not_nil!
         attributes = StaticArray(UInt64, 64).new(0_u64)
         actions = StaticArray(UInt64, 32).new(0_u64)
@@ -223,7 +236,10 @@
           LibProcessSupervisionLinux.posix_spawnattr_setsigdefault(pointerof(attributes), pointerof(every))
           LibProcessSupervisionLinux.posix_spawnattr_setsigmask(pointerof(attributes), pointerof(none))
           flags = SPAWN_SETSIGDEF | SPAWN_SETSIGMASK
-          if group = pgroup
+          if prepared.options.new_session
+            # a new session is also a new process group led by the child
+            flags |= SPAWN_SETSID
+          elsif group = pgroup
             flags |= SPAWN_SETPGROUP
             LibProcessSupervisionLinux.posix_spawnattr_setpgroup(pointerof(attributes), group)
           end
@@ -233,9 +249,13 @@
           end
           LibProcessSupervisionLinux.posix_spawnattr_setflags(pointerof(attributes), flags)
           3.times do |target|
-            # sources are all >= 3 (see Plumbing) and close-on-exec; dup2 clears that flag on the target
-            source = stdio[target]
+            # sources are all above every target (see Plumbing) and close-on-exec; dup2 clears that flag on the target
+            source = plumbing.sources[target]
             LibProcessSupervisionLinux.posix_spawn_file_actions_adddup2(pointerof(actions), source, target) if source >= 0
+          end
+          plumbing.extra_count.times do |index|
+            LibProcessSupervisionLinux.posix_spawn_file_actions_adddup2(pointerof(actions), plumbing.extra_sources[index],
+              plumbing.extra_targets[index])
           end
           prepared.chdir.try do |directory|
             rc = LibProcessSupervisionLinux.posix_spawn_file_actions_addchdir_np(pointerof(actions), directory)
@@ -316,7 +336,14 @@
       end
 
       private def self.clone_process(prepared : ProcessSupervision::POSIX::Spawn::Prepared, cgroup_fd : Int32, procs_fd : Int32,
-                                     pgroup : Int32?, error_fd : Int32, stdio : StaticArray(Int32, 3)) : {Int32, Int32}
+                                     pgroup : Int32?, error_fd : Int32, plumbing : ProcessSupervision::POSIX::Spawn::Plumbing) : {Int32, Int32}
+        namespaces = prepared.options.namespaces
+        if !namespaces.none? && !use_clone3?
+          # the fork path can unshare every namespace but the PID one (that needs one more fork)
+          if namespaces.pid?
+            raise ProcessSupervision::Error::Unsupported.new("a PID namespace needs clone3, which this kernel or filter refuses")
+          end
+        end
         mask = uninitialized LibC::SigsetT
         previous = uninitialized LibC::SigsetT
         # Block every signal around the fork so the child cannot run one of the runtime's handlers (they write to the
@@ -335,14 +362,14 @@
           Crystal::System::Process.lock_write do
             if use_clone3?
               args = StaticArray(UInt64, 11).new(0_u64)
-              args[0] = CLONE_PIDFD | (cgroup_fd >= 0 ? CLONE_INTO_CGROUP : 0_u64)
+              args[0] = CLONE_PIDFD | (cgroup_fd >= 0 ? CLONE_INTO_CGROUP : 0_u64) | namespaces.value
               args[1] = pointerof(pidfd).address
               args[4] = SIGCHLD_NUMBER
               args[10] = cgroup_fd.to_u64 if cgroup_fd >= 0
               result = LibC.syscall(SYS_CLONE3, pointerof(args), CLONE_ARGS_SIZE_VER2)
               if result == 0
                 # clone3 already placed the child in the cgroup: no need for the cgroup.procs descriptor
-                child_exec(prepared, pgroup, -1, error_fd, stdio)
+                child_exec(prepared, pgroup, -1, error_fd, plumbing, false)
               elsif result > 0
                 pid = result.to_i32
                 @@last_engine = "clone3"
@@ -356,7 +383,7 @@
             if pid < 0 && (!use_clone3? || failure == Errno::ENOSYS || failure == Errno::EPERM)
               forked = LibC.fork
               if forked == 0
-                child_exec(prepared, pgroup, procs_fd, error_fd, stdio)
+                child_exec(prepared, pgroup, procs_fd, error_fd, plumbing, true)
               end
               if forked > 0
                 pid = forked
@@ -390,8 +417,12 @@
       end
 
       # The child side. Plain system calls only: no allocation, no Crystal runtime, nothing that can raise.
+      #
+      # Order: cgroup (fork path), session or process group, descriptors, namespaces (fork path), resource limits, umask,
+      # parent-death signal, groups / gid / uid (last of the privileged steps), no_new_privs, signals, directory, exec.
       private def self.child_exec(prepared : ProcessSupervision::POSIX::Spawn::Prepared, pgroup : Int32?, procs_fd : Int32,
-                                  error_fd : Int32, stdio : StaticArray(Int32, 3)) : NoReturn
+                                  error_fd : Int32, plumbing : ProcessSupervision::POSIX::Spawn::Plumbing, forked : Bool) : NoReturn
+        options = prepared.options
         empty = uninitialized LibC::SigsetT
         LibC.sigemptyset(pointerof(empty))
         if procs_fd >= 0
@@ -399,15 +430,56 @@
           zero = 0x30_u8
           child_fail(error_fd) unless LibC.write(procs_fd, pointerof(zero), 1) == 1
         end
-        if group = pgroup
+        if options.new_session
+          child_fail(error_fd) if LibProcessSupervisionLinux.setsid < 0
+        elsif group = pgroup
           child_fail(error_fd) unless LibProcessSupervisionLinux.setpgid(0, group) == 0
         end
         target = 0
         while target < 3
-          source = stdio[target]
-          # sources are all >= 3 (see Plumbing), so no dup2 can overwrite a later source
+          source = plumbing.sources[target]
+          # sources are all above every target (see Plumbing), so no dup2 can overwrite a later source
           child_fail(error_fd) if source >= 0 && LibC.dup2(source, target) < 0
           target += 1
+        end
+        index = 0
+        while index < plumbing.extra_count
+          child_fail(error_fd) if LibC.dup2(plumbing.extra_sources[index], plumbing.extra_targets[index]) < 0
+          index += 1
+        end
+        if forked && !options.namespaces.none?
+          child_fail(error_fd) if LibProcessSupervisionLinux.unshare(options.namespaces.value.to_i32) < 0
+        end
+        index = 0
+        while index < prepared.rlimit_count
+          limit = LibC::Rlimit.new
+          limit.rlim_cur = prepared.rlimits[index * 3 + 1]
+          limit.rlim_max = prepared.rlimits[index * 3 + 2]
+          child_fail(error_fd) if LibProcessSupervisionLinux.setrlimit(prepared.rlimits[index * 3].to_i32, pointerof(limit)) < 0
+          index += 1
+        end
+        if mask = options.umask
+          LibC.umask(mask)
+        end
+        if death = options.parent_death_signal
+          child_fail(error_fd) if LibProcessSupervisionLinux.prctl(PR_SET_PDEATHSIG, death.value.to_u64, 0, 0, 0) < 0
+          # the parent may have died before the prctl; then nothing would ever deliver the signal (a new PID
+          # namespace's first process sees parent pid 0, so the check does not apply there)
+          if !options.namespaces.pid? && LibC.getppid != prepared.parent_pid
+            LibC._exit(128 + death.value)
+          end
+        end
+        if options.groups
+          child_fail(error_fd) if LibProcessSupervisionLinux.setgroups(LibC::SizeT.new(prepared.group_count), prepared.groups) < 0
+        end
+        if gid = options.gid
+          child_fail(error_fd) if LibProcessSupervisionLinux.setgid(gid) < 0
+        end
+        if uid = options.uid
+          child_fail(error_fd) if LibC.setuid(uid) < 0
+        end
+        if options.no_new_privileges
+          child_fail(error_fd) if LibProcessSupervisionLinux.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0
         end
         number = 1
         while number <= 64

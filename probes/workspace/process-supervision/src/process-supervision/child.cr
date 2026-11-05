@@ -23,12 +23,16 @@ module ProcessSupervision
     # Copies between the child's pipes and caller-supplied IO objects that are not file descriptors.
     @copies : StreamCopies?
 
+    # The parent's end of the IPC socket (`SpawnOptions#ipc`); closed by `#close`.
+    getter! ipc : IO
+
     def initialize(@process : Process, @handle : ProcessHandle, @group : Group,
                    input : IO::FileDescriptor? = nil, output : IO::FileDescriptor? = nil,
-                   error : IO::FileDescriptor? = nil, copies : StreamCopies? = nil)
+                   error : IO::FileDescriptor? = nil, copies : StreamCopies? = nil, ipc : IO? = nil)
       @input = input
       @output = output
       @error = error
+      @ipc = ipc
       @copies = copies.try { |pending| pending.empty? ? nil : pending }
       @copies.try &.start
     end
@@ -58,6 +62,11 @@ module ProcessSupervision
       @wait_lock.synchronize { @status }
     end
 
+    # How the child ended (exited / killed by a signal / crashed, with the Windows NTSTATUS name), once waited for.
+    def outcome : ExitOutcome?
+      status.try { |value| ExitOutcome.classify(value) }
+    end
+
     # Closes local stream/process-wrapper and stable-handle resources only. It
     # deliberately does not close the supervision group because that group may
     # contain siblings. Cleanup attempts both owners and preserves the first
@@ -65,7 +74,7 @@ module ProcessSupervision
     def close : Nil
       run_on_execution_context("process-supervision-child-close") do
         first_error = nil.as(Exception?)
-        {@input, @output, @error}.each do |pipe|
+        {@input, @output, @error, @ipc}.each do |pipe|
           begin
             pipe.try { |io| io.close unless io.closed? }
           rescue ex

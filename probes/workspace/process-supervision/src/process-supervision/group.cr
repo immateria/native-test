@@ -43,6 +43,69 @@ module ProcessSupervision
     abstract def kill_on_close? : Bool
     abstract def soft_termination? : Bool
 
+    # Sends *signal* to every member. POSIX process groups (and their escapees) and cgroups; a Windows Job raises
+    # `Error::Unsupported` (use `request_stop`, `suspend`, `resume`, `kill`).
+    def signal(signal : Signal) : Nil
+      raise Error::Unsupported.new("#{mechanism} cannot deliver signals")
+    end
+
+    # Stops every member from running until `resume` (SIGSTOP; `cgroup.freeze`; every thread of every Job process).
+    def suspend : Nil
+      raise Error::Unsupported.new("#{mechanism} cannot suspend its members")
+    end
+
+    def resume : Nil
+      raise Error::Unsupported.new("#{mechanism} cannot resume its members")
+    end
+
+    # Asks every member to stop by itself: SIGCONT then SIGTERM on POSIX (a stopped process does not act on TERM) and
+    # for cgroups; on Windows CTRL_BREAK_EVENT to every console child spawned with `SpawnOptions#console_group` and
+    # WM_CLOSE to every top-level window of a member.
+    def request_stop : Nil
+      raise Error::Unsupported.new("#{mechanism} has no graceful stop")
+    end
+
+    # `request_stop`, up to *grace* for the members to leave, then `kill` and up to *kill_after* to drain: the graceful
+    # tier `shutdown` skips for backends without SIGTERM (Windows Jobs, cgroups).
+    def stop(*, grace : Time::Span = 5.seconds, kill_after : Time::Span = 2.seconds, close : Bool = true) : ShutdownResult
+      run_on_execution_context("process-supervision-group-stop") do
+        validate_timeout(grace, "grace")
+        validate_timeout(kill_after, "kill_after")
+        requested = killed = drained = closed_owner = false
+        primary = nil.as(Exception?)
+        begin
+          drained = empty?
+          unless drained
+            begin
+              request_stop
+              requested = true
+            rescue Error::Unsupported
+            end
+            drained = wait_empty(grace) if requested
+            unless drained
+              kill
+              killed = true
+              drained = wait_empty(kill_after)
+            end
+            raise Error::Timeout.new("process group did not drain after stop", kill_after) unless drained
+          end
+        rescue ex
+          primary = ex
+        ensure
+          if close
+            begin
+              self.close
+              closed_owner = true
+            rescue ex
+              primary ||= ex
+            end
+          end
+        end
+        raise primary.not_nil! if primary
+        ShutdownResult.new(requested, killed, drained, closed_owner)
+      end
+    end
+
     # Bounded terminate -> kill -> drain policy. Backends without meaningful
     # soft termination skip directly to hard kill instead of pretending that a
     # hard Windows Job termination is equivalent to SIGTERM.
