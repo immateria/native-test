@@ -1165,8 +1165,13 @@ Not built: a kit lane for Linux (the shard specs are its native evidence), and F
 
 ## First pass over every roadmap gap (what was built, what building it found)
 
-Commits `f6ea4f9` (the pass) and `6d4fac4` (fixes from its first native run). What was built is listed in `ROADMAP.md`
-("Status after the first pass") and the shard README ("Spawn options, control and supervision"). Native results for `6d4fac4`: pending (runs in progress).
+Commits `f6ea4f9` (the pass), then `6d4fac4`, `de0f4a5`, `55046d0` and `aa4fd94` (fixes from its native runs). What was built is listed in `ROADMAP.md`
+("Status after the first pass") and the shard README ("Spawn options, control and supervision"). Native results: Linux (`6d4fac4`, ubuntu-24.04 / 22.04 / 24.04 arm64) 83 supervision examples with 0 failures in each of
+the eleven runs per runner (plain, clone3 and fork engines, systemd `Delegate=yes`, no delegation, user manager, root,
+Docker default and privileged, plus the 200-cycle stress run), 22 process-handle examples; macOS (`de0f4a5`, 15, 15
+Intel, 26) 55 supervision and 9 process-handle examples, 0 failures, stress passing; Windows (`aa4fd94`, Server 2022 and
+2025) pending (runs in progress). Kit (`55046d0`): Windows elevated and unelevated and macOS Crystal + SDK lanes all
+`qualification_validation=pass`, manifest checks before and after pass.
 
 What building it found:
 
@@ -1207,6 +1212,11 @@ What building it found:
   write access to `cgroup.procs` of the closest common ancestor (here the root): every spawn into the scope failed with
   `EACCES`. `acquire` now checks this and refuses with the reason. Only a supervisor inside the user's systemd tree, or
   root, can use it.
+* **Crystal children do not crash on Windows the way other programs do.** The runtime installs a first vectored exception
+  handler that prints an access violation or a stack overflow and exits with code 1, so such a child is reported as
+  "exited 1", not as `STATUS_ACCESS_VIOLATION`, and `DIE_ON_UNHANDLED_EXCEPTION` never sees it. Other exceptions pass
+  through: a non-continuable `STATUS_ILLEGAL_INSTRUCTION` ends the child at once in a Job with that limit and is
+  classified as a crash.
 * **Windows command-line limit.** `CreateProcessW` takes 32,767 UTF-16 units including the terminator; the shard checks
   before anything is created and raises the error `CreateProcessW` itself gives (`ERROR_FILENAME_EXCED_RANGE`, 206).
 
