@@ -112,7 +112,7 @@ end
 {% else %}
   describe ProcessSupervision do
     it "loads the public surface" do
-      ProcessSupervision::VERSION.should eq("0.8.0")
+      ProcessSupervision::VERSION.should eq("0.9.0")
     end
   end
 {% end %}

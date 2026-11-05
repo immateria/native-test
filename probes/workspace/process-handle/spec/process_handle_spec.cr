@@ -148,7 +148,7 @@ require "./spec_helper"
 {% else %}
   describe ProcessHandle do
     it "loads the public surface" do
-      ProcessHandle::VERSION.should eq("0.9.0")
+      ProcessHandle::VERSION.should eq("0.10.0")
     end
   end
 {% end %}

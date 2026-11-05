@@ -168,8 +168,12 @@ What building it found (details in explore/FINDINGS.md, "First pass over every r
   Crystal I/O, or anything that can yield, while it holds a `Thread::Mutex`; interface files under a lock use raw syscalls.
 - A descriptor the event loop only waits on (an inotify instance) is wrapped with `IO::FileDescriptor.new(handle:)`: the
   public constructor sets its blocking mode, which turns a non-blocking inotify descriptor blocking. A kqueue cannot be
-  waited on through the macOS event loop at all (it also registers `EVFILT_WRITE`, which the kernel refuses), so macOS
-  exit waits still poll every 5 ms.
+  waited on through the macOS event loop at all (it also registers `EVFILT_WRITE`, which the kernel refuses), so every
+  macOS exit watch now lives in one shared kqueue serviced by one thread, which wakes waiting fibers through pipes
+  (process-handle 0.10.0: no descriptor per handle, no polling).
+- Windows batch files: `Job#spawn` still refuses them; `Job#spawn_batch` runs one through `cmd.exe` with quoting for
+  cmd's parser (the scheme Rust adopted after "BatBadBut"), fuzzed with 3 000 argument lists without a mismatch or an
+  injection; arguments with a line feed or carriage return cannot pass through cmd at all and are refused.
 - Crystal ignores `@[Link]` on a `private lib`; a binding to a library the standard library does not link (user32) is
   public.
 - The socket library is required on POSIX only: on Windows it starts Winsock at program start, and a program built with
