@@ -701,6 +701,11 @@ require "file_utils"
         service.stop(name, 30.seconds).should be_true
         File.read(log).should contain("shutdown drained=true")
         File.read(log).should contain("service returned")
+        # an exited process stays in the snapshot while a handle to it is still open somewhere: give it a moment
+        deadline = Time.instant + 5.seconds
+        while ProcessHandle.snapshot.any? { |entry| entry.pid == worker } && Time.instant < deadline
+          sleep 50.milliseconds
+        end
         ProcessHandle.snapshot.any? { |entry| entry.pid == worker }.should be_false
         service.process_id(name).should be_nil
       ensure
