@@ -166,9 +166,12 @@ What building it found (details in explore/FINDINGS.md, "First pass over every r
 
 - With execution contexts a fiber can resume on another thread after any blocking call, so nothing here does blocking
   Crystal I/O, or anything that can yield, while it holds a `Thread::Mutex`; interface files under a lock use raw syscalls.
-- A descriptor the event loop only waits on (a kqueue copy, an inotify instance) is wrapped with
-  `IO::FileDescriptor.new(handle:)`: the public constructor sets its blocking mode, which macOS refuses on a kqueue
-  (`ENOTTY`) and which turns a non-blocking inotify descriptor blocking on Linux.
+- A descriptor the event loop only waits on (an inotify instance) is wrapped with `IO::FileDescriptor.new(handle:)`: the
+  public constructor sets its blocking mode, which turns a non-blocking inotify descriptor blocking. A kqueue cannot be
+  waited on through the macOS event loop at all (it also registers `EVFILT_WRITE`, which the kernel refuses), so macOS
+  exit waits still poll every 5 ms.
+- Crystal ignores `@[Link]` on a `private lib`; a binding to a library the standard library does not link (user32) is
+  public.
 - The socket library is required on POSIX only: on Windows it starts Winsock at program start, and a program built with
   it dies before `main` when spawned with `clear_env` (no `SystemRoot`).
 - `SystemdScope` only helps a process that may move children into the scope: moving needs write access to `cgroup.procs`
