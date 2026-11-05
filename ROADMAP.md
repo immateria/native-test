@@ -44,8 +44,8 @@ the API shape and edge cases still need review, as asked: "map out as much as po
 | systemd delegated scope | **first cut**, experimental: usable only by a supervisor inside the user's systemd tree or root (moving children needs write access at the common ancestor); `acquire` refuses otherwise | `Linux::SystemdScope.acquire` |
 | Namespaces | **first cut** (clone3 path; no uid_map for user namespaces) | `SpawnOptions#namespaces` |
 | Stress | **first cut** | `PROCESS_SUPERVISION_STRESS=1` spec, run in CI |
-| launchd | **measured**: bootout/crash end the job's process group, never a `setsid` escapee; `ExitTimeOut`, `KeepAlive` throttle (10 s) | FINDINGS "Hard questions" |
-| Windows SCM | **measured**: a Crystal program runs as a service (dispatcher on a Crystal thread, `ServiceMain` Win32-only); STOP 17 ms; the Job takes workers down with a killed service; `STDOUT` is a closed stream | `explore/windows/crystal_service.cr`; not in the shard yet |
+| launchd | **built** (first cut): job property lists with `ExitTimeOut` sized from the shutdown budget, install/uninstall/status/kickstart; measured: bootout/crash end the job's process group, never a `setsid` escapee | `ProcessSupervision::Launchd` |
+| Windows SCM | **built** (first cut): `Service.run` (dispatcher in an isolated context, stop via a pipe), install/start/stop/state/uninstall; spec installs, starts, stops (worker ended) and removes a real service on Server 2022/2025 | `ProcessSupervision::Windows::Service` |
 | seccomp / Landlock | **measured**: Landlock ABI 4 (22.04) / 8 (24.04) incl. TCP and signal scoping; seccomp errno/kill/user-notification work, also in Docker; both need `no_new_privs` and a fork/`clone3` child | not in the shard yet |
 | FreeBSD | **measured**: `pdfork` (close kills, not in `wait(-1)`), `NOTE_TRACK`, reaper tree kill reaching escapees and nested reapers, `PROC_PDEATHSIG_CTL`; Crystal 1.21.1 packaged, but its compiler crashes on the supervision spec | backend not built |
 | AppContainer, musl runs, soak, benchmarks, reload/fd hand-over | open | |

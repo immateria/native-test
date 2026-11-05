@@ -1362,6 +1362,17 @@ results on macOS 15 and 26: 12 process-handle examples (three new: 53 watches ad
 waiters wake on `SIGKILL`; a wait times out while the process runs and returns on exit; `alive?` is false as soon as the
 process is reaped, 20 times in a row) and 55 supervision examples, 0 failures, stress run passing.
 
+### Built from these measurements: a Windows service host and launchd jobs
+
+`ProcessSupervision::Windows::Service` follows the probe's wiring, with an isolated execution context for the dispatcher
+instead of a raw thread and a pipe (written with a plain `WriteFile` from the SCM's threads) instead of Win32 events, so
+the waiting side is an ordinary fiber. Its spec builds `spec/support/service_child.cr`, installs it as a real service,
+starts it, finds its Job worker parented to the service process, stops it (the worker is gone, the block returned),
+and uninstalls it: 30 supervision examples, 0 failures, 0 pending on Server 2022 and 2025; outside the SCM, `run`
+raises `Error::Unavailable` (`StartServiceCtrlDispatcherW` error 1063). `ProcessSupervision::Launchd` writes and loads a
+job and reads `launchctl print`; its spec checks that launchd starts the job, that `XPC_SERVICE_NAME` is the label, that
+`status` reports the running pid, and that `uninstall` ends the process and removes the property list.
+
 ## Still open
 
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time

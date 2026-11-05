@@ -240,3 +240,38 @@ cleanup instead of joining it, avoiding the per-reader HANDLE leak observed with
 Crystal 1.22.x `Thread#join`. `Group#shutdown(close: true)` also attempts cleanup
 when its *initial* state observation throws, preserving that error over any
 secondary cleanup failure. Windows supervised-spawn rollback also preserves the original setup failure when closing a partially-created stable process handle fails, so cleanup cannot replace the primary diagnostic.
+
+## Running under a service manager
+
+**Windows service.** `ProcessSupervision::Windows::Service.run(name) { |service| ... }` makes the program a service: the
+SCM's dispatcher runs in an isolated execution context, `ServiceMain` and the control handler only make Win32 calls
+(the SCM calls `ServiceMain` on a thread the garbage collector does not know), and a STOP or system shutdown wakes
+`service.wait_for_stop` through a pipe. The block runs on the calling fiber; an exception from it is reported as a
+service-specific error, so the SCM's failure actions apply. Start the workers in one `ProcessSupervision.job`: if the
+service process is killed, the Job's kill-on-close ends them. A service has no standard streams (`STDOUT` is a closed
+stream): log to a file. `Service.install(name, binary, args, restart_after: 5.seconds)`, `start`, `stop(name, timeout)`,
+`state`, `process_id` and `uninstall` manage services (elevated).
+
+```crystal
+ProcessSupervision::Windows::Service.run("my-supervisor") do |service|
+  job = ProcessSupervision.job
+  job.spawn("C:\\app\\worker.exe")
+  service.wait_for_stop
+  service.report_stop_progress(10.seconds) # a long shutdown keeps the SCM waiting
+  job.shutdown(grace: 5.seconds)
+end
+```
+
+**launchd.** `ProcessSupervision::Launchd::JobSpec` renders the job's property list; `exit_timeout_for(grace:,
+kill_after:)` sets `ExitTimeOut` above the supervisor's own shutdown, so launchd's SIGKILL never cuts it short.
+`Launchd.install(spec)` writes it (`~/Library/LaunchAgents`, or `/Library/LaunchDaemons` for root) and bootstraps it into
+`gui/<uid>` or `system`; `status`, `kickstart` and `uninstall` (bootout, then delete) go through `launchctl`;
+`Launchd.current_label` is the label launchd started this process under. launchd ends the job's process group but
+never a process that left it (`setsid`), so keep the supervisor's own escapee handling.
+
+```crystal
+spec = ProcessSupervision::Launchd::JobSpec.new("dev.example.supervisor", ["/usr/local/bin/supervisor"])
+spec.keep_alive = true
+spec.exit_timeout_for(grace: 5.seconds, kill_after: 3.seconds) # ExitTimeOut 10
+ProcessSupervision::Launchd.install(spec)
+```
