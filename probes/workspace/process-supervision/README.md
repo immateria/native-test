@@ -275,3 +275,16 @@ spec.keep_alive = true
 spec.exit_timeout_for(grace: 5.seconds, kill_after: 3.seconds) # ExitTimeOut 10
 ProcessSupervision::Launchd.install(spec)
 ```
+
+## Process semantics the shard handles for you
+
+- `parent_death_signal` survives Crystal's thread pool: the spawn runs on a thread that lives as long as the process
+  (Linux ties the signal to the creating *thread*; pooled threads end after 5 idle minutes).
+- `namespaces: Pid` runs a minimal init as PID 1 (signals forwarded, orphans reaped); `pid_namespace_init = false` to
+  opt out.
+- A child whose pid was used before by a stray child never gets the stray's parked exit status.
+- Linux children get no descriptor without close-on-exec, on every engine (macOS uses `POSIX_SPAWN_CLOEXEC_DEFAULT`).
+- `Child#wait(timeout)` bounds stream copies too; `SpawnOptions#wait_delay` stops waiting for an output pipe a
+  descendant holds open (`Child#output_cut?`); a copy into stdin is abandoned once the child has exited.
+- A process group is never signalled after it was seen empty (its number may then belong to another process group).
+

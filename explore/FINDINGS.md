@@ -1404,6 +1404,22 @@ Ubuntu runners in every environment (plain, root, systemd units, Docker), macOS 
   and everything above it (`posix_spawn_file_actions_addclosefrom_np`); the clone3/fork child marks everything from 3
   up close-on-exec (`close_range(CLOSE_RANGE_CLOEXEC)`, kernel 5.11+, an `fcntl` loop before) so the exec-error pipe
   still works, then clears the flag on the extra descriptors. macOS already used `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+* **`wait` hung on streams after the child had exited.** With a stream copied into an `IO`, `Child#wait` waited
+  for every copy. An output pipe reaches end-of-file only when every process holding its write end closes it, so
+  `sh -c 'sleep 3 & echo hi'` made `wait` take 3 s (the grandchild's life, not the child's); a copy into stdin from a
+  source that never ends kept even `wait(5.seconds)` blocked (still blocked when the 30 s guard ended the program).
+  Now the stdin copy is abandoned once the child has exited, `SpawnOptions#wait_delay` (Go's `Cmd.WaitDelay`) bounds
+  the wait for output pipes after the exit and sets `Child#output_cut?`, and a finite `wait(timeout)` bounds the whole
+  call (the collection goes on in a fiber; a later `wait` picks it up).
+* **A process group number was signalled after it could belong to someone else.** `ProcessGroup#signal` sent
+  `kill(-pgid)` forever. Once every member has exited, an unrelated process that leads a new group (`setsid`) can get
+  the number: with `ns_last_pid` forcing it, `group.kill` killed a `setsid sleep 30`. While any member lives the kernel
+  does not reuse a pgid, and a group that has emptied can never get a member again (joining needs a live member), so
+  the group is tombstoned the first time it is seen empty (`ESRCH`) and nothing is sent to the number afterwards. Not
+  covered: a group that empties and whose number is reused before the controller looks at it even once (a full pid
+  wrap in between).
+* **Windows: an exited process stays in the process snapshot while any handle to it is open**, so "the worker is gone"
+  right after a service stop must wait for the last handle (the Windows Server 2025 run failed once on that).
 
 ## Still open
 
