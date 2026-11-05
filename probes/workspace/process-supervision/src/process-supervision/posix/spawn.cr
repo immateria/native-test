@@ -289,12 +289,59 @@
 
       # Hands a pid created outside Process.new to Crystal's child reaper. The runtime already reaps every child and keeps
       # the status of pids nobody waits for yet, so this may happen after the child exited; do not waitpid it yourself.
+      #
+      # Before handing it over, drops a status the runtime parked under this pid for an earlier, *different* child (see
+      # `Crystal::System::SignalChildHandler.discard_stale_status`): `Crystal::System::Process.new` claims a parked status
+      # at once, so a stray's status would otherwise become this child's.
       def self.adopt(pid : Int32) : ::Process
+        Crystal::System::SignalChildHandler.discard_stale_status(pid)
         ::Process.new(Crystal::System::Process.new(pid))
+      end
+
+      # Whether *pid* (a child of this process) has been reaped already: `waitid(P_PID, WNOHANG | WNOWAIT)` answers
+      # ECHILD for a reaped pid, and leaves a running or zombie child untouched.
+      def self.reaped?(pid : Int32) : Bool
+        info = uninitialized UInt8[128]
+        {% if flag?(:darwin) %}
+          options = 0x04 | 0x01 | 0x20 # WEXITED | WNOHANG | WNOWAIT
+        {% else %}
+          options = 0x04 | 0x01 | 0x01000000
+        {% end %}
+        LibProcessSupervisionWaitid.waitid(1, pid.to_u32, info.to_unsafe.as(Void*), options) != 0 && Errno.value == Errno::ECHILD
       end
 
       private def self.validate_text!(value : String, label : String) : Nil
         raise ArgumentError.new("Invalid #{label}: contains NUL byte") if value.includes?('\0')
+      end
+    end
+  end
+{% end %}
+
+{% if flag?(:unix) %}
+  private lib LibProcessSupervisionWaitid
+    fun waitid(idtype : Int32, id : UInt32, info : Void*, options : Int32) : Int32
+  end
+
+  # Crystal's SIGCHLD handler (stdlib internal, Crystal 1.21) reaps every child with `waitpid(-1)` and parks the status
+  # of a pid nobody waits for yet. A stray child (an orphan adopted as a subreaper, a raw fork, a `Process` dropped
+  # without `wait`) leaves such an entry, and when the kernel reuses that pid, `Process.new`'s internal
+  # `SignalChildHandler.wait` claims the stray's status for the new child (measured: a child that ran for a second
+  # "exited 7" after 2 ms; spec "never reports a stray child's parked status").
+  module Crystal::System::SignalChildHandler
+    # :nodoc:
+    #
+    # Drops the parked status for *pid* unless the current child with that pid has itself been reaped (then the
+    # handler has overwritten the entry with its real status). Checked under the handler's mutex: the handler reaps
+    # before it takes the mutex, so a reap racing this check either is seen as ECHILD (and its status stored after) or
+    # stores its status after the stale one was dropped.
+    def self.discard_stale_status(pid : LibC::PidT) : Nil
+      @@mutex.lock
+      begin
+        if @@pending.has_key?(pid) && !ProcessSupervision::POSIX::Spawn.reaped?(pid)
+          @@pending.delete(pid)
+        end
+      ensure
+        @@mutex.unlock
       end
     end
   end

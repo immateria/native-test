@@ -129,6 +129,21 @@ require "file_utils"
         end
       end
 
+      it "never reports a stray child's parked status for a child that reuses its pid" do
+        pending!("needs root (ns_last_pid)") unless LibC.getuid == 0 && File.writable?("/proc/sys/kernel/ns_last_pid")
+        # a child the runtime did not create: Crystal's SIGCHLD handler reaps it and parks exit 7 under its pid
+        stray = LibC.fork
+        LibC._exit(7) if stray == 0
+        sleep 300.milliseconds
+        File.write("/proc/sys/kernel/ns_last_pid", (stray - 1).to_s)
+        child = feature_leader("/bin/sh", ["-c", "sleep 0.5; exit 0"])
+        pending!("pid #{stray} was not reused (got #{child.pid})") unless child.pid == stray
+        started = Time.instant
+        status = feature_finish(child)
+        status.exit_code.should eq(0)
+        (Time.instant - started).should be >= 300.milliseconds
+      end
+
       it "switches user and group when running as root" do
         pending!("needs root") unless LibC.getuid == 0
         opts = options do |o|
