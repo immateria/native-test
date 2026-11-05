@@ -463,7 +463,7 @@ require "file_utils"
         status = child.wait(10.seconds).not_nil!
         outcome = ProcessSupervision::ExitOutcome.classify(status)
         outcome.crashed?.should be_true
-        outcome.description.should contain("ACCESS_VIOLATION")
+        outcome.description.should contain("ILLEGAL_INSTRUCTION")
       ensure
         child.close
         job.close

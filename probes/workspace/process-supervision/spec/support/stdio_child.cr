@@ -6,8 +6,15 @@
 #   tree         start this program again as `ready` with inherited streams, then wait for it
 #   ready        write "ready\n" to standard output, then sleep for a minute
 #   break        like ready, but exit 0 (printing "stopping") on a console Ctrl+Break / Ctrl+C
-#   crash        fault (access violation)
+#   crash        raise an unhandled STATUS_ILLEGAL_INSTRUCTION exception (an access violation would not do: Crystal's
+#                runtime catches it in a vectored handler, prints it and exits with code 1)
 #   write-handle write "via handle\n" to the inherited handle announced for descriptor 5
+{% if flag?(:win32) %}
+  lib LibStdioChildKernel32
+    fun RaiseException(code : UInt32, flags : UInt32, count : UInt32, arguments : Void*) : Void
+  end
+{% end %}
+
 case ARGV[0]?
 when "cat"
   IO.copy(STDIN, STDOUT)
@@ -32,8 +39,12 @@ when "break"
   STDOUT.flush
   sleep 60.seconds
 when "crash"
-  # an access violation
-  Pointer(Int32).new(16_u64).value = 1
+  # Crystal's vectored handler only takes access violations and stack overflows; anything else stays unhandled
+  {% if flag?(:win32) %}
+    LibStdioChildKernel32.RaiseException(0xC000001D_u32, 1_u32, 0_u32, Pointer(Void).null) # EXCEPTION_NONCONTINUABLE
+  {% else %}
+    Pointer(Int32).new(16_u64).value = 1
+  {% end %}
 when "write-handle"
   # writes to the handle the parent passed as extra descriptor 5 (PROCESS_SUPERVISION_HANDLES=5:<value>)
   entry = (ENV["PROCESS_SUPERVISION_HANDLES"]? || "").split(',').find(&.starts_with?("5:"))
