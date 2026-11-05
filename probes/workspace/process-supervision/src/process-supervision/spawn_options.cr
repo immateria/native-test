@@ -75,11 +75,19 @@ module ProcessSupervision
     property umask : UInt32? = nil
     # resource => {soft, hard}; `UNLIMITED` for no limit
     property rlimits : Hash(Rlimit, Tuple(UInt64, UInt64)) = {} of Rlimit => Tuple(UInt64, UInt64)
-    # Signal the child gets when the thread that created it exits (Linux `PR_SET_PDEATHSIG`). Note: it is tied to the
-    # creating *thread*, not the process; in a multi-threaded runtime prefer `ProcessSupervision::Lifeline`.
+    # Signal the child gets when its parent dies (Linux `PR_SET_PDEATHSIG`). The kernel ties it to the *thread* that
+    # created the child, so a spawn with this option runs on a thread that lives as long as the process; it still fires
+    # when the supervisor process ends, by any cause. A child started from a raw `Thread` of your own is not affected.
     property parent_death_signal : Signal? = nil
     property no_new_privileges : Bool = false
     property namespaces : Namespace = Namespace::None
+    # With `Namespace::Pid`: run a minimal init as PID 1 of the new namespace and the program as its child (PID 2).
+    # PID 1 is special: the kernel drops every signal it has no handler for, so a program that relies on the default
+    # action of SIGTERM or SIGINT cannot be stopped, and every orphan in the namespace becomes its zombie. The init
+    # forwards each signal it receives (except SIGCHLD) to the program's process group, reaps orphans, and exits with
+    # the program's exit code, or 128 + the signal number when a signal ended it. When the init ends, the kernel kills
+    # everything left in the namespace. Set to false to make the program PID 1 itself.
+    property pid_namespace_init : Bool = true
     property console_group : Bool = false
     property hide_window : Bool = false
 

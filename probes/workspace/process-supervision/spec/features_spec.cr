@@ -110,6 +110,25 @@ require "file_utils"
         feature_finish(child).success?.should be_true
       end
 
+      it "keeps a parent-death-signal child alive after the thread that asked for it has ended" do
+        # PR_SET_PDEATHSIG fires when the creating *thread* exits. Crystal parks the thread of a finished isolated
+        # context in a pool and ends it after `thread_keepalive` (5 minutes by default): a child created there would
+        # be killed minutes later. Shorten the keepalive so the pool thread really ends while the child runs.
+        keepalive = Fiber::ExecutionContext.thread_keepalive
+        Fiber::ExecutionContext.thread_keepalive = 50.milliseconds
+        begin
+          child = nil.as(ProcessSupervision::Child?)
+          Fiber::ExecutionContext::Isolated.new("short-lived") do
+            child = feature_leader("/bin/sh", ["-c", "sleep 1.5; exit 3"], options: options(&.parent_death_signal=(Signal::KILL)))
+          end.wait
+          status = feature_finish(child.not_nil!)
+          status.signal_exit?.should be_false
+          status.exit_code.should eq(3)
+        ensure
+          Fiber::ExecutionContext.thread_keepalive = keepalive
+        end
+      end
+
       it "switches user and group when running as root" do
         pending!("needs root") unless LibC.getuid == 0
         opts = options do |o|
@@ -125,17 +144,62 @@ require "file_utils"
 
       it "starts the child in new UTS and PID namespaces when privileged" do
         pending!("needs root") unless LibC.getuid == 0
-        opts = options { |o| o.namespaces = ProcessSupervision::SpawnOptions::Namespace::Uts | ProcessSupervision::SpawnOptions::Namespace::Pid }
-        child = begin
-          # never touch the hostname unless this really is the new PID namespace (so also the new UTS one)
-          feature_leader("/bin/sh", ["-c", "[ $$ = 1 ] || exit 9; hostname ps-ns-spec; hostname; echo $$"], output: Process::Redirect::Pipe, options: opts)
-        rescue ex : ProcessSupervision::Error::Unsupported | File::AccessDeniedError | IO::Error
-          pending!("namespaces refused here: #{ex.message}")
+        {true, false}.each do |init|
+          opts = options do |o|
+            o.namespaces = ProcessSupervision::SpawnOptions::Namespace::Uts | ProcessSupervision::SpawnOptions::Namespace::Pid
+            o.pid_namespace_init = init
+          end
+          expected = init ? "2" : "1" # with the init, the program is its child
+          child = begin
+            # never touch the hostname unless this really is the new PID namespace (so also the new UTS one)
+            feature_leader("/bin/sh", ["-c", "[ $$ = #{expected} ] || exit 9; hostname ps-ns-spec; hostname; echo $$"],
+              output: Process::Redirect::Pipe, options: opts)
+          rescue ex : ProcessSupervision::Error::Unsupported | File::AccessDeniedError | IO::Error
+            pending!("namespaces refused here: #{ex.message}")
+          end
+          text = child.output.gets_to_end
+          feature_finish(child).exit_code.should eq(0)
+          text.lines.should eq(["ps-ns-spec", expected])
+          System.hostname.should_not eq("ps-ns-spec")
         end
-        text = child.output.gets_to_end
-        feature_finish(child)
-        text.lines.should eq(["ps-ns-spec", "1"])
-        System.hostname.should_not eq("ps-ns-spec")
+      end
+
+      it "stops a program without a TERM handler in a new PID namespace (the init forwards; PID 1 alone ignores it)" do
+        pending!("needs root") unless LibC.getuid == 0
+        {true, false}.each do |init|
+          opts = options do |o|
+            o.namespaces = ProcessSupervision::SpawnOptions::Namespace::Pid
+            o.pid_namespace_init = init
+          end
+          child = feature_leader("sleep", ["30"], options: opts)
+          sleep 200.milliseconds
+          child.handle.signal(Signal::TERM)
+          status = child.wait(3.seconds)
+          if init
+            status.not_nil!.exit_code.should eq(128 + Signal::TERM.value)
+          else
+            status.should be_nil # the kernel drops a default-action signal sent to a namespace's PID 1
+            child.handle.kill
+            child.wait(5.seconds).not_nil!.signal_exit?.should be_true
+          end
+          child.close
+          child.group.close rescue nil
+        end
+      end
+
+      it "reaps orphans inside a new PID namespace" do
+        pending!("needs root") unless LibC.getuid == 0
+        opts = options(&.namespaces=(ProcessSupervision::SpawnOptions::Namespace::Pid))
+        # the subshell exits at once, so its `sleep 0.2` is orphaned to the namespace's PID 1 (the init)
+        child = feature_leader("/bin/sh", ["-c", "(sleep 0.2 &); sleep 1.5"], options: opts)
+        sleep 800.milliseconds
+        zombies = Dir.children("/proc").select(&.to_i64?).count do |entry|
+          stat = File.read("/proc/#{entry}/stat") rescue next false
+          fields = stat[(stat.rindex(')').not_nil! + 2)..].split(' ')
+          fields[0] == "Z" && fields[1] == child.pid.to_s
+        end
+        zombies.should eq(0)
+        feature_finish(child).exit_code.should eq(0)
       end
     {% else %}
       it "refuses options macOS's posix_spawn cannot express" do

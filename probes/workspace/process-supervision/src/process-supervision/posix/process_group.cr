@@ -45,7 +45,7 @@
         check_options!(options, joining: true)
         marker = track_descendants ? MarkerScan.entry(@mutex.synchronize { @marker ||= MarkerScan.new_token }) : nil
         {% if flag?(:linux) %}
-          run_on_execution_context("process-supervision-posix-spawn") do
+          run_spawn("process-supervision-posix-spawn", options) do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             group = @pgid.to_i32
@@ -61,7 +61,7 @@
             ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, self, group)
           end
         {% elsif flag?(:darwin) %}
-          run_on_execution_context("process-supervision-posix-spawn") do
+          run_spawn("process-supervision-posix-spawn", options) do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             begin
@@ -94,7 +94,7 @@
         token = track_descendants ? MarkerScan.new_token : nil
         marker = token.try { |value| MarkerScan.entry(value) }
         {% if flag?(:linux) %}
-          run_on_execution_context("process-supervision-posix-spawn-leader") do
+          run_spawn("process-supervision-posix-spawn-leader", options) do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             pending = ProcessSupervision::Linux::RawSpawn.create(prepared, plumbing, pgroup: 0)
@@ -102,7 +102,7 @@
             ProcessSupervision::Linux::RawSpawn.complete(pending, prepared, plumbing, new(pending.pid.to_i64, token), nil)
           end
         {% elsif flag?(:darwin) %}
-          run_on_execution_context("process-supervision-posix-spawn-leader") do
+          run_spawn("process-supervision-posix-spawn-leader", options) do
             prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, marker, options)
             plumbing = ProcessSupervision::POSIX::Spawn::Plumbing.build(input, output, error, options, prepared.ipc_target)
             pid, process, handle = ProcessSupervision::POSIX::DarwinSpawn.launch(prepared, 0, plumbing)

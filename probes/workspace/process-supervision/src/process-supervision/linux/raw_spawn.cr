@@ -19,6 +19,7 @@
     fun setgid(gid : UInt32) : Int32
     fun prctl(option : Int32, arg2 : UInt64, arg3 : UInt64, arg4 : UInt64, arg5 : UInt64) : Int32
     fun unshare(flags : Int32) : Int32
+    fun sigwaitinfo(set : LibC::SigsetT*, info : Void*) : Int32
   end
 
   module ProcessSupervision::Linux
@@ -486,12 +487,66 @@
           LibC.signal(number, LibC::SIG_DFL) unless number == 9 || number == 19
           number += 1
         end
-        LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(empty), nil)
         if directory = prepared.chdir
           child_fail(error_fd) unless LibC.chdir(directory) == 0
         end
+        if options.namespaces.pid? && options.pid_namespace_init
+          pid_namespace_init(prepared, error_fd, plumbing)
+        end
+        LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(empty), nil)
         LibC.execve(prepared.path, prepared.argv.pointers, prepared.envp.pointers)
         child_fail(error_fd)
+      end
+
+      # PID 1 of a new PID namespace (still the child side: plain system calls only). Forks the program, which leads
+      # its own process group, then forwards signals to that group and reaps until the program exits.
+      private def self.pid_namespace_init(prepared : ProcessSupervision::POSIX::Spawn::Prepared, error_fd : Int32,
+                                          plumbing : ProcessSupervision::POSIX::Spawn::Plumbing) : NoReturn
+        all = uninitialized LibC::SigsetT
+        LibC.sigfillset(pointerof(all))
+        # every signal stays blocked here (the parent blocked them around clone): blocked signals are queued even for
+        # PID 1, and sigwaitinfo takes them; the program resets its mask before exec
+        program = LibC.fork
+        child_fail(error_fd) if program < 0
+        if program == 0
+          LibProcessSupervisionLinux.setpgid(0, 0)
+          empty = uninitialized LibC::SigsetT
+          LibC.sigemptyset(pointerof(empty))
+          LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(empty), nil)
+          LibC.execve(prepared.path, prepared.argv.pointers, prepared.envp.pointers)
+          child_fail(error_fd)
+        end
+        LibProcessSupervisionLinux.setpgid(program, program) # both sides, so a forwarded signal never misses the group
+        # the init keeps none of the program's descriptors: the exec-error pipe must reach end-of-file when the program
+        # execs, and readers of the program's output must see end-of-file when it closes its copy
+        LibC.close(error_fd)
+        fd = 0
+        while fd < 3
+          LibC.close(fd)
+          fd += 1
+        end
+        index = 0
+        while index < plumbing.extra_count
+          LibC.close(plumbing.extra_targets[index])
+          index += 1
+        end
+        LibC.pthread_sigmask(LibC::SIG_SETMASK, pointerof(all), nil)
+        info = uninitialized UInt8[128]
+        loop do
+          signal = LibProcessSupervisionLinux.sigwaitinfo(pointerof(all), info.to_unsafe.as(Void*))
+          next if signal < 0
+          if signal == 17 # SIGCHLD: reap everything, orphans included
+            loop do
+              status = 0
+              reaped = LibC.waitpid(-1, pointerof(status), LibC::WNOHANG)
+              break if reaped <= 0
+              next unless reaped == program
+              LibC._exit((status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f))
+            end
+          elsif LibC.kill(-program, signal) != 0
+            LibC.kill(program, signal)
+          end
+        end
       end
 
       private def self.child_fail(error_fd : Int32) : NoReturn

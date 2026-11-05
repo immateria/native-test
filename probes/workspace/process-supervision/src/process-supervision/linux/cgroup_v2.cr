@@ -189,7 +189,7 @@
                 output : ::Process::Stdio = ::Process::Redirect::Inherit,
                 error : ::Process::Stdio = ::Process::Redirect::Inherit,
                 options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new) : ProcessSupervision::Child
-        run_on_execution_context("process-supervision-cgroup-spawn") do
+        run_spawn("process-supervision-cgroup-spawn", options) do
           options.check_supported!("Linux cgroup v2", credentials: true, umask: true, rlimits: true, parent_death_signal: true,
             no_new_privileges: true, namespaces: true)
           prepared = ProcessSupervision::POSIX::Spawn.prepare(command, args, env, clear_env, chdir, nil, options)
