@@ -198,9 +198,10 @@
         keeper = ::Process.new(runner, args, output: ::Process::Redirect::Pipe, error: ::Process::Redirect::Pipe)
         line = keeper.output.gets
         unless line == "ready"
-          message = keeper.error.gets_to_end rescue ""
+          # stop it first: if the scope command did start, it holds the error pipe open and the read would not end
           keeper.terminate rescue nil
           keeper.wait rescue nil
+          message = keeper.error.gets_to_end rescue ""
           raise ProcessSupervision::Error::Unavailable.new("systemd-run could not create #{unit}: #{message.strip}")
         end
         path = scope_path(keeper.pid)
@@ -217,7 +218,30 @@
           keeper.wait rescue nil
           raise ProcessSupervision::Error::Unavailable.new("#{unit} is not delegated to this user: #{ex.message}")
         end
+        # Moving a process between cgroups needs write access to cgroup.procs of their closest common ancestor. A
+        # supervisor that is not itself inside the user's systemd tree (a system service, a CI job) gets EACCES for
+        # every child it spawns into the scope, so refuse here rather than at the first spawn.
+        unless can_migrate_into?(path)
+          keeper.terminate rescue nil
+          keeper.wait rescue nil
+          raise ProcessSupervision::Error::Unavailable.new(
+            "#{unit} was created, but this process cannot move children into it: cgroup.procs of the common " \
+            "ancestor of its own cgroup and the scope is not writable (run the supervisor inside the user's " \
+            "systemd session, or as root)")
+        end
         new(path, unit, keeper)
+      end
+
+      private def self.can_migrate_into?(target : Path) : Bool
+        own = CgroupV2.current_path
+        return false unless own
+        ancestor = own
+        until target.to_s == ancestor.to_s || target.to_s.starts_with?("#{ancestor.to_s.chomp('/')}/")
+          parent = ancestor.parent
+          return false if parent == ancestor
+          ancestor = parent
+        end
+        LibC.access((ancestor / "cgroup.procs").to_s, LibC::W_OK) == 0
       end
 
       def initialize(@path : Path, @unit : String, @keeper : ::Process)

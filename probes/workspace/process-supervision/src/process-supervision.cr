@@ -1,5 +1,9 @@
 require "process-handle"
-require "socket"
+# Not on Windows: requiring the socket library starts Winsock at program start, and WSAStartup fails in a process
+# whose environment lacks SystemRoot (a child spawned with clear_env), killing it before main.
+{% unless flag?(:win32) %}
+  require "socket"
+{% end %}
 require "./process-supervision/version"
 require "./process-supervision/error"
 require "./process-supervision/mechanism"

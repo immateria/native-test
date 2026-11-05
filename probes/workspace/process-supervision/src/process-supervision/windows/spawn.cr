@@ -59,7 +59,9 @@
         chdir_string.try { |path| validate_no_nul!(path, "chdir") }
         command_line = Process.quote_windows(argv).to_utf16
         if command_line.size + 1 > MAX_COMMAND_LINE
-          raise ArgumentError.new("command line is #{command_line.size + 1} UTF-16 units; CreateProcessW accepts #{MAX_COMMAND_LINE}")
+          # the same error CreateProcessW would report (ERROR_FILENAME_EXCED_RANGE), raised before anything is created
+          raise Error::Native.new("CreateProcessW",
+            "command line is #{command_line.size + 1} UTF-16 units; the limit is #{MAX_COMMAND_LINE}", 206_i64)
         end
         chdir_w = chdir_string.try &.to_utf16
 

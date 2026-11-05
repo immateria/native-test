@@ -110,8 +110,9 @@
         LibC.fcntl(@kq, 67, 0) # F_DUPFD_CLOEXEC
       end
       return poll_wait(deadline) if watcher < 0
-      IO::FileDescriptor.set_blocking(watcher, false)
-      io = IO::FileDescriptor.new(watcher)
+      # macOS refuses O_NONBLOCK on a kqueue descriptor (fcntl fails with ENOTTY on some releases); readiness waiting
+      # does not need it, so the descriptor is wrapped as it is, without the constructor's blocking-mode setup.
+      io = IO::FileDescriptor.new(handle: watcher)
       begin
         loop do
           return true unless alive?

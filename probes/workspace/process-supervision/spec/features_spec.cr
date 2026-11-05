@@ -490,7 +490,11 @@ require "file_utils"
       options = ProcessSupervision::SpawnOptions.new
       options.uid = 0_u32
       expect_raises(ProcessSupervision::Error::Unsupported) { ProcessSupervision.job.spawn(windows_child, options: options) }
-      expect_raises(ArgumentError) { ProcessSupervision.job.spawn(windows_child, ["x" * 40_000]) }
+      job = ProcessSupervision.job
+      error = expect_raises(ProcessSupervision::Error::Native) { job.spawn(windows_child, ["x" * 40_000]) }
+      error.native_code.should eq(206) # ERROR_FILENAME_EXCED_RANGE, as CreateProcessW reports it
+      job.empty?.should be_true
+      job.close
     end
   end
 {% end %}

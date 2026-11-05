@@ -277,8 +277,10 @@
         return true if empty?
         fd = LibProcessSupervisionInotify.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
         return ProcessSupervision::Readiness.poll(timeout) { empty? } if fd < 0
-        IO::FileDescriptor.set_blocking(fd, false)
-        io = IO::FileDescriptor.new(fd)
+        # handle: skips the constructor's blocking-mode setup, which would clear O_NONBLOCK on an anonymous-inode
+        # descriptor (it treats anything that is not a pipe, socket or terminal as a blocking file) and turn the
+        # drain loop below into a read that never returns.
+        io = IO::FileDescriptor.new(handle: fd)
         begin
           if LibProcessSupervisionInotify.inotify_add_watch(fd, (@path / "cgroup.events").to_s, IN_MODIFY) < 0
             return ProcessSupervision::Readiness.poll(timeout) { empty? }

@@ -110,24 +110,26 @@ jobs:
 
       - name: Run the supervision specs in other Linux environments
         if: runner.os == 'Linux' && (github.event_name != 'workflow_dispatch' || inputs.scenarios)
+        timeout-minutes: 25
         run: |
           set +e
+          T="timeout -k 10 300"  # a hung environment ends with exit 124 and its partial output, not a stuck job
           uid="$(id -u)"; gid="$(id -g)"
           S="$GITHUB_WORKSPACE/shard-out/spec-process-supervision"
           W="$GITHUB_WORKSPACE/probes/workspace/process-supervision"
           [ -x "$S" ] || { echo "no spec binary"; exit 0; }
           cd "$W"
           out="$GITHUB_WORKSPACE/shard-out"
-          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p Delegate=yes -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-delegate-yes.txt" 2>&1
+          $T sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p Delegate=yes -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-delegate-yes.txt" 2>&1
           echo "== systemd Delegate=yes exit=$?"; tail -n 6 "$out/run-systemd-delegate-yes.txt"
-          sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-no-delegate.txt" 2>&1
+          $T sudo systemd-run --quiet --pipe --wait --collect --uid="$uid" --gid="$gid" -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-no-delegate.txt" 2>&1
           echo "== systemd no Delegate exit=$?"; tail -n 6 "$out/run-systemd-no-delegate.txt"
           sudo loginctl enable-linger "$(id -un)"
           for i in $(seq 1 30); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
           XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-            systemd-run --user --quiet --pipe --wait --collect -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-user-manager.txt" 2>&1
+            $T systemd-run --user --quiet --pipe --wait --collect -p WorkingDirectory="$W" -- "$S" --verbose > "$out/run-systemd-user-manager.txt" 2>&1
           echo "== systemd user manager exit=$?"; tail -n 6 "$out/run-systemd-user-manager.txt"
-          sudo "$S" --verbose > "$out/run-host-root.txt" 2>&1
+          $T sudo "$S" --verbose > "$out/run-host-root.txt" 2>&1
           echo "== host root exit=$?"; tail -n 6 "$out/run-host-root.txt"
           sudo chown -R "$uid:$gid" "$out"
           # containers: the spec binary is dynamically linked, so use an Ubuntu image of the host's release
@@ -137,7 +139,7 @@ jobs:
           for mode in default privileged; do
             extra=""; [ "$mode" = privileged ] && extra="--privileged"
             # same absolute path inside: the specs read their sources through paths baked in at compile time
-            docker run --rm $extra -v "$GITHUB_WORKSPACE":"$GITHUB_WORKSPACE" -w "$W" shardspec "$S" --verbose > "$out/run-docker-$mode.txt" 2>&1
+            $T docker run --rm $extra -v "$GITHUB_WORKSPACE":"$GITHUB_WORKSPACE" -w "$W" shardspec "$S" --verbose > "$out/run-docker-$mode.txt" 2>&1
             echo "== docker $mode exit=$?"; tail -n 6 "$out/run-docker-$mode.txt"
           done
           sudo chown -R "$uid:$gid" "$out"
