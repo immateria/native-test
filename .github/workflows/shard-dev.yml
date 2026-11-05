@@ -175,7 +175,10 @@ jobs:
             echo "$f: $summary"
             echo "$summary" | grep -Eq ' 0 failures, 0 errors' || { echo "::error::$f: $summary"; bad=1; }
           done
-          ls run-*.txt > /dev/null 2>&1 || { echo "::error::no spec ran"; bad=1; }
+          # a spec binary that failed to build leaves no run file at all
+          for f in run-plain-process-handle.txt run-plain-process-supervision.txt run-stress.txt; do
+            [ -f "$f" ] || { echo "::error::$f is missing (did the spec build fail? see build-*.txt)"; bad=1; }
+          done
           exit $bad
 
   shard-windows:
@@ -239,6 +242,10 @@ jobs:
           $bad = $false
           $files = Get-ChildItem -Path $out -Filter "run-*.txt" -ErrorAction SilentlyContinue
           if (-not $files) { Write-Output "::error::no spec ran"; exit 1 }
+          # a spec binary that failed to build leaves no run file at all
+          foreach ($name in @("run-plain-process-handle.txt", "run-plain-process-supervision.txt")) {
+            if (-not (Test-Path (Join-Path $out $name))) { Write-Output "::error::$name is missing (did the spec build fail? see build-*.txt)"; $bad = $true }
+          }
           foreach ($f in $files) {
             $m = Select-String -Path $f.FullName -Pattern '\d+ examples, \d+ failures, \d+ errors, \d+ pending' | Select-Object -Last 1
             if (-not $m) { Write-Output "::error::$($f.Name) has no spec summary (crash or hang)"; $bad = $true; continue }

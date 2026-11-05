@@ -1,7 +1,8 @@
 {% if flag?(:win32) %}
-  @[Link("kernel32")]
+  # Not `private`: Crystal 1.21 ignores @[Link] on a private lib, and user32 (EnumWindows, PostMessageW) is not
+  # linked by the standard library. kernel32 is.
   @[Link("user32")]
-  private lib LibProcessSupervisionJobControl
+  lib LibProcessSupervisionJobControl
     fun QueryInformationJobObject(job : LibC::HANDLE, info_class : UInt32, info : Void*, length : UInt32, return_length : UInt32*) : LibC::BOOL
     fun GenerateConsoleCtrlEvent(event : UInt32, group : UInt32) : LibC::BOOL
     alias EnumWindowsProc = (Void*, Int64) -> LibC::BOOL
