@@ -1,0 +1,189 @@
+name: explore-hard
+
+# Probes for the questions only a real system answers (explore/FINDINGS.md "Hard questions, measured"): Windows
+# argument quoting and batch-file refusal, a Crystal program as a Windows service, launchd on macOS, Landlock and
+# seccomp on Linux, and FreeBSD's process descriptors and reaper (in a VM). Nothing asserts; every probe writes JSON
+# lines, and a job fails only when a probe cannot be built.
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "which jobs to run"
+        type: choice
+        options: [all, windows, macos, linux, freebsd]
+        default: all
+  push:
+    paths:
+      - "explore/windows/argv_fuzz.cr"
+      - "explore/windows/argdump.c"
+      - "explore/windows/crystal_service.cr"
+      - "explore/macos/launchd_probe.sh"
+      - "explore/linux/sandbox.c"
+      - "explore/freebsd/**"
+      - ".github/workflows/explore-hard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.runner }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-crystal-windows
+
+      - name: Build
+        run: |
+          New-Item -ItemType Directory -Force hard-out | Out-Null
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          cmd /c "`"$vcvars`" >nul && cl /nologo /O1 /W3 /Fe:hard-out\argdump.exe /Fo:hard-out\argdump.obj explore\windows\argdump.c"
+          if (-not (Test-Path hard-out\argdump.exe)) { throw "argdump build failed" }
+          $ws = Join-Path $env:GITHUB_WORKSPACE "probes\workspace"
+          $default = ((& crystal env CRYSTAL_PATH) | Out-String).Trim()
+          $env:CRYSTAL_PATH = "$(Join-Path $ws 'process-handle\src');$(Join-Path $ws 'process-supervision\src');$default"
+          foreach ($p in "argv_fuzz", "crystal_service") {
+            & crystal build --no-color -o "hard-out\$p.exe" "explore\windows\$p.cr" *> "hard-out\build-$p.txt"
+            "build $p exit=$LASTEXITCODE"
+            Get-Content "hard-out\build-$p.txt" -TotalCount 30
+            if (-not (Test-Path "hard-out\$p.exe")) { throw "$p build failed" }
+          }
+
+      - name: Argument quoting and batch files
+        timeout-minutes: 20
+        run: |
+          $tag = "windows-${{ matrix.runner }}"
+          $argdump = (Resolve-Path hard-out\argdump.exe).Path
+          & hard-out\argv_fuzz.exe $argdump (Join-Path $env:RUNNER_TEMP "argv-work") > "hard-out\$tag-argv_fuzz.jsonl" 2> "hard-out\$tag-argv_fuzz.err"
+          "argv_fuzz exit=$LASTEXITCODE"
+          exit 0
+
+      - name: A Crystal program as a service (elevated)
+        timeout-minutes: 10
+        run: |
+          $tag = "windows-${{ matrix.runner }}"
+          & hard-out\crystal_service.exe (Join-Path $env:RUNNER_TEMP "svc-work") > "hard-out\$tag-crystal_service.jsonl" 2> "hard-out\$tag-crystal_service.err"
+          "crystal_service exit=$LASTEXITCODE"
+          exit 0
+
+      - name: Show results
+        if: always()
+        run: |
+          Get-ChildItem hard-out -Filter *.jsonl | ForEach-Object { "=== $($_.Name)"; Get-Content $_.FullName | ForEach-Object { if ($_.Length -gt 1500) { $_.Substring(0, 1500) } else { $_ } } }
+          Get-ChildItem hard-out -Filter *.err | Where-Object Length -gt 0 | ForEach-Object { "=== $($_.Name)"; Get-Content $_.FullName -TotalCount 40 }
+          exit 0
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hard-windows-${{ matrix.runner }}
+          path: |
+            hard-out/*.jsonl
+            hard-out/*.err
+            hard-out/*.txt
+          retention-days: 30
+
+  macos:
+    name: macOS ${{ matrix.runner }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'macos'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    steps:
+      - uses: actions/checkout@v4
+      - name: launchd
+        run: |
+          mkdir -p hard-out work
+          tag="macos-${{ matrix.runner }}"
+          timeout 600 bash explore/macos/launchd_probe.sh work > "hard-out/$tag-launchd.jsonl" 2> "hard-out/$tag-launchd.err"; echo "launchd exit=$?"
+          cat "hard-out/$tag-launchd.jsonl"; head -c 3000 "hard-out/$tag-launchd.err"
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hard-macos-${{ matrix.runner }}
+          path: hard-out/*
+          retention-days: 30
+
+  linux:
+    name: Linux ${{ matrix.runner }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Landlock and seccomp
+        run: |
+          mkdir -p hard-out
+          tag="linux-${{ matrix.runner }}"
+          uname -a
+          cc -O1 -Wall -o hard-out/sandbox explore/linux/sandbox.c
+          ./hard-out/sandbox "$RUNNER_TEMP/sbx" > "hard-out/$tag-sandbox.jsonl" 2> "hard-out/$tag-sandbox.err"; echo "unprivileged exit=$?"
+          sudo ./hard-out/sandbox "$RUNNER_TEMP/sbx-root" > "hard-out/$tag-sandbox-root.jsonl" 2> "hard-out/$tag-sandbox-root.err"; echo "root exit=$?"
+          docker run --rm -v "$PWD/hard-out:/o" -w /o ubuntu:24.04 ./sandbox /tmp/sbx > "hard-out/$tag-sandbox-docker.jsonl" 2> "hard-out/$tag-sandbox-docker.err"; echo "docker exit=$?"
+          cat hard-out/*.jsonl
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hard-linux-${{ matrix.runner }}
+          path: hard-out/*.json*
+          retention-days: 30
+
+  freebsd:
+    name: FreeBSD ${{ matrix.release }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'freebsd'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14.3", "15.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probes in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          prepare: |
+            pkg install -y crystal || echo "no crystal package"
+          run: |
+            mkdir -p hard-out
+            tag="freebsd-${{ matrix.release }}"
+            uname -a > "hard-out/$tag-platform.txt"
+            (crystal --version 2>&1 || echo "crystal: not installed") >> "hard-out/$tag-platform.txt"
+            cc -O1 -Wall -o hard-out/fbsd_proc explore/freebsd/fbsd_proc.c > "hard-out/$tag-build.txt" 2>&1; echo "build exit=$?"
+            ./hard-out/fbsd_proc > "hard-out/$tag-fbsd_proc.jsonl" 2> "hard-out/$tag-fbsd_proc.err"; echo "unprivileged-or-root exit=$?"
+            cat hard-out/*.txt hard-out/*.jsonl
+            head -c 2000 "hard-out/$tag-fbsd_proc.err"
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hard-freebsd-${{ matrix.release }}
+          path: |
+            hard-out/*.jsonl
+            hard-out/*.txt
+            hard-out/*.err
+          retention-days: 30

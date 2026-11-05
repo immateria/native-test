@@ -19,6 +19,12 @@ on:
       - "explore/macos/**"
       - "explore/windows/**"
       - ".github/workflows/explore-matrix.yml"
+      # explore-hard.yml's probes
+      - "!explore/windows/argv_fuzz.cr"
+      - "!explore/windows/argdump.c"
+      - "!explore/windows/crystal_service.cr"
+      - "!explore/macos/launchd_probe.sh"
+      - "!explore/linux/sandbox.c"
 
 permissions:
   contents: read
