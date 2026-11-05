@@ -1374,6 +1374,37 @@ job and reads `launchctl print`; its spec checks that launchd starts the job, th
 `status` reports the running pid, and that `uninstall` ends the process and removes the property list. It passes on macOS 15 and 26 (57 supervision examples, 0 failures; the one pending is the stress spec, which runs
 in its own step).
 
+## Process semantics that were wrong in the shard (found, reproduced, fixed)
+
+Each one has a spec that failed before the fix (shown by reverting the fix) and passes after; Linux runs on all three
+Ubuntu runners in every environment (plain, root, systemd units, Docker), macOS 15 and 26.
+
+* **The parent-death signal fired minutes after spawn.** `PR_SET_PDEATHSIG` is tied to the *thread* that created the
+  child. Crystal 1.21 runs with execution contexts by default; an isolated context's thread goes back to a pool when
+  its fiber ends, and the pool ends idle threads after `Fiber::ExecutionContext.thread_keepalive` (5 minutes). A child
+  spawned with `parent_death_signal` from such a context (the shard's own bridge made one for every call from a raw
+  thread) was SIGKILLed when that thread was retired. With a 50 ms keepalive the spec's child died at once. Spawns
+  with a parent-death signal now run on one isolated context that never ends.
+* **PID 1 of a new PID namespace ignored SIGTERM.** The kernel drops every signal the namespace's init has no handler
+  for, so `sleep 30` started with `namespaces: Pid` survived `TERM` (the spec shows it still running after 3 s), and
+  every orphan in the namespace became its zombie. The child now runs a minimal init as PID 1 (all signals blocked and
+  taken with `sigwaitinfo`, forwarded to the program's process group, `waitpid(-1)` for orphans, exit with the
+  program's code or 128 + signal); the program is PID 2. `pid_namespace_init = false` keeps the old behaviour.
+* **A reused pid inherited a stray child's exit status.** Crystal's SIGCHLD handler reaps every child with
+  `waitpid(-1)` and parks a status nobody waits for under its pid; `Crystal::System::Process.new` claims a parked
+  status at once. A stray (an orphan adopted as a subreaper, a raw `fork`, a `Process` dropped without `wait`) whose
+  pid the kernel reuses for a new child hands that child its status: with `ns_last_pid` forcing the reuse, a child
+  that ran for a second "exited 7" after 2 ms, in plain `Process.new` and in the shard. The shard now drops a parked
+  status before adopting a pid unless the new child itself has been reaped (`waitid(P_PID, WNOHANG | WNOWAIT)`
+  answers ECHILD), checked under the handler's own mutex so a concurrent reap is never lost. Plain `Process.new` in
+  the standard library still has this.
+* **Children inherited descriptors without close-on-exec.** "Inherits stdio and nothing else" held only for
+  descriptors with `O_CLOEXEC`; one the supervisor itself inherited, or a C library opened, reached every Linux child
+  (the spec saw it on the `pidfd_spawn` path). `pidfd_spawn` now closes the gaps below the highest extra descriptor
+  and everything above it (`posix_spawn_file_actions_addclosefrom_np`); the clone3/fork child marks everything from 3
+  up close-on-exec (`close_range(CLOSE_RANGE_CLOEXEC)`, kernel 5.11+, an `fcntl` loop before) so the exec-error pipe
+  still works, then clears the flag on the extra descriptors. macOS already used `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+
 ## Still open
 
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time
