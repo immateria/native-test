@@ -88,6 +88,11 @@ module ProcessSupervision
     # the program's exit code, or 128 + the signal number when a signal ended it. When the init ends, the kernel kills
     # everything left in the namespace. Set to false to make the program PID 1 itself.
     property pid_namespace_init : Bool = true
+    # After the child exits, how long `Child#wait` waits for its output streams to reach end-of-file when they are
+    # copied into an `IO`. A descendant that inherited stdout or stderr (`sh -c 'daemon &'`) keeps the pipe open, and
+    # without a delay `wait` returns only when that descendant exits. With one, the pipes are closed after the delay,
+    # `wait` returns the status, and `Child#output_cut?` is true. Nil (the default) waits for end-of-file.
+    property wait_delay : Time::Span? = nil
     property console_group : Bool = false
     property hide_window : Bool = false
 

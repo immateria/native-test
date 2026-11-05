@@ -157,6 +157,7 @@
 
         begin
           plumbing = Plumbing.build(input, output, error)
+          plumbing.copies.wait_delay = options.wait_delay
           # extra handles: inheritable duplicates the child sees under the same numeric values, announced as
           # PROCESS_SUPERVISION_HANDLES=<requested number>:<handle value>,...
           announced = [] of String

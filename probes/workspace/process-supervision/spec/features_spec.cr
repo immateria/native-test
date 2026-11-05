@@ -260,6 +260,42 @@ require "file_utils"
     {% end %}
   end
 
+  describe "ProcessSupervision streams copied into an IO (POSIX)" do
+    it "returns after wait_delay when a descendant keeps the output pipe open" do
+      buffer = IO::Memory.new
+      child = feature_leader("/bin/sh", ["-c", "sleep 5 & echo hi"], output: buffer,
+        options: options(&.wait_delay=(300.milliseconds)))
+      started = Time.instant
+      status = child.wait(10.seconds).not_nil!
+      elapsed = Time.instant - started
+      status.success?.should be_true
+      elapsed.should be < 3.seconds
+      buffer.to_s.should eq("hi\n")
+      child.output_cut?.should be_true
+      child.group.kill
+      feature_finish(child)
+    end
+
+    it "does not cut output when the pipe closes in time" do
+      buffer = IO::Memory.new
+      child = feature_leader("/bin/sh", ["-c", "echo done"], output: buffer, options: options(&.wait_delay=(5.seconds)))
+      feature_finish(child).success?.should be_true
+      buffer.to_s.should eq("done\n")
+      child.output_cut?.should be_false
+    end
+
+    it "does not wait for an input source that never ends once the child has exited" do
+      reader, writer = IO.pipe # the writer stays open: the source never reaches end-of-file
+      # not a file descriptor, so it is copied into the child's stdin by a fiber
+      child = feature_leader("true", input: IO::Stapled.new(reader, writer))
+      started = Time.instant
+      feature_finish(child).success?.should be_true
+      (Time.instant - started).should be < 3.seconds
+      writer.close
+      reader.close
+    end
+  end
+
   describe "ProcessSupervision group control (POSIX)" do
     it "suspends and resumes a process group" do
       child = feature_leader("sleep", ["30"])

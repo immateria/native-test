@@ -58,6 +58,12 @@ module ProcessSupervision
       end
     end
 
+    # Whether `wait` stopped waiting for an output stream after `SpawnOptions#wait_delay` because a descendant still
+    # held it open (the output IO may then be incomplete).
+    def output_cut? : Bool
+      @copies.try(&.cut?) || false
+    end
+
     def status : Process::Status?
       @wait_lock.synchronize { @status }
     end

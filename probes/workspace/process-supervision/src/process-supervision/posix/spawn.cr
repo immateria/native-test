@@ -149,6 +149,7 @@
                        options : ProcessSupervision::SpawnOptions = ProcessSupervision::SpawnOptions.new,
                        ipc_target : Int32 = -1) : Plumbing
           plumbing = new
+          plumbing.copies.wait_delay = options.wait_delay
           begin
             plumbing.reserve_above((options.extra_fds.keys + [ipc_target]).max? || 2)
             plumbing.add(0, input)
