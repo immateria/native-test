@@ -130,7 +130,7 @@ require "file_utils"
       end
 
       it "never reports a stray child's parked status for a child that reuses its pid" do
-        pending!("needs root (ns_last_pid)") unless LibC.getuid == 0 && File.writable?("/proc/sys/kernel/ns_last_pid")
+        pending!("needs root (ns_last_pid)") unless LibC.getuid == 0 && File::Info.writable?("/proc/sys/kernel/ns_last_pid")
         # a child the runtime did not create: Crystal's SIGCHLD handler reaps it and parks exit 7 under its pid
         stray = LibC.fork
         LibC._exit(7) if stray == 0
@@ -142,6 +142,33 @@ require "file_utils"
         status = feature_finish(child)
         status.exit_code.should eq(0)
         (Time.instant - started).should be >= 300.milliseconds
+      end
+
+      it "passes no descriptor that lacks close-on-exec, on every engine, and keeps the extra ones" do
+        # a descriptor this process inherited or a C library opened without O_CLOEXEC
+        leaked = LibC.open("/dev/null", LibC::O_RDONLY)
+        leaked.should be >= 3
+        reader, writer = IO.pipe
+        begin
+          script = "[ -e /proc/$$/fd/#{leaked} ] && echo leaked || echo closed"
+          {false, true}.each do |forced_clone3|
+            ProcessSupervision::Linux::RawSpawn.pidfd_spawn_disabled = forced_clone3
+            [options { }, options(&.umask=(0o022_u32)), options { |o| o.extra_fds[9] = writer }].each do |opts|
+              child = feature_leader("/bin/sh", ["-c", script + "; (echo extra >&9) 2>/dev/null || true"],
+                output: Process::Redirect::Pipe, options: opts)
+              text = child.output.gets_to_end
+              feature_finish(child)
+              {forced_clone3, ProcessSupervision::Linux::RawSpawn.last_engine, text.lines.first?}.should eq(
+                {forced_clone3, ProcessSupervision::Linux::RawSpawn.last_engine, "closed"})
+            end
+          end
+          writer.close
+          reader.gets_to_end.lines.count("extra").should eq(2) # the extra descriptor still reached the program
+        ensure
+          ProcessSupervision::Linux::RawSpawn.pidfd_spawn_disabled = false
+          LibC.close(leaked)
+          reader.close
+        end
       end
 
       it "switches user and group when running as root" do

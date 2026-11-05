@@ -13,8 +13,10 @@
     fun posix_spawn_file_actions_destroy(actions : Void*) : Int32
     fun posix_spawn_file_actions_adddup2(actions : Void*, fd : Int32, target : Int32) : Int32
     fun posix_spawn_file_actions_addchdir_np(actions : Void*, path : UInt8*) : Int32
+    fun posix_spawn_file_actions_addclose(actions : Void*, fd : Int32) : Int32
     fun setsid : Int32
     fun setrlimit(resource : Int32, limit : LibC::Rlimit*) : Int32
+    fun getrlimit(resource : Int32, limit : LibC::Rlimit*) : Int32
     fun setgroups(size : LibC::SizeT, list : UInt32*) : Int32
     fun setgid(gid : UInt32) : Int32
     fun prctl(option : Int32, arg2 : UInt64, arg3 : UInt64, arg4 : UInt64, arg5 : UInt64) : Int32
@@ -48,6 +50,8 @@
       private CLONE_INTO_CGROUP   = 0x200000000_u64
       private CLONE_ARGS_SIZE_VER2 =         88_u64
       private SIGCHLD_NUMBER       =         17_u64
+      private SYS_CLOSE_RANGE      =        436_i64
+      private CLOSE_RANGE_CLOEXEC  =          0x4_u32
 
       @@clone3_refused = false
       @@clone3_disabled = false
@@ -67,8 +71,9 @@
       private alias PidfdSpawnFn = Proc(Int32*, UInt8*, Void*, Void*, UInt8**, UInt8**, Int32)
       private alias SetCgroupFn = Proc(Void*, Int32, Int32)
       private alias PidfdGetpidFn = Proc(Int32, Int32)
+      private alias AddClosefromFn = Proc(Void*, Int32, Int32)
 
-      private record Symbols, spawn : PidfdSpawnFn, getpid : PidfdGetpidFn, setcgroup : SetCgroupFn?
+      private record Symbols, spawn : PidfdSpawnFn, getpid : PidfdGetpidFn, setcgroup : SetCgroupFn?, closefrom : AddClosefromFn
 
       @@symbols : Symbols? = nil
       @@symbols_loaded = false
@@ -78,13 +83,15 @@
         spawn_ptr = LibC.dlsym(LibC::RTLD_DEFAULT, "pidfd_spawn")
         getpid_ptr = LibC.dlsym(LibC::RTLD_DEFAULT, "pidfd_getpid")
         cgroup_ptr = LibC.dlsym(LibC::RTLD_DEFAULT, "posix_spawnattr_setcgroup_np")
-        @@symbols = if spawn_ptr.null? || getpid_ptr.null?
+        closefrom_ptr = LibC.dlsym(LibC::RTLD_DEFAULT, "posix_spawn_file_actions_addclosefrom_np")
+        @@symbols = if spawn_ptr.null? || getpid_ptr.null? || closefrom_ptr.null?
                       nil
                     else
                       Symbols.new(
                         PidfdSpawnFn.new(spawn_ptr, Pointer(Void).null),
                         PidfdGetpidFn.new(getpid_ptr, Pointer(Void).null),
-                        cgroup_ptr.null? ? nil : SetCgroupFn.new(cgroup_ptr, Pointer(Void).null))
+                        cgroup_ptr.null? ? nil : SetCgroupFn.new(cgroup_ptr, Pointer(Void).null),
+                        AddClosefromFn.new(closefrom_ptr, Pointer(Void).null))
                     end
         @@symbols_loaded = true
         @@symbols
@@ -254,10 +261,20 @@
             source = plumbing.sources[target]
             LibProcessSupervisionLinux.posix_spawn_file_actions_adddup2(pointerof(actions), source, target) if source >= 0
           end
+          highest = 2
           plumbing.extra_count.times do |index|
             LibProcessSupervisionLinux.posix_spawn_file_actions_adddup2(pointerof(actions), plumbing.extra_sources[index],
               plumbing.extra_targets[index])
+            highest = {highest, plumbing.extra_targets[index]}.max
           end
+          # everything else is closed, including descriptors without close-on-exec (inherited by this process, or opened
+          # by a C library): numbers below the highest target that are not targets one by one (closing one that is not
+          # open is not an error for posix_spawn), the rest at once
+          (3..highest).each do |fd|
+            next if (0...plumbing.extra_count).any? { |index| plumbing.extra_targets[index] == fd }
+            LibProcessSupervisionLinux.posix_spawn_file_actions_addclose(pointerof(actions), fd)
+          end
+          found.closefrom.call(pointerof(actions).as(Void*), highest + 1)
           prepared.chdir.try do |directory|
             rc = LibProcessSupervisionLinux.posix_spawn_file_actions_addchdir_np(pointerof(actions), directory)
             raise ProcessSupervision::POSIX::Spawn.exec_error(prepared.command, Errno.new(rc)) unless rc == 0
@@ -446,6 +463,24 @@
         index = 0
         while index < plumbing.extra_count
           child_fail(error_fd) if LibC.dup2(plumbing.extra_sources[index], plumbing.extra_targets[index]) < 0
+          index += 1
+        end
+        # Nothing else reaches the program: every descriptor from 3 up becomes close-on-exec (also those the supervisor
+        # inherited, or a C library opened, without the flag), then the extra targets are made inheritable again. Not
+        # closed here: the exec-error pipe must stay open until the exec.
+        if LibC.syscall(SYS_CLOSE_RANGE, 3_u32, UInt32::MAX, CLOSE_RANGE_CLOEXEC) != 0
+          limit = LibC::Rlimit.new
+          LibProcessSupervisionLinux.getrlimit(7, pointerof(limit)) # RLIMIT_NOFILE; kernels before 5.11
+          top = limit.rlim_cur > 65_536 ? 65_536 : limit.rlim_cur.to_i32
+          fd = 3
+          while fd < top
+            LibC.fcntl(fd, 2, 1) # F_SETFD, FD_CLOEXEC
+            fd += 1
+          end
+        end
+        index = 0
+        while index < plumbing.extra_count
+          LibC.fcntl(plumbing.extra_targets[index], 2, 0) # F_SETFD: inheritable
           index += 1
         end
         if forked && !options.namespaces.none?
