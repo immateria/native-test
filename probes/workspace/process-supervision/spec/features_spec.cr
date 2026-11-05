@@ -276,6 +276,19 @@ require "file_utils"
       feature_finish(child)
     end
 
+    it "bounds a timed wait by its timeout when a descendant holds the output pipe, and finishes later" do
+      buffer = IO::Memory.new
+      child = feature_leader("/bin/sh", ["-c", "sleep 2 & echo hi"], output: buffer)
+      started = Time.instant
+      child.wait(300.milliseconds).should be_nil
+      (Time.instant - started).should be < 1.5.seconds
+      status = child.wait(10.seconds).not_nil!
+      status.success?.should be_true
+      buffer.to_s.should eq("hi\n")
+      child.output_cut?.should be_false
+      feature_finish(child)
+    end
+
     it "does not cut output when the pipe closes in time" do
       buffer = IO::Memory.new
       child = feature_leader("/bin/sh", ["-c", "echo done"], output: buffer, options: options(&.wait_delay=(5.seconds)))

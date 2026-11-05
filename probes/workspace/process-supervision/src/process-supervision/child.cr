@@ -48,10 +48,11 @@ module ProcessSupervision
     # Waits for this direct child and caches the exact Process::Status object. When a standard stream was given as an
     # IO that is not a file descriptor, this also waits for its copy to finish (so an output IO is complete), and a copy
     # that failed is raised instead (`#status` still has the exit status).
-    # Concurrent unbounded callers share one Process#wait collector, matching
-    # the PTY Session contract. A finite timeout first waits on the stable
-    # ProcessHandle; timeout does not start a detached collector that would keep
-    # running after the caller returns.
+    # Concurrent callers share one Process#wait collector, matching the PTY
+    # Session contract. A finite timeout bounds the whole call: it waits on the
+    # stable ProcessHandle first, and only once the process has ended does a
+    # collector run (in a fiber, when stream copies are still open), so a timed
+    # out wait never leaves a collector behind for a running process.
     def wait(timeout : Time::Span? = nil) : Process::Status?
       run_on_execution_context("process-supervision-child-wait") do
         wait_on_execution_context(timeout)
@@ -106,15 +107,33 @@ module ProcessSupervision
     end
 
     private def wait_on_execution_context(timeout : Time::Span?) : Process::Status?
-      if timeout
-        raise ArgumentError.new("timeout must not be negative") if timeout < Time::Span.zero
-        if cached = cached_wait_outcome
-          return cached
-        end
-        return nil unless @handle.wait(timeout)
+      return collect_wait unless timeout
+      raise ArgumentError.new("timeout must not be negative") if timeout < Time::Span.zero
+      if cached = cached_wait_outcome
+        return cached
       end
+      deadline = Time.instant + timeout
+      return nil unless @handle.wait(timeout)
+      return collect_wait unless @copies.try { |copies| !copies.empty? || copies.started? }
 
-      collect_wait
+      # The process has ended, but an output copy can still be waiting for end-of-file (a descendant holding the pipe):
+      # the timeout bounds that too. The collection goes on in a fiber; a later `wait` joins it.
+      result = Channel(Process::Status | Exception).new(1)
+      spawn(name: "process-supervision-child-collect") do
+        begin
+          result.send(collect_wait)
+        rescue ex
+          result.send(ex)
+        end
+      end
+      remaining = deadline - Time.instant
+      select
+      when outcome = result.receive
+        raise outcome if outcome.is_a?(Exception)
+        outcome
+      when timeout(remaining > Time::Span.zero ? remaining : Time::Span.zero)
+        nil
+      end
     end
 
     private def collect_wait : Process::Status

@@ -50,6 +50,10 @@ module ProcessSupervision
       @jobs.empty?
     end
 
+    def started? : Bool
+      @lock.synchronize { @started > 0 }
+    end
+
     # Starts one copy fiber per stream. Called once, after the process exists.
     def start : Nil
       jobs = @lock.synchronize do
