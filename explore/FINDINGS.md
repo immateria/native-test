@@ -1220,6 +1220,148 @@ What building it found:
 * **Windows command-line limit.** `CreateProcessW` takes 32,767 UTF-16 units including the terminator; the shard checks
   before anything is created and raises the error `CreateProcessW` itself gives (`ERROR_FILENAME_EXCED_RANGE`, 206).
 
+## Hard questions, measured (explore-hard.yml: Windows arguments and batch files, a Crystal service, Landlock and seccomp, launchd, FreeBSD)
+
+The questions documentation does not settle, each answered by running it: `explore/windows/argv_fuzz.cr` +
+`argdump.c`, `explore/windows/crystal_service.cr`, `explore/linux/sandbox.c`, `explore/macos/launchd_probe.sh`,
+`explore/freebsd/fbsd_proc.c`. What it changed in the shards: macOS exit watches share one kqueue and one thread
+(event-driven, no descriptor per handle; process-handle 0.10.0), and Windows has `Job#spawn_batch`.
+
+### Windows: argument quoting (Server 2022 and 2025)
+
+| Path | Cases | Mismatches |
+|---|---|---|
+| `Process.quote_windows` → `CommandLineToArgvW`, in process | 20 000 × 2 runners | 0 |
+| → a child built with `cl.exe` (Universal CRT `wmain` argv) | 1 500 × 2 | 0 |
+| → a Crystal child (`ARGV`) | 300 × 2 | 0 |
+
+The random arguments mix spaces, tabs, `"`, runs of backslashes (also trailing), `^&|<>%!()`, `%PATH%`, empty
+strings, non-BMP characters, U+00A0, U+3000 and (rarely) `\n \r \v \f`. Crystal's quoting is exact for every C-runtime
+parser measured; nothing to fix. (The first run reported 1 500 mismatches: `argdump`'s stdout is in text mode and
+added `\r`. A probe bug, worth knowing when a child's output is compared byte for byte.)
+
+### Windows: batch files
+
+`CreateProcessW` runs a `.bat`/`.cmd` through `cmd.exe`, whose parser does not follow the C runtime's, so quoting for
+the C runtime lets an argument inject commands ("BatBadBut", CVE-2024-24576). Crystal's `Process.new` and the shard's
+`Job#spawn` both refuse batch files by extension. Every spelling tried against both, with an injection payload
+(`"&echo injected>inj.txt&rem `):
+
+* `t.bat`, `T.BAT`, `t.bat.`, `t.bat `, `t.bat. . `, `t.cmd`, a long name: refused by the extension check (Crystal:
+  `File::BadExecutableError`; the shard: `Error::Unsupported`);
+* `t.bat::$DATA`, `t.cmd::$DATA`, an alternate stream `t2.bat:s`, `noext:s`: `CreateProcessW` itself answers
+  `ERROR_BAD_EXE_FORMAT` (193): **a stream name does not make Windows start cmd.exe**; `plain.txt:evil.bat` is caught
+  by the extension check;
+* `t.bat\t`, `t.bat/`, `t.bat\`, `t` (with `t.bat` present), `tonly` with its directory first in `PATH`: not found
+  (`CreateProcessW` appends only `.exe`; Crystal's lookup does not use `PATHEXT`);
+* batch text in a file named `.exe`: error 216 (`ERROR_EXE_MACHINE_TYPE_MISMATCH`); Crystal raises an `IO::Error`
+  with an empty message for it;
+* 8.3 short names are disabled on the runners' `D:` volume (`GetShortPathNameW` returns the long name).
+
+Nothing ran a batch file and nothing was injected. **Running a batch file safely**: the quoting Rust adopted
+(`cmd.exe /e:ON /v:OFF /d /c ""script" args"`; an argument that is not plain is quoted, `"` doubled, backslashes
+doubled only before a quote, `%` preceded by a `%%cd:~,` no-op so `%VAR%` never expands), sent through a wrapper
+`.cmd` that passes `%*` to the UCRT child: **3 000 random argument lists, 0 mismatches, 0 injections** (an injection
+payload in every tenth list). With `\n \r \v \f` mixed in, 251 of 1 500 lists differ, still 0 injections. Character
+by character (alone, at the start, middle and end of an argument, quoted, between `%`): `\v`, `\f`, `\t`, ESC, U+0001
+and DEL pass unchanged; **`\n` ends the command** (everything after it is lost) and **`\r` is dropped**, leaving the
+`%%cd:~,` text visible. A line break cannot pass through cmd.exe at all. Built as `Job#spawn_batch` (it refuses
+`\n`/`\r` and a script path with `"`, and names `cmd.exe` by its full path); its spec passes on both runners.
+
+### Windows: a Crystal program as a service (Server 2022 and 2025, elevated)
+
+The SCM calls `ServiceMain` on a thread it creates, and the control handler on the thread that called
+`StartServiceCtrlDispatcherW`. The probe runs the dispatcher on a Crystal `Thread`, keeps `ServiceMain` to Win32 calls
+(register the handler, report `RUNNING`, signal an event) and does the Crystal work on the main thread.
+
+* It works: `RUNNING` 47–96 ms after `StartService`; `ServiceMain` ran on a thread that was neither the main nor the
+  dispatcher thread; the handler ran on the dispatcher thread.
+* Allocating Crystal objects inside `ServiceMain` (the foreign thread) did not crash in 4 starts, but that thread is
+  not registered with the GC; a design must not depend on it.
+* Standard streams: all three are not ttys, and `STDOUT.puts` raises `IO::Error: Closed stream` (Crystal maps the
+  service's missing handles to closed streams). A service must log to a file or the event log.
+* `Process.run` works from the service; a worker started with `ProcessSupervision.job` ran in session 0.
+* `SERVICE_CONTROL_STOP`: `STOPPED` 17 ms after `ControlService`, the Job's shutdown took 0.1–0.2 ms, the worker was
+  gone. `taskkill /F` of the service process: the worker was gone with it (the Job's kill-on-close), the SCM reported
+  `STOPPED` within 86–100 ms.
+
+### Linux: Landlock and seccomp in the child (22.04 kernel 6.8, 24.04 x64 and arm64 kernel 7.0; also as root and in Docker)
+
+| | ubuntu-22.04 | ubuntu-24.04 / 24.04-arm |
+|---|---|---|
+| Landlock ABI | 4 | 8 |
+| filesystem rules (read-only `/`, one writable directory, `/dev/null`) survive `exec` | yes | yes |
+| TCP connect denied (ABI ≥ 4) | yes | yes |
+| signal scoping (ABI ≥ 6): the sandboxed child cannot signal its supervisor, can signal its own children | n/a | yes |
+| `landlock_restrict_self` without `no_new_privs`, unprivileged / root on host / root in Docker | `EPERM` / works / `EPERM` | same |
+| seccomp filter without `no_new_privs`, unprivileged / root on host / root in Docker | `EACCES` / works / `EACCES` | same |
+| `SECCOMP_RET_ERRNO` survives `exec` | yes | yes |
+| `SECCOMP_RET_KILL_PROCESS` | `SIGSYS`, core dumped | same |
+| user notification: the child sends its listener to the supervisor (`SCM_RIGHTS`), the supervisor reads the path from `/proc/<pid>/mem`, checks `NOTIF_ID_VALID` and answers `EROFS` | works, 2 µs from request to receipt; also in default Docker | works (2–191 µs) |
+
+Consequences for the shard: a sandbox must be applied in the child between fork and exec (the fork / `clone3` engines;
+`posix_spawn` and `pidfd_spawn` cannot), it needs `no_new_privs` unless the supervisor has `CAP_SYS_ADMIN`, and
+Docker's root does not count. On glibc x86_64, `mkdir` uses `__NR_mkdir`, not `mkdirat`, so a filter must name both.
+Landlock's signal scope (kernel 6.12+) is the first kernel mechanism here that stops a child from signalling its own
+supervisor.
+
+### macOS: launchd as the supervisor's own manager (macOS 15.8 and 26.6)
+
+A job that writes its pid, starts a background `sleep` in its process group and a `setsid()` escapee, then loops
+(`sleep 1`) with a TERM trap. Liveness by `ps` (not `kill -0`, which answers `EPERM` for root's processes and succeeds
+for zombies, and made the first run's answers wrong).
+
+| Case | main gone | background child (same group) | `setsid` escapee |
+|---|---|---|---|
+| `bootout`, `gui/501` and `system` | 0.77–0.97 s (the TERM trap runs after the current `sleep 1`) | with main | **still running after 8 s** |
+| `bootout`, TERM ignored, `ExitTimeOut` 3 | 3.10–3.13 s (SIGKILL) | with main | still running |
+| `bootout`, `AbandonProcessGroup` | 0.89–1.12 s | **still running** | still running |
+| main SIGKILLed | 23–50 ms | with main | still running |
+| main SIGKILLed, `KeepAlive` | new main after **10.10–10.20 s** (default throttle) | with the old main | still running |
+| the same with `ThrottleInterval` 1 | new main after 1.06–1.11 s | with the old main | still running |
+
+* Domains a CI user has: `gui/501` (a login session exists on the hosted runners) and `system` (through `sudo`);
+  `launchctl bootstrap user/501` fails with `5: Input/output error`.
+* `bootstrap` returns in 10–41 ms; the job runs 76–223 ms after it.
+* launchd's guarantee is the job's process group: it ends the group when the job ends unless `AbandonProcessGroup`,
+  and does nothing to a process that left the group. On macOS 26 each job is in its own resource and jetsam coalition
+  (`launchctl procinfo`); launchd did not use the coalition to end the escapee. A supervisor run by launchd still needs
+  its own escapee tracking (the environment marker), and should set `ExitTimeOut` above its own shutdown grace.
+
+### FreeBSD: process descriptors and the reaper (14.3 and 15.0, amd64, in a VM, as root)
+
+| Question | Answer (both releases) |
+|---|---|
+| `pdfork` + `pdkill(SIGTERM)` + `poll(POLLHUP)` | 0.06–0.10 ms; `pdgetpid` matches |
+| does an exited `pdfork` child appear in `wait(-1)`, send `SIGCHLD`? | **no and no** (`ECHILD`, 0 signals); `waitpid(pid)` reaps it |
+| `EVFILT_PROCDESC` / `NOTE_EXIT` on the descriptor | fires, `data` is the wait status (exit code 3 → 768) |
+| closing the last descriptor | **kills the child** (gone after 5.2–5.5 ms); with `PD_DAEMON` it keeps running |
+| `EVFILT_PROC` with `NOTE_TRACK` (removed from macOS) | a child's fork attaches the grandchild automatically: `NOTE_CHILD` (data = parent pid), `NOTE_FORK`, then `NOTE_EXIT` with the status for both |
+| `procctl(PROC_REAP_ACQUIRE)` | works; orphans (also a `setsid` one) are reparented to the reaper, `PROC_REAP_STATUS`/`GETPIDS` list them |
+| `PROC_REAP_KILL` (SIGKILL, all descendants) | `rk_killed` 2, both orphans dead 0.3–1.9 ms later, **the `setsid` escapee included** |
+| `PROC_REAP_KILL` across a nested reaper | `rk_killed` 3: the nested reaper **and its own descendants** died within 1.5–4.9 ms |
+| `PROC_PDEATHSIG_CTL` | works; the signal arrived 1.06–1.22 ms after the parent exited |
+| `posix_spawn` | `addchdir_np`, `addfchdir_np`, `addclosefrom_np` exist; `POSIX_SPAWN_SETSID` does not |
+| Crystal | 1.21.1 is packaged (`pkg install crystal`, LLVM 20); process-handle's spec builds and passes (7 platform-independent examples) |
+
+FreeBSD has the strongest POSIX primitives measured anywhere in this repository: a process descriptor that cannot be
+recycled and kills its child when closed (the Windows Job's kill-on-close, per process), plus a subreaper whose tree kill
+reaches escapees and nested reapers in one call. A FreeBSD backend would be `pdfork` for identity plus
+`PROC_REAP_ACQUIRE`/`PROC_REAP_KILL` for the group. Not built yet: **the Crystal 1.21.1 compiler crashes (`Trace/BPT
+trap`, exit 133, no message) compiling process-supervision's spec on FreeBSD 15.0**; that must be reduced first.
+
+### macOS: event-driven exit waits, built (process-handle 0.10.0)
+
+Every `ProcessHandle::Kqueue` registers its `NOTE_EXIT` watch in one shared kqueue. One isolated execution context
+blocks in `kevent` on a second kqueue in which the shared one is registered for `EVFILT_READ`, and drains the shared
+kqueue under the watcher's mutex; every caller that reads the state drains under the same mutex first, so an exit the
+kernel has posted is never invisible because the thread dequeued it and has not recorded it yet. A waiting fiber gets a
+pipe and is woken with one byte (not end-of-file: a write end leaked into a concurrently spawned child would hold
+end-of-file back). All handles of one pid share one entry, because kqueue keys a watch by (pid, filter). Native
+results on macOS 15 and 26: 12 process-handle examples (three new: 53 watches add at most 2 descriptors and all 53
+waiters wake on `SIGKILL`; a wait times out while the process runs and returns on exit; `alive?` is false as soon as the
+process is reaped, 20 times in a row) and 55 supervision examples, 0 failures, stress run passing.
+
 ## Still open
 
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time
@@ -1235,5 +1377,7 @@ What building it found:
 * macOS descendants: whether the environment marker survives a program that execs and clears or rewrites its environment,
   and whether `START_SUSPENDED` plus a marker is enough in practice; musl/Alpine `posix_spawn` and Docker/systemd cgroup
   delegation were not tested (everything above is the hosted runner images);
+* why the Crystal 1.21.1 compiler crashes (SIGTRAP) on process-supervision's spec on FreeBSD; whether launchd's
+  coalitions can be used to find escapees; an unprivileged FreeBSD run (the VM runs everything as root);
 * not measured: a shared-process (`svchost`-style) service, preshutdown and system shutdown ordering; the macOS
   `posix_spawnattr_setjetsam_ext` limit for grandchildren and after `exec`; GitHub Actions' own cancellation timing.

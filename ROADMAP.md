@@ -21,9 +21,9 @@ the API shape and edge cases still need review, as asked: "map out as much as po
 |---|---|---|
 | CI that can fail | **built** | `shard-dev.yml` Gate step (spec summaries), plus a stress run |
 | Hybrid cgroup hosts | **built** (it was a spec bug, not a library bug) | the spec cleans up and is pending where root may create at the hierarchy root |
-| Event-driven waits | **built** for cgroups (inotify on `cgroup.events`); macOS handles still poll every 5 ms (Crystal's event loop cannot take a kqueue descriptor: it also registers `EVFILT_WRITE`, which the kernel refuses); process groups back off 5 → 100 ms | `CgroupV2#wait_empty`, `Readiness` |
-| One kqueue per handle | open | |
-| Versions / stale text | **built** | process-handle 0.9.0, process-supervision 0.8.0 |
+| Event-driven waits | **built** for cgroups (inotify on `cgroup.events`) and macOS handles (one watcher thread on a shared kqueue wakes waiters through pipes; Crystal's event loop cannot take a kqueue descriptor itself); process groups back off 5 → 100 ms | `CgroupV2#wait_empty`, `ProcessHandle::Darwin::ExitWatcher` |
+| One kqueue per handle | **built**: one shared kqueue for every handle (53 watches cost at most 2 descriptors) | process-handle 0.10.0 |
+| Versions / stale text | **built** | process-handle 0.10.0, process-supervision 0.9.0 |
 | Arbitrary signals | **first cut** | `Group#signal`, `ProcessHandle#signal` (POSIX, cgroups via pidfd; Windows raises) |
 | Graceful stop | **first cut** | `Group#request_stop`, `Group#stop` (CONT+TERM; CTRL_BREAK + WM_CLOSE on Windows with `SpawnOptions#console_group`) |
 | Suspend / resume | **first cut** | `Group#suspend/resume` (SIGSTOP, `cgroup.freeze`, NtSuspendProcess per Job member), `ProcessHandle#suspend/resume` |
@@ -37,13 +37,18 @@ the API shape and edge cases still need review, as asked: "map out as much as po
 | Supervisor death | **first cut** | `SpawnOptions#parent_death_signal` (Linux), `ProcessSupervision::Lifeline` (POSIX watcher), Job kill-on-close |
 | Crash policy | **first cut** (Windows) | `Job::Limits#die_on_unhandled_exception`; core dumps via `rlimits[Core]`. Note: a Crystal child's access violation is caught by its own runtime and exits 1, so it is not seen as a crash |
 | Process tree snapshot | **first cut** | `ProcessHandle.snapshot`, `.descendants` |
-| Large command lines | **first cut** (Windows check) | `Job#spawn` raises `Error::Native` (206, as `CreateProcessW` would) past 32 767 units, before anything is created; quoting fuzz open |
+| Large command lines, quoting | **first cut** (Windows check); quoting **measured**: `Process.quote_windows` round-trips 20 000 random lists through `CommandLineToArgvW`, the UCRT and Crystal, 0 mismatches | `Job#spawn` raises `Error::Native` (206) past 32 767 units, before anything is created |
+| Batch files on Windows | **built**: `Job#spawn_batch` (cmd.exe quoting, fuzzed: 3 000 lists, 0 mismatches, 0 injections; line breaks refused); 18 bypass spellings of the refusal checked, none ran | `Job#spawn_batch` |
 | Restart policy, readiness, watchdog, logs, events, dependencies | **first cut** | `ProcessSupervision::Supervisor`, `LineLog` |
 | IPC channel | **first cut** (socket pair; no framing) | `SpawnOptions#ipc` |
 | systemd delegated scope | **first cut**, experimental: usable only by a supervisor inside the user's systemd tree or root (moving children needs write access at the common ancestor); `acquire` refuses otherwise | `Linux::SystemdScope.acquire` |
 | Namespaces | **first cut** (clone3 path; no uid_map for user namespaces) | `SpawnOptions#namespaces` |
 | Stress | **first cut** | `PROCESS_SUPERVISION_STRESS=1` spec, run in CI |
-| launchd, Windows SCM, seccomp/Landlock, AppContainer, FreeBSD, musl runs, fuzzing, soak, benchmarks, one shared kqueue, reload/fd hand-over | open | |
+| launchd | **measured**: bootout/crash end the job's process group, never a `setsid` escapee; `ExitTimeOut`, `KeepAlive` throttle (10 s) | FINDINGS "Hard questions" |
+| Windows SCM | **measured**: a Crystal program runs as a service (dispatcher on a Crystal thread, `ServiceMain` Win32-only); STOP 17 ms; the Job takes workers down with a killed service; `STDOUT` is a closed stream | `explore/windows/crystal_service.cr`; not in the shard yet |
+| seccomp / Landlock | **measured**: Landlock ABI 4 (22.04) / 8 (24.04) incl. TCP and signal scoping; seccomp errno/kill/user-notification work, also in Docker; both need `no_new_privs` and a fork/`clone3` child | not in the shard yet |
+| FreeBSD | **measured**: `pdfork` (close kills, not in `wait(-1)`), `NOTE_TRACK`, reaper tree kill reaching escapees and nested reapers, `PROC_PDEATHSIG_CTL`; Crystal 1.21.1 packaged, but its compiler crashes on the supervision spec | backend not built |
+| AppContainer, musl runs, soak, benchmarks, reload/fd hand-over | open | |
 
 ## Built before the first pass (for reference)
 
@@ -124,7 +129,7 @@ the API shape and edge cases still need review, as asked: "map out as much as po
 | Item | Status |
 |---|---|
 | Linux namespaces at spawn (`CLONE_NEWPID`, user, mount, net, ipc, uts) and a PID-1 shim inside a new PID namespace | unexplored |
-| seccomp filters, `no_new_privs`, Landlock | unexplored |
+| seccomp filters, `no_new_privs`, Landlock | measured (explore-hard: Landlock ABI 4/8, signal scoping, seccomp user notification); `no_new_privs` built |
 | Windows AppContainer / LPAC children, restricted and low-integrity tokens, mitigation policies | measured (AppContainer starts on 2022/2025/11-arm) |
 | Windows `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` (spawn "as" another parent) | measured |
 | macOS sandbox profiles, `responsibility_spawnattrs_setdisclaim`, jetsam limits for children (`posix_spawnattr_setjetsam_ext`) | measured in part (jetsam for the direct child only) |
@@ -133,7 +138,7 @@ the API shape and edge cases still need review, as asked: "map out as much as po
 
 | Platform / environment | Status |
 |---|---|
-| FreeBSD: `pdfork` process descriptors, `procctl(PROC_REAP_ACQUIRE / REAP_KILL)` (a real kernel subreaper with tree kill) | unexplored, likely the strongest POSIX backend after cgroups |
+| FreeBSD: `pdfork` process descriptors, `procctl(PROC_REAP_ACQUIRE / REAP_KILL)` (a real kernel subreaper with tree kill) | measured on 14.3 and 15.0: the strongest POSIX primitives seen; backend blocked on a Crystal compiler crash |
 | musl / Alpine running the shard specs (the engines' `posix_spawn` behaviour differs; `pidfd_spawn` is absent) | cgroup delegation measured on Alpine, shard not run there |
 | cgroup v1-only and hybrid hosts | one hybrid host seen; Tier 0 item 2 |
 | WSL 1/2, Kubernetes pods, rootless Docker/Podman, SELinux enforcing | not testable on hosted runners; needs self-hosted or VM runners |
