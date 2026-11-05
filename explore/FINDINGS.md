@@ -1182,6 +1182,15 @@ What building it found:
   instance (an anonymous inode), so the loop that drains queued events blocked forever once a delegated cgroup emptied.
   Neither shows where cgroups are not delegated (the local host is hybrid v1, where those specs are pending). A descriptor
   the event loop only waits on is now wrapped with `IO::FileDescriptor.new(handle:)`, which leaves the mode alone.
+* **A kqueue cannot be waited on through Crystal's macOS event loop.** The loop registers every descriptor for both
+  `EVFILT_READ` and `EVFILT_WRITE` (edge-triggered, once per descriptor), and the kernel refuses `EVFILT_WRITE` on a
+  kqueue descriptor: `kevent: Invalid argument` on macOS 15, 15 Intel and 26. `Kqueue#wait` polls the exit watch every
+  5 ms again; an event-driven wait needs a kevent thread of its own or `EVFILT_PROC` in the runtime.
+* **Crystal ignores `@[Link]` on a `private lib`.** A cross-compiled link line has no `user32.lib` for
+  `@[Link("user32")] private lib ...` and has it once the lib is public (checked with a three-line program). kernel32,
+  ntdll and libproc are linked by the standard library anyway, so only user32 showed it: the Windows supervision spec
+  binary did not link, and the shard-dev gate passed because it judged only the result files that existed (it now
+  requires them).
 * **Winsock and `clear_env`.** Requiring Crystal's socket library makes the program call `WSAStartup` at start; in a
   process whose environment has no `SystemRoot` that fails and the program dies before `main`. The kit's
   `clear_env` cases (the probe is itself the child) all lost their child once the shard required `socket`. The shard
