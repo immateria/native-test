@@ -123,6 +123,58 @@ Contract, all of it measured natively (explore/FINDINGS.md, "Spawning into conta
   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` allow-list, the child's pipe ends are synchronous and the parent's overlapped (as in
   the stdlib), and a file opened for overlapped I/O is copied through a pipe like any other IO.
 
+## Spawn options, control and supervision (first cut)
+
+Built in one pass over the roadmap's gaps; every piece has specs that run natively (shard-dev), but the API is not
+settled. See `ROADMAP.md` for what is built, what is a first cut and what is open.
+
+```crystal
+options = ProcessSupervision::SpawnOptions.new
+options.new_session = true                               # Linux, macOS
+options.extra_fds = {3 => some_file}                     # Linux, macOS; Windows: handle values in PROCESS_SUPERVISION_HANDLES
+options.ipc = true                                       # Linux, macOS: socket pair, child's end in PROCESS_SUPERVISION_IPC_FD
+options.rlimits = {ProcessSupervision::SpawnOptions::Rlimit::Nofile => {256_u64, 256_u64}}   # Linux
+options.umask = 0o077_u32; options.no_new_privileges = true                                   # Linux
+child = ProcessSupervision.spawn("worker", options: options)
+child.ipc.puts "hello"
+
+group = child.group
+group.signal(Signal::HUP)          # every member (process group: killpg plus marked escapees; cgroup: pidfd per member)
+group.suspend; group.resume        # SIGSTOP/SIGCONT, cgroup.freeze, NtSuspendProcess per Job member
+group.stop(grace: 5.seconds)       # request_stop (TERM / CTRL_BREAK + WM_CLOSE), wait, then kill
+child.outcome                      # ExitOutcome: exited(code) / signaled(signal, core) / crashed(NTSTATUS name)
+
+child.handle.usage                 # ProcessHandle::Usage: cpu times, resident and peak bytes, I/O bytes
+ProcessHandle.descendants(child.pid)                     # from a process snapshot (parent links)
+
+lifeline = ProcessSupervision::Lifeline.arm(group)       # POSIX: a watcher kills the group if this process dies
+lifeline.disarm
+
+cg.limits = ProcessSupervision::Linux::CgroupV2::Limits.new(memory_max: 512_u64 << 20, pids_max: 64_i64)
+cg.stats; cg.memory_events; cg.members; cg.frozen?
+scope = ProcessSupervision::Linux::SystemdScope.acquire  # a delegated cgroup from systemd (experimental)
+
+supervisor = ProcessSupervision::Supervisor.new
+spec = ProcessSupervision::Supervisor::Spec.new("api", "/usr/bin/api")
+spec.readiness = ProcessSupervision::Supervisor::Readiness::Notify   # sd_notify READY=1 on NOTIFY_SOCKET
+spec.watchdog = 10.seconds                                           # WATCHDOG=1 expected within this
+supervisor.add(spec); supervisor.start
+supervisor.events.receive                                            # Starting / Started / Ready / Exited / Restarting ...
+```
+
+What building it found (details in explore/FINDINGS.md, "First pass over every roadmap gap"):
+
+- With execution contexts a fiber can resume on another thread after any blocking call, so nothing here does blocking
+  Crystal I/O, or anything that can yield, while it holds a `Thread::Mutex`; interface files under a lock use raw syscalls.
+- A descriptor the event loop only waits on (a kqueue copy, an inotify instance) is wrapped with
+  `IO::FileDescriptor.new(handle:)`: the public constructor sets its blocking mode, which macOS refuses on a kqueue
+  (`ENOTTY`) and which turns a non-blocking inotify descriptor blocking on Linux.
+- The socket library is required on POSIX only: on Windows it starts Winsock at program start, and a program built with
+  it dies before `main` when spawned with `clear_env` (no `SystemRoot`).
+- `SystemdScope` only helps a process that may move children into the scope: moving needs write access to `cgroup.procs`
+  of the closest common ancestor, which a supervisor in a system service does not have; `acquire` says so.
+- A Linux process group whose members are all zombies still answers `kill(-pgid, 0)`; `empty?` reads `/proc` to tell.
+
 ## PTY-derived lifecycle semantics
 
 `Child#wait` uses the same single-collector model as the PTY Session backends.

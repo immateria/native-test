@@ -1163,6 +1163,44 @@ before and after pass; every one of the 20 new r14 cases passes.
 
 Not built: a kit lane for Linux (the shard specs are its native evidence), and FreeBSD.
 
+## First pass over every roadmap gap (what was built, what building it found)
+
+Commits `f6ea4f9` (the pass) and `6d4fac4` (fixes from its first native run). What was built is listed in `ROADMAP.md`
+("Status after the first pass") and the shard README ("Spawn options, control and supervision"). Native results for `6d4fac4`: pending (runs in progress).
+
+What building it found:
+
+* **Execution contexts and `Thread::Mutex`.** With Crystal 1.21 execution contexts, a fiber that makes a blocking call can
+  resume on another thread (the system monitor starts a new thread for the context while one is blocked). A
+  `Thread::Mutex` held across Crystal I/O, `sleep` or anything else that can yield is then unlocked from a thread that
+  does not own it, or the next locker waits forever. Found as a deadlock by a 200-cycle stress loop (gdb: the mutex owner
+  was a transient `DEFAULT-0` thread that no longer existed). Rule adopted: under a lock, only raw syscalls (`LibC.open`,
+  `read`, `write`, `kill`); `/proc` scans and interface-file reads happen outside it.
+* **`IO::FileDescriptor.new(fd)` changes the descriptor's blocking mode.** Its setup makes pipes, sockets and terminals
+  non-blocking and everything else blocking. On macOS `fcntl(F_SETFL, O_NONBLOCK)` on a kqueue fails with `ENOTTY`
+  (macOS 15, 15 Intel, 26), so every event-driven `Kqueue#wait` raised; on Linux it cleared `O_NONBLOCK` on an inotify
+  instance (an anonymous inode), so the loop that drains queued events blocked forever once a delegated cgroup emptied.
+  Neither shows where cgroups are not delegated (the local host is hybrid v1, where those specs are pending). A descriptor
+  the event loop only waits on is now wrapped with `IO::FileDescriptor.new(handle:)`, which leaves the mode alone.
+* **Winsock and `clear_env`.** Requiring Crystal's socket library makes the program call `WSAStartup` at start; in a
+  process whose environment has no `SystemRoot` that fails and the program dies before `main`. The kit's
+  `clear_env` cases (the probe is itself the child) all lost their child once the shard required `socket`. The shard
+  now requires it on POSIX only.
+* **IPC socket ends.** `UNIXSocket.pair` returns non-blocking ends; `O_NONBLOCK` belongs to the open file description, so
+  the child's end must be set blocking before it is passed on, as for pipes.
+* **A process group of zombies.** On Linux `kill(-pgid, 0)` succeeds while any member is a zombie (macOS answers
+  `EPERM`), so a group whose last members exited but were not reaped looked alive. `empty?` reads `/proc/<pid>/stat`
+  (state not `Z`/`X`, process group equal) when the probe succeeds.
+* **`kill --` in dash.** `kill -KILL -- -<pgid>` is rejected by dash (Ubuntu's `/bin/sh`); `kill -KILL -<pgid>` works in
+  dash, bash and macOS's sh. The lifeline watcher uses the latter.
+* **`SystemdScope` and the migration rule.** `systemd-run --user --scope -p Delegate=yes` creates a scope owned by the
+  user on the hosted Ubuntu runners, but a CI job runs in a system service, and moving a process between cgroups needs
+  write access to `cgroup.procs` of the closest common ancestor (here the root): every spawn into the scope failed with
+  `EACCES`. `acquire` now checks this and refuses with the reason. Only a supervisor inside the user's systemd tree, or
+  root, can use it.
+* **Windows command-line limit.** `CreateProcessW` takes 32,767 UTF-16 units including the terminator; the shard checks
+  before anything is created and raises the error `CreateProcessW` itself gives (`ERROR_FILENAME_EXCED_RANGE`, 206).
+
 ## Still open
 
 * the Windows enforcement period (7.000 s on x64, 7.04–7.16 s on arm64, not a clock effect): the 7-second job-time

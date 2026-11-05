@@ -140,3 +140,12 @@ semantics remain with `pty`.
    a pipe); `pidfd_spawn` as the first Linux engine; the process-group descendant marker (`ProcessGroup#escapees`).
 7. Open: a `pidfd_spawn` that a seccomp filter refuses is detected by `ENOSYS` only; a C library with `pidfd_spawn` but a
    fix for BZ 31695 is handled by the same code path (the probe finds nothing to close) but was not run here.
+8. First cut, built in one pass (see `ROADMAP.md`): `SpawnOptions` on every backend (an option a backend cannot honour
+   raises `Error::Unsupported` before anything is created; on Linux the options only `pidfd_spawn` can express keep it as
+   the engine, the rest move to clone3/fork with the setup done in the child in a fixed order: cgroup, session/group,
+   descriptors, namespaces, rlimits, umask, death signal, credentials, `no_new_privs`, signals, directory, exec);
+   `Group#signal`/`suspend`/`resume`/`request_stop`/`stop`; `ExitOutcome`; `ProcessHandle#usage` and process snapshots;
+   `Lifeline`; cgroup limits, statistics and `SystemdScope`; the `Supervisor` layer (restart policy, sd_notify readiness
+   and watchdog, bounded logs, dependencies, events). Rules this pass added: no blocking Crystal I/O under a
+   `Thread::Mutex` (execution contexts move fibers between threads), and descriptors that are only waited on are
+   wrapped with `IO::FileDescriptor.new(handle:)` so their blocking mode is left as it is.
