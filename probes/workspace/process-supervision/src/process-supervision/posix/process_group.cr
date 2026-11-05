@@ -18,6 +18,12 @@
       @marker : String?
 
       # *marker* is the descendant-marker token of a group this process spawned into (see `#escapees`), if any.
+      # Set once the group was seen with no member. A group that has emptied can never get a member again (joining
+      # needs a live member), but its number can then be reused by an unrelated process that leads a new group
+      # (`setsid`, `setpgid(0, 0)`): from here on nothing is sent to the number. (While any member lives, the kernel
+      # does not reuse the number at all.)
+      @gone = false
+
       def initialize(@pgid : Int64, marker : String? = nil)
         @marker = marker
         raise ArgumentError.new("pgid must be positive") unless @pgid > 0
@@ -256,11 +262,15 @@
       def signal(signal : Signal) : Nil
         token = @mutex.synchronize do
           check_open_locked
-          rc = LibC.kill(-@pgid.to_i32, signal.value)
-          unless rc == 0
-            errno = Errno.value
-            unless errno == Errno::ESRCH || no_live_member?(errno)
-              raise ProcessSupervision::Error::Native.new("killpg(#{signal})", errno.message, errno.value.to_i64)
+          unless @gone
+            rc = LibC.kill(-@pgid.to_i32, signal.value)
+            unless rc == 0
+              errno = Errno.value
+              if errno == Errno::ESRCH
+                @gone = true
+              elsif !no_live_member?(errno)
+                raise ProcessSupervision::Error::Native.new("killpg(#{signal})", errno.message, errno.value.to_i64)
+              end
             end
           end
           @marker
@@ -272,6 +282,7 @@
 
       # Plain system call only (runs under the mutex).
       private def group_state_locked : GroupState
+        return GroupState::Empty if @gone
         rc = LibC.kill(-@pgid.to_i32, 0)
         {% if flag?(:linux) %}
           # Linux still delivers to zombies, so a group whose members have all exited but are not yet reaped (an
@@ -281,7 +292,10 @@
         {% end %}
         return GroupState::Members if rc == 0
         errno = Errno.value
-        return GroupState::Empty if errno == Errno::ESRCH
+        if errno == Errno::ESRCH
+          @gone = true
+          return GroupState::Empty
+        end
         if errno == Errno::EPERM
           return no_live_member?(errno) ? GroupState::Empty : GroupState::Members
         end

@@ -172,6 +172,33 @@ require "file_utils"
         end
       end
 
+      it "never signals a process group number reused after the group emptied" do
+        pending!("needs root (ns_last_pid)") unless LibC.getuid == 0 && File::Info.writable?("/proc/sys/kernel/ns_last_pid")
+        child = feature_leader("true")
+        group = child.group
+        pgid = child.pid
+        child.wait(5.seconds)
+        group.wait_empty(5.seconds).should be_true
+        # an unrelated process takes the number as its own group (setsid execs in place: pid = new pgid)
+        File.write("/proc/sys/kernel/ns_last_pid", (pgid - 1).to_s)
+        impostor = Process.new("setsid", ["sleep", "30"])
+        begin
+          pending!("pid #{pgid} was not reused (got #{impostor.pid})") unless impostor.pid == pgid
+          sleep 100.milliseconds
+          LibC.getpgid(pgid.to_i32).should eq(pgid)
+          group.kill
+          group.request_stop
+          sleep 100.milliseconds
+          impostor.exists?.should be_true
+          group.empty?.should be_true
+        ensure
+          impostor.terminate(graceful: false) rescue nil
+          impostor.wait rescue nil
+          child.close
+          group.close
+        end
+      end
+
       it "switches user and group when running as root" do
         pending!("needs root") unless LibC.getuid == 0
         opts = options do |o|
